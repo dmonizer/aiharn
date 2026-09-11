@@ -265,6 +265,95 @@ func TestValidateKnownHostsRequired(t *testing.T) {
 	}
 }
 
+func TestIsSSHConfigAlias(t *testing.T) {
+	if !(ChannelConfig{Host: "foo"}).IsSSHConfigAlias() {
+		t.Fatal("host-only channel should be alias")
+	}
+	for name, c := range map[string]ChannelConfig{
+		"user":        {Host: "foo", User: "u"},
+		"key_file":    {Host: "foo", Auth: AuthConfig{KeyFile: "k"}},
+		"password":    {Host: "foo", Auth: AuthConfig{Password: "p"}},
+		"known_hosts": {Host: "foo", KnownHosts: "kh"},
+		"insecure":    {Host: "foo", Insecure: true},
+	} {
+		if c.IsSSHConfigAlias() {
+			t.Fatalf("%s: should not be alias", name)
+		}
+	}
+}
+
+func TestValidateSSHConfigAlias(t *testing.T) {
+	body := `
+[models.m]
+provider = "openai_responses"
+base_url = "https://example.com"
+api_key = "${TEST_API_KEY}"
+model = "m"
+
+[[channels]]
+name = "devbox"
+type = "ssh"
+host = "myalias"
+
+[agents.p]
+model = "m"
+system_prompt = "prompts/planner.md"
+channel = "devbox"
+tools = "none"
+
+[approval]
+mode = "ask"
+`
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Channels[0].IsSSHConfigAlias() {
+		t.Fatal("channel should be in alias mode")
+	}
+	if err := Validate(cfg, ValidateOptions{}); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestValidateSSHConfigAliasPartialStillRequiresAuth(t *testing.T) {
+	// A host + user (but no auth) is not a pure alias; auth is still required.
+	body := `
+[models.m]
+provider = "openai_responses"
+base_url = "https://example.com"
+api_key = "${TEST_API_KEY}"
+model = "m"
+
+[[channels]]
+name = "devbox"
+type = "ssh"
+host = "myalias"
+user = "ubuntu"
+
+[agents.p]
+model = "m"
+system_prompt = "prompts/planner.md"
+channel = "devbox"
+tools = "none"
+
+[approval]
+mode = "ask"
+`
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = Validate(cfg, ValidateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "auth") {
+		t.Fatalf("Validate error = %v, want auth required", err)
+	}
+}
+
 func TestRedacted(t *testing.T) {
 	t.Setenv("TEST_API_KEY", "supersecret")
 	path := setup(t, validConfig)

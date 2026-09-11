@@ -63,6 +63,11 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		if c.Host == "" {
 			errs = append(errs, fmt.Sprintf("channels[%q].host is required", c.Name))
 		}
+		// An SSH alias (name + host only) resolves user/auth/known_hosts from
+		// ~/.ssh/config at runtime, so those fields are not required here.
+		if c.Type == ChannelTypeSSH && c.IsSSHConfigAlias() {
+			continue
+		}
 		if c.User == "" {
 			errs = append(errs, fmt.Sprintf("channels[%q].user is required", c.Name))
 		}

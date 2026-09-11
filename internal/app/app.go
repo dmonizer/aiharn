@@ -314,15 +314,16 @@ func buildTransport(c config.ChannelConfig) (execution.Transport, error) {
 		return nil, fmt.Errorf("app: channel type %q is not implemented", c.Type)
 	}
 	return execssh.NewTransport(execssh.Options{
-		Host:         c.Host,
-		Port:         c.Port,
-		User:         c.User,
-		KeyFile:      c.Auth.KeyFile,
-		Password:     c.Auth.Password,
-		KnownHosts:   c.KnownHosts,
-		Insecure:     c.Insecure,
-		KeepAlive:    c.KeepAliveEnabled(),
-		DefaultShell: c.DefaultShell,
+		Host:           c.Host,
+		Port:           c.Port,
+		User:           c.User,
+		KeyFile:        c.Auth.KeyFile,
+		Password:       c.Auth.Password,
+		KnownHosts:     c.KnownHosts,
+		Insecure:       c.Insecure,
+		KeepAlive:      c.KeepAliveEnabled(),
+		DefaultShell:   c.DefaultShell,
+		SSHConfigAlias: c.IsSSHConfigAlias(),
 	})
 }
 

@@ -33,6 +33,10 @@ type Options struct {
 	Insecure     bool   // if true, skip host-key verification (warned opt-out)
 	KeepAlive    bool   // true = sessions share one client; false = one client per session
 	DefaultShell string // e.g. "/bin/bash"
+
+	// SSHConfigAlias, when true, treats Host as an OpenSSH ~/.ssh/config alias
+	// and resolves HostName, Port, User, IdentityFile, and KnownHosts from it.
+	SSHConfigAlias bool
 }
 
 // Transport implements execution.Transport.
@@ -52,6 +56,16 @@ var _ execution.Transport = (*Transport)(nil)
 func NewTransport(opts Options) (*Transport, error) {
 	if opts.Host == "" {
 		return nil, errors.New("ssh: host is required")
+	}
+	if opts.SSHConfigAlias {
+		configPath, err := defaultSSHConfigPath()
+		if err != nil {
+			return nil, err
+		}
+		opts, err = resolveAlias(opts, configPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if opts.Port == 0 {
 		opts.Port = 22

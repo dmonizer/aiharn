@@ -83,14 +83,22 @@ func (c ChannelConfig) KeepAliveEnabled() bool {
 	return c.KeepAlive == nil || *c.KeepAlive
 }
 
+// IsSSHConfigAlias reports whether the channel carries only a name and host —
+// no user, auth, or known_hosts — so its host should be resolved as an OpenSSH
+// ~/.ssh/config alias rather than an explicit endpoint.
+func (c ChannelConfig) IsSSHConfigAlias() bool {
+	return c.User == "" && c.Auth.KeyFile == "" && c.Auth.Password == "" &&
+		c.KnownHosts == "" && !c.Insecure
+}
+
 // AgentConfig is a configured agent type.
 type AgentConfig struct {
-	Model          string               `toml:"model"`
-	SystemPrompt   string               `toml:"system_prompt"`
-	Channel        string               `toml:"channel"` // "" = first channel
-	WorkingDir     *WorkingDirTemplate  `toml:"working_dir"`
-	Tools          ToolSelection        `toml:"tools"`
-	AllowSubagents bool                 `toml:"allow_subagents"`
+	Model          string              `toml:"model"`
+	SystemPrompt   string              `toml:"system_prompt"`
+	Channel        string              `toml:"channel"` // "" = first channel
+	WorkingDir     *WorkingDirTemplate `toml:"working_dir"`
+	Tools          ToolSelection       `toml:"tools"`
+	AllowSubagents bool                `toml:"allow_subagents"`
 }
 
 // LimitsConfig holds the runtime bounds. Zero means "use the default"; negative
@@ -122,18 +130,18 @@ const (
 	ToolModeAll  = "all"
 	ToolModeList = "list"
 
-	ApprovalModeAsk       = "ask"
-	ApprovalModeAllowAll  = "allow-all"
+	ApprovalModeAsk      = "ask"
+	ApprovalModeAllowAll = "allow-all"
 )
 
 // Defaults used when a field is absent or zero.
 const (
-	defaultSSHPort       = 22
-	defaultShell         = "/bin/bash"
-	defaultChannelType   = ChannelTypeSSH
-	defaultToolsMode     = ToolModeNone
-	defaultApprovalMode  = ApprovalModeAsk
-	defaultProvider      = ProviderOpenAIResponses
+	defaultSSHPort      = 22
+	defaultShell        = "/bin/bash"
+	defaultChannelType  = ChannelTypeSSH
+	defaultToolsMode    = ToolModeNone
+	defaultApprovalMode = ApprovalModeAsk
+	defaultProvider     = ProviderOpenAIResponses
 
 	defaultMaxAgentDepth      = 2
 	defaultMaxOpenAgents      = 8
