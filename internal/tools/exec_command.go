@@ -20,15 +20,16 @@ var _ Executor = (execution.Session)(nil)
 
 // ExecuteCommand returns the tool that runs a shell command on the agent's
 // executor, gated by the approval Gate. maxOutput caps retained stdout+stderr
-// (0 = unlimited).
-func ExecuteCommand(ex Executor, gate *approval.Gate, maxOutput int64) Tool {
-	return &execCommand{ex: ex, gate: gate, maxOutput: maxOutput}
+// (0 = unlimited). defaultCwd is the directory used when the model omits cwd.
+func ExecuteCommand(ex Executor, gate *approval.Gate, maxOutput int64, defaultCwd string) Tool {
+	return &execCommand{ex: ex, gate: gate, maxOutput: maxOutput, defaultCwd: defaultCwd}
 }
 
 type execCommand struct {
-	ex        Executor
-	gate      *approval.Gate
-	maxOutput int64
+	ex         Executor
+	gate       *approval.Gate
+	maxOutput  int64
+	defaultCwd string
 }
 
 func (t *execCommand) Definition() llm.ToolDefinition {
@@ -68,8 +69,12 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		return "denied by user", nil
 	}
 
+	cwd := p.Cwd
+	if cwd == "" {
+		cwd = t.defaultCwd
+	}
 	r, err := t.ex.Exec(ctx, p.Command, execution.ExecOptions{
-		Cwd:            p.Cwd,
+		Cwd:            cwd,
 		MaxOutputBytes: t.maxOutput,
 	})
 	if err != nil {

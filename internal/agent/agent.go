@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	"aiharn/internal/llm"
 	"aiharn/internal/tools"
@@ -63,19 +65,21 @@ type Event struct {
 
 // Spec is the resolved, immutable configuration for one agent instance.
 type Spec struct {
-	ID             string
-	Type           string
-	Model          string
-	System         string // system prompt content
-	Client         llm.Client
-	Tools          *tools.Registry
-	Depth          int    // 0 = top-level
-	CallerID       string // "" for top-level
-	AllowSubagents bool   // whether this agent may spawn subagents
-	EventCapacity  int
-	InboxCapacity  int
-	MaxToolRounds  int // per-turn cap on tool-call iterations
-	Cleanup        func() // invoked once at close (e.g. release the session)
+	ID              string
+	Type            string
+	Model           string
+	System          string // system prompt content
+	Client          llm.Client
+	Tools           *tools.Registry
+	Depth           int    // 0 = top-level
+	CallerID        string // "" for top-level
+	AllowSubagents  bool   // whether this agent may spawn subagents
+	EventCapacity   int
+	InboxCapacity   int
+	MaxToolRounds   int           // per-turn cap on tool-call iterations
+	RequestTimeout  time.Duration // per-provider-request timeout (0 = none)
+	ToolResultBytes int64         // cap on model-visible tool output (0 = none)
+	Cleanup         func()        // invoked once at close (e.g. release the session)
 }
 
 const (
@@ -98,7 +102,9 @@ type Agent struct {
 	callerID       string
 	allowSubagents bool
 
-	maxToolRounds int
+	maxToolRounds   int
+	requestTimeout  time.Duration
+	toolResultBytes int64
 
 	mu      sync.Mutex
 	history []llm.Item
@@ -137,20 +143,22 @@ func New(spec Spec) *Agent {
 		spec.MaxToolRounds = defaultMaxToolRounds
 	}
 	return &Agent{
-		id:             spec.ID,
-		typ:            spec.Type,
-		model:          spec.Model,
-		system:         spec.System,
-		client:         spec.Client,
-		tools:          spec.Tools,
-		depth:          spec.Depth,
-		callerID:       spec.CallerID,
-		allowSubagents: spec.AllowSubagents,
-		maxToolRounds:  spec.MaxToolRounds,
-		cleanup:        spec.Cleanup,
-		state:          StateStarting,
-		events:         make(chan Event, spec.EventCapacity),
-		inbox:          make(chan string, spec.InboxCapacity),
+		id:              spec.ID,
+		typ:             spec.Type,
+		model:           spec.Model,
+		system:          spec.System,
+		client:          spec.Client,
+		tools:           spec.Tools,
+		depth:           spec.Depth,
+		callerID:        spec.CallerID,
+		allowSubagents:  spec.AllowSubagents,
+		maxToolRounds:   spec.MaxToolRounds,
+		requestTimeout:  spec.RequestTimeout,
+		toolResultBytes: spec.ToolResultBytes,
+		cleanup:         spec.Cleanup,
+		state:           StateStarting,
+		events:          make(chan Event, spec.EventCapacity),
+		inbox:           make(chan string, spec.InboxCapacity),
 	}
 }
 
@@ -243,12 +251,15 @@ func (a *Agent) turn(ctx context.Context, input string) error {
 	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input})
 
 	for round := 0; round < a.maxToolRounds; round++ {
-		stream, err := a.client.Stream(ctx, a.buildRequest())
+		rctx, cancel := a.requestContext(ctx)
+		stream, err := a.client.Stream(rctx, a.buildRequest())
 		if err != nil {
+			cancel()
 			return a.fail(err)
 		}
 
-		output, err := a.collect(ctx, stream)
+		output, err := a.collect(rctx, stream)
+		cancel()
 		if err != nil {
 			return a.fail(err)
 		}
@@ -378,11 +389,23 @@ func (a *Agent) runTool(ctx context.Context, call llm.Item) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
+	if a.toolResultBytes > 0 && int64(len(result)) > a.toolResultBytes {
+		result = truncateUTF8(result, a.toolResultBytes) + "\n[result truncated]"
+	}
 	return result
 }
 
+// requestContext derives a per-request context with the configured timeout, if
+// any, so a single slow provider call cannot stall a turn indefinitely.
+func (a *Agent) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if a.requestTimeout <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, a.requestTimeout)
+}
+
 func (a *Agent) fail(err error) error {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		a.setState(StateIdle)
 	} else {
 		a.setState(StateErrored)
@@ -398,6 +421,12 @@ func (a *Agent) append(items ...llm.Item) {
 
 func (a *Agent) setState(s State) {
 	a.mu.Lock()
+	// Closed is terminal: a cancellation racing with Close (whose fail maps to
+	// idle) must not resurrect a closed agent.
+	if a.state == StateClosed {
+		a.mu.Unlock()
+		return
+	}
 	a.state = s
 	a.mu.Unlock()
 	a.emit(Event{Type: EventState, State: s})
@@ -422,4 +451,16 @@ func functionCalls(items []llm.Item) []llm.Item {
 		}
 	}
 	return calls
+}
+
+// truncateUTF8 truncates s to at most n bytes without splitting a UTF-8 rune.
+func truncateUTF8(s string, n int64) string {
+	if int64(len(s)) <= n {
+		return s
+	}
+	cut := int(n)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"aiharn/internal/agent"
@@ -202,23 +203,56 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		return nil, err
 	}
 
-	reg := buildRegistry(session, gate, cfg.Limits.CommandOutputBytes, agentCfg.Tools, mgr, spec.ID)
+	defaultCwd, err := resolveDefaultCwd(ctx, session, agentCfg, channelCfg, spec.Type, spec.ID)
+	if err != nil {
+		session.Close()
+		return nil, err
+	}
+
+	reg := buildRegistry(session, gate, cfg.Limits.CommandOutputBytes, defaultCwd, agentCfg.Tools, mgr, spec.ID)
 
 	a := agent.New(agent.Spec{
-		ID:             spec.ID,
-		Type:           spec.Type,
-		Model:          modelCfg.Model,
-		System:         system,
-		Client:         responses.NewAdapter(modelCfg.BaseURL, modelCfg.APIKey),
-		Tools:          reg,
-		Depth:          spec.Depth,
-		CallerID:       spec.CallerID,
-		AllowSubagents: agentCfg.AllowSubagents,
-		EventCapacity:  cfg.Limits.EventCapacity,
-		InboxCapacity:  cfg.Limits.InboxDepth,
-		Cleanup:        func() { session.Close() },
+		ID:              spec.ID,
+		Type:            spec.Type,
+		Model:           modelCfg.Model,
+		System:          system,
+		Client:          responses.NewAdapter(modelCfg.BaseURL, modelCfg.APIKey),
+		Tools:           reg,
+		Depth:           spec.Depth,
+		CallerID:        spec.CallerID,
+		AllowSubagents:  agentCfg.AllowSubagents,
+		EventCapacity:   cfg.Limits.EventCapacity,
+		InboxCapacity:   cfg.Limits.InboxDepth,
+		RequestTimeout:  cfg.Limits.RequestTimeout.Std(),
+		ToolResultBytes: cfg.Limits.ToolResultBytes,
+		Cleanup:         func() { session.Close() },
 	})
 	return a, nil
+}
+
+// resolveDefaultCwd renders the working_dir template (agent override, else the
+// channel's) into a literal remote path. It queries the remote home lazily —
+// only when the template references "~" or "$HOME" — and returns "" when no
+// working_dir is configured.
+func resolveDefaultCwd(ctx context.Context, session execution.Session, agentCfg config.AgentConfig, channelCfg config.ChannelConfig, agentType, agentID string) (string, error) {
+	tmpl := channelCfg.WorkingDir
+	if agentCfg.WorkingDir != nil {
+		tmpl = *agentCfg.WorkingDir
+	}
+	if tmpl.Raw == "" {
+		return "", nil
+	}
+
+	home := ""
+	if strings.Contains(tmpl.Raw, "~") || strings.Contains(tmpl.Raw, "$HOME") {
+		r, err := session.Exec(ctx, `printf '%s' "$HOME"`, execution.ExecOptions{})
+		if err != nil {
+			return "", fmt.Errorf("app: resolve remote home for working_dir: %w", err)
+		}
+		home = strings.TrimSpace(r.Stdout)
+	}
+
+	return execution.RenderWorkingDir(tmpl.Raw, agentType, agentID, home)
 }
 
 // transportCache returns one Transport per channel name, created lazily and
@@ -305,11 +339,12 @@ func buildGate(mode string) (*approval.Gate, error) {
 
 // buildRegistry attaches the built-in tools selected by sel to a fresh registry.
 // The session and gate are shared by all built-ins; backend (the Manager) and
-// callerID wire the subagent tools to the runtime.
-func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, sel config.ToolSelection, backend tools.SubagentBackend, callerID string) *tools.Registry {
+// callerID wire the subagent tools to the runtime. defaultCwd is the directory
+// execute_command falls back to when the model omits one.
+func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, sel config.ToolSelection, backend tools.SubagentBackend, callerID string) *tools.Registry {
 	reg := tools.New()
 	all := map[string]tools.Tool{
-		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput),
+		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),
 		tools.NameCheckSubagent:       tools.CheckSubagent(backend, callerID),

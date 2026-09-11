@@ -10,9 +10,9 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/execution"
-	"aiharn/internal/tools"
 	testexec "aiharn/internal/testutil/execution"
 	testllm "aiharn/internal/testutil/llm"
+	"aiharn/internal/tools"
 )
 
 func TestSelectChannel(t *testing.T) {
@@ -71,23 +71,67 @@ func TestBuildRegistrySelection(t *testing.T) {
 	sess := testexec.NewSession(nil)
 	gate := approval.NewGate(approval.ModeAllowAll)
 
-	none := buildRegistry(sess, gate, 0, config.ToolSelection{Mode: config.ToolModeNone}, nil, "a1")
+	none := buildRegistry(sess, gate, 0, "", config.ToolSelection{Mode: config.ToolModeNone}, nil, "a1")
 	if len(none.Names()) != 0 {
 		t.Fatalf("none: got %v", none.Names())
 	}
 
-	all := buildRegistry(sess, gate, 0, config.ToolSelection{Mode: config.ToolModeAll}, nil, "a1")
+	all := buildRegistry(sess, gate, 0, "", config.ToolSelection{Mode: config.ToolModeAll}, nil, "a1")
 	if len(all.Names()) != len(tools.Names()) {
 		t.Fatalf("all: got %v, want %v", all.Names(), tools.Names())
 	}
 
-	list := buildRegistry(sess, gate, 0, config.ToolSelection{
+	list := buildRegistry(sess, gate, 0, "", config.ToolSelection{
 		Mode:  config.ToolModeList,
 		Names: []string{"execute_command", "not_a_tool"},
 	}, nil, "a1")
 	if len(list.Names()) != 1 || list.Names()[0] != "execute_command" {
 		t.Fatalf("list: got %v", list.Names())
 	}
+}
+
+func TestResolveDefaultCwd(t *testing.T) {
+	t.Run("no working dir", func(t *testing.T) {
+		sess := testexec.NewSession(nil)
+		got, err := resolveDefaultCwd(context.Background(), sess, config.AgentConfig{}, config.ChannelConfig{}, "main", "main")
+		if err != nil || got != "" {
+			t.Fatalf("got %q, %v", got, err)
+		}
+		if len(sess.Calls()) != 0 {
+			t.Fatalf("unexpected exec calls: %d", len(sess.Calls()))
+		}
+	})
+
+	t.Run("agent override with home", func(t *testing.T) {
+		sess := testexec.NewSession(func(ctx context.Context, cmd string, opts execution.ExecOptions) (execution.Result, error) {
+			return execution.Result{Stdout: "/home/ubuntu\n"}, nil
+		})
+		wd, _ := config.ParseWorkingDir("$HOME/work/${agent.type}-${agent.id}")
+		got, err := resolveDefaultCwd(context.Background(), sess,
+			config.AgentConfig{WorkingDir: &wd}, config.ChannelConfig{}, "coder", "coder-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "/home/ubuntu/work/coder-coder-1" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("channel default without home", func(t *testing.T) {
+		sess := testexec.NewSession(nil)
+		wd, _ := config.ParseWorkingDir("/srv/${agent.type}")
+		got, err := resolveDefaultCwd(context.Background(), sess,
+			config.AgentConfig{}, config.ChannelConfig{WorkingDir: wd}, "coder", "coder-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "/srv/coder" {
+			t.Fatalf("got %q", got)
+		}
+		if len(sess.Calls()) != 0 {
+			t.Fatalf("home queried unnecessarily: %d calls", len(sess.Calls()))
+		}
+	})
 }
 
 func TestReadSystemPrompt(t *testing.T) {

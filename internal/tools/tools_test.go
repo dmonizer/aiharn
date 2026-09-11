@@ -9,8 +9,8 @@ import (
 
 	"aiharn/internal/approval"
 	"aiharn/internal/execution"
-	"aiharn/internal/tools"
 	testexec "aiharn/internal/testutil/execution"
+	"aiharn/internal/tools"
 )
 
 func newRegistry(t *testing.T, tts ...tools.Tool) *tools.Registry {
@@ -34,7 +34,7 @@ func echoExecutor(t *testing.T) *testexec.Session {
 func TestExecuteCommandAllowAll(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
 
 	out, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"echo hi"}`))
 	if err != nil {
@@ -48,10 +48,36 @@ func TestExecuteCommandAllowAll(t *testing.T) {
 	}
 }
 
+func TestExecuteCommandDefaultCwd(t *testing.T) {
+	ex := testexec.NewSession(nil)
+	gate := approval.NewGate(approval.ModeAllowAll)
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "/srv/work"))
+
+	// No cwd in args → the default applies.
+	if _, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"pwd"}`)); err != nil {
+		t.Fatal(err)
+	}
+	// An explicit cwd overrides the default.
+	if _, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"pwd","cwd":"/tmp"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := ex.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("calls = %d, want 2", len(calls))
+	}
+	if calls[0].Opts.Cwd != "/srv/work" {
+		t.Fatalf("default cwd = %q, want /srv/work", calls[0].Opts.Cwd)
+	}
+	if calls[1].Opts.Cwd != "/tmp" {
+		t.Fatalf("explicit cwd = %q, want /tmp", calls[1].Opts.Cwd)
+	}
+}
+
 func TestExecuteCommandAskApproved(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAsk)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
 
 	done := make(chan string, 1)
 	go func() {
@@ -85,7 +111,7 @@ func TestExecuteCommandAskApproved(t *testing.T) {
 func TestExecuteCommandAskDenied(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAsk)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
 
 	done := make(chan string, 1)
 	go func() {
@@ -120,7 +146,7 @@ func TestExecuteCommandAskDenied(t *testing.T) {
 func TestExecuteCommandInvalidArgs(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
 
 	_, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{}`))
 	if err == nil || !strings.Contains(err.Error(), "invalid arguments") {
@@ -131,7 +157,7 @@ func TestExecuteCommandInvalidArgs(t *testing.T) {
 func TestExecuteCommandMalformedJSON(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
 
 	_, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{not json`))
 	if err == nil {
@@ -178,7 +204,7 @@ func TestRegistryUnknownTool(t *testing.T) {
 func TestRegistryDefinitionsOrder(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0), tools.SetApproval(gate))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""), tools.SetApproval(gate))
 
 	defs := r.Definitions()
 	if len(defs) != 2 {

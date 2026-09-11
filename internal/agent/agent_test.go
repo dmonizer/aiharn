@@ -2,17 +2,20 @@ package agent_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
 	"aiharn/internal/execution"
 	"aiharn/internal/llm"
-	"aiharn/internal/tools"
 	testexec "aiharn/internal/testutil/execution"
 	testllm "aiharn/internal/testutil/llm"
+	"aiharn/internal/tools"
 )
 
 func drainEvents(a *agent.Agent) []agent.Event {
@@ -94,7 +97,7 @@ func TestTurnToolCall(t *testing.T) {
 	})
 	gate := approval.NewGate(approval.ModeAllowAll)
 	reg := tools.New()
-	if err := reg.Register(tools.ExecuteCommand(ex, gate, 0)); err != nil {
+	if err := reg.Register(tools.ExecuteCommand(ex, gate, 0, "")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,6 +177,90 @@ func TestTurnNoTerminalEvent(t *testing.T) {
 
 	if err := a.Turn(context.Background(), "hi"); err == nil {
 		t.Fatal("expected error for stream without terminal event")
+	}
+}
+
+// stubTool returns a fixed string, for exercising the agent's tool-result cap.
+type stubTool struct{ name, out string }
+
+func (s stubTool) Definition() llm.ToolDefinition { return llm.ToolDefinition{Name: s.name} }
+func (s stubTool) Run(context.Context, json.RawMessage) (string, error) {
+	return s.out, nil
+}
+
+// toolCallScript runs one stub tool call then completes.
+func toolCallScript(name string) [][]llm.Event {
+	return [][]llm.Event{
+		{{Type: llm.EventCompleted, Items: []llm.Item{
+			{Type: llm.ItemFunctionCall, CallID: "c1", Name: name, Args: "{}"},
+		}}},
+		{{Type: llm.EventCompleted, Items: []llm.Item{
+			{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "done"},
+		}}},
+	}
+}
+
+func TestTurnToolResultTruncated(t *testing.T) {
+	reg := tools.New()
+	if err := reg.Register(stubTool{name: "big", out: "abcdefghij"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &testllm.FakeClient{Script: toolCallScript("big")}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", System: "sys",
+		Client: client, Tools: reg, ToolResultBytes: 5,
+	})
+
+	if err := a.Turn(context.Background(), "go"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	hist := a.History()
+	if len(hist) != 4 {
+		t.Fatalf("history len = %d: %+v", len(hist), hist)
+	}
+	if got := hist[2].Content; got != "abcde\n[result truncated]" {
+		t.Fatalf("truncated output = %q", got)
+	}
+}
+
+func TestTurnToolResultTruncatedUTF8(t *testing.T) {
+	reg := tools.New()
+	if err := reg.Register(stubTool{name: "big", out: "ééééé"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &testllm.FakeClient{Script: toolCallScript("big")}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", System: "sys",
+		Client: client, Tools: reg, ToolResultBytes: 5,
+	})
+
+	if err := a.Turn(context.Background(), "go"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	got := a.History()[2].Content
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncation split a rune: %q", got)
+	}
+	if got != "éé\n[result truncated]" {
+		t.Fatalf("truncated output = %q", got)
+	}
+}
+
+func TestTurnRequestTimeout(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", System: "sys",
+		Client:         blockingClient{},
+		RequestTimeout: 50 * time.Millisecond,
+	})
+
+	err := a.Turn(context.Background(), "hi")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	if a.State() != agent.StateErrored {
+		t.Fatalf("state = %v, want errored", a.State())
 	}
 }
 
