@@ -27,7 +27,8 @@ model    = "glm-5.3-flash"
 #
 # When user, auth, and known_hosts are ALL omitted, `host` is treated as an
 # OpenSSH ~/.ssh/config alias: HostName, Port, User, and IdentityFile are
-# resolved from that file, and known_hosts defaults to ~/.ssh/known_hosts.
+# resolved from that file (IdentityFile is optional — if omitted, auth falls
+# back to the SSH agent), and known_hosts defaults to ~/.ssh/known_hosts.
 [[channels]]
 name = "sf"
 type = "ssh"

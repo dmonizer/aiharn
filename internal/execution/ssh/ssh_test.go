@@ -300,7 +300,6 @@ func TestNewTransportValidation(t *testing.T) {
 	}{
 		{"missing host", execssh.Options{User: "u", Password: "p", Insecure: true}, "host"},
 		{"missing user", execssh.Options{Host: "h", Password: "p", Insecure: true}, "user"},
-		{"missing auth", execssh.Options{Host: "h", User: "u", Insecure: true}, "key_file or password"},
 		{"both auth", execssh.Options{Host: "h", User: "u", KeyFile: "k", Password: "p", Insecure: true}, "mutually exclusive"},
 		{"missing known_hosts", execssh.Options{Host: "h", User: "u", Password: "p"}, "known_hosts"},
 	}

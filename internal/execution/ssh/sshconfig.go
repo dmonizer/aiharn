@@ -22,8 +22,10 @@ func defaultSSHConfigPath() (string, error) {
 
 // resolveAlias resolves opts.Host as an OpenSSH config alias read from
 // configPath, filling in the host name, port, user, identity file, and
-// known_hosts. It leaves non-connection options (KeepAlive, DefaultShell)
-// untouched, and honors an explicit port only when the config does not set one.
+// known_hosts. IdentityFile is optional: when the alias omits it, KeyFile stays
+// empty and authentication falls back to the SSH agent. It leaves non-connection
+// options (KeepAlive, DefaultShell) untouched, and honors an explicit port only
+// when the config does not set one.
 func resolveAlias(opts Options, configPath string) (Options, error) {
 	f, err := os.Open(configPath)
 	if err != nil {
@@ -58,18 +60,15 @@ func resolveAlias(opts Options, configPath string) (Options, error) {
 		}
 	}
 
-	identityFile := get(cfg, alias, "IdentityFile")
-	if identityFile == "" {
-		return opts, fmt.Errorf("ssh: alias %q has no IdentityFile in %s", alias, configPath)
-	}
-
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return opts, fmt.Errorf("ssh: resolve home dir: %w", err)
 	}
 	sshDir := filepath.Join(home, ".ssh")
 
-	opts.KeyFile = resolveIdentityPath(identityFile, sshDir)
+	if identityFile := get(cfg, alias, "IdentityFile"); identityFile != "" {
+		opts.KeyFile = resolveIdentityPath(identityFile, sshDir)
+	}
 	if opts.KnownHosts == "" {
 		opts.KnownHosts = filepath.Join(sshDir, "known_hosts")
 	}

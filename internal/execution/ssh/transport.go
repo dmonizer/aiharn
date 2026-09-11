@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"aiharn/internal/execution"
@@ -72,9 +73,6 @@ func NewTransport(opts Options) (*Transport, error) {
 	}
 	if opts.User == "" {
 		return nil, errors.New("ssh: user is required")
-	}
-	if opts.KeyFile == "" && opts.Password == "" {
-		return nil, errors.New("ssh: key_file or password is required")
 	}
 	if opts.KeyFile != "" && opts.Password != "" {
 		return nil, errors.New("ssh: key_file and password are mutually exclusive")
@@ -157,10 +155,11 @@ func (t *Transport) dropShared() {
 }
 
 func dial(opts Options) (*ssh.Client, error) {
-	cfg, err := buildClientConfig(opts)
+	cfg, release, err := buildClientConfig(opts)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	addr := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 	client, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
@@ -169,20 +168,32 @@ func dial(opts Options) (*ssh.Client, error) {
 	return client, nil
 }
 
-func buildClientConfig(opts Options) (*ssh.ClientConfig, error) {
+// buildClientConfig assembles the SSH client config for one of three auth
+// methods: password, key file, or (when neither is set) the SSH agent. The
+// returned release func closes any agent connection and must be called after
+// the handshake completes.
+func buildClientConfig(opts Options) (*ssh.ClientConfig, func(), error) {
+	release := func() {}
 	var auth ssh.AuthMethod
-	if opts.Password != "" {
+	switch {
+	case opts.Password != "":
 		auth = ssh.Password(opts.Password)
-	} else {
+	case opts.KeyFile != "":
 		key, err := os.ReadFile(opts.KeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("ssh: read key_file: %w", err)
+			return nil, release, fmt.Errorf("ssh: read key_file: %w", err)
 		}
 		signer, err := ssh.ParsePrivateKey(key)
 		if err != nil {
-			return nil, fmt.Errorf("ssh: parse key_file %s: %w", opts.KeyFile, err)
+			return nil, release, fmt.Errorf("ssh: parse key_file %s: %w", opts.KeyFile, err)
 		}
 		auth = ssh.PublicKeys(signer)
+	default:
+		var err error
+		auth, release, err = agentAuth()
+		if err != nil {
+			return nil, release, err
+		}
 	}
 
 	cfg := &ssh.ClientConfig{
@@ -194,11 +205,36 @@ func buildClientConfig(opts Options) (*ssh.ClientConfig, error) {
 	} else {
 		cb, err := knownhosts.New(opts.KnownHosts)
 		if err != nil {
-			return nil, fmt.Errorf("ssh: load known_hosts: %w", err)
+			release()
+			return nil, release, fmt.Errorf("ssh: load known_hosts: %w", err)
 		}
 		cfg.HostKeyCallback = cb
 	}
-	return cfg, nil
+	return cfg, release, nil
+}
+
+// agentAuth returns an auth method backed by the SSH agent at $SSH_AUTH_SOCK,
+// plus a release func that closes the agent connection.
+func agentAuth() (ssh.AuthMethod, func(), error) {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return nil, func() {}, errors.New("ssh: no key_file, password, or SSH agent (SSH_AUTH_SOCK unset)")
+	}
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("ssh: connect to SSH agent %s: %w", sock, err)
+	}
+	client := agent.NewClient(conn)
+	signers, err := client.Signers()
+	if err != nil {
+		conn.Close()
+		return nil, func() {}, fmt.Errorf("ssh: list SSH agent keys: %w", err)
+	}
+	if len(signers) == 0 {
+		conn.Close()
+		return nil, func() {}, errors.New("ssh: SSH agent has no keys")
+	}
+	return ssh.PublicKeys(signers...), func() { conn.Close() }, nil
 }
 
 // sanitizeSSHError removes secret-bearing material (password) from an error, as

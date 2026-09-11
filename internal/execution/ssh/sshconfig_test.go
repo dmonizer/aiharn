@@ -67,10 +67,21 @@ func TestResolveAliasDefaults(t *testing.T) {
 	}
 }
 
-func TestResolveAliasMissingIdentityFile(t *testing.T) {
-	_, err := resolveAlias(Options{Host: "myalias"}, writeSSHConfig(t, "Host myalias\n\tHostName 10.0.0.5\n"))
-	if err == nil || !strings.Contains(err.Error(), "IdentityFile") {
-		t.Fatalf("err = %v, want IdentityFile error", err)
+func TestResolveAliasWithoutIdentityFile(t *testing.T) {
+	// An alias with no IdentityFile leaves KeyFile empty so auth falls back to
+	// the SSH agent; it is not an error.
+	opts, err := resolveAlias(Options{Host: "myalias"}, writeSSHConfig(t, "Host myalias\n\tHostName 10.0.0.5\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Host != "10.0.0.5" {
+		t.Fatalf("Host = %q", opts.Host)
+	}
+	if opts.KeyFile != "" {
+		t.Fatalf("KeyFile = %q, want empty (agent fallback)", opts.KeyFile)
+	}
+	if opts.KnownHosts == "" {
+		t.Fatal("KnownHosts should still default")
 	}
 }
 
