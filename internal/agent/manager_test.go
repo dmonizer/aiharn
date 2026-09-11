@@ -382,6 +382,34 @@ func TestErroredAgentReleasesSlot(t *testing.T) {
 	}
 }
 
+func TestRosterNotifiesOnStateChange(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain the spawn notification so only a later state change can re-ping.
+	select {
+	case <-mgr.Roster():
+	default:
+	}
+
+	waitFor(t, 2*time.Second, "subagent to become idle", func() bool {
+		return mgr.Agent(id).State() == agent.StateIdle
+	})
+
+	select {
+	case <-mgr.Roster():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("no roster notification for the running→idle transition")
+	}
+}
+
 func TestShutdownIdempotentNoLeaks(t *testing.T) {
 	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 16, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
 	if err := mgr.RegisterTop(newTop(t, true)); err != nil {

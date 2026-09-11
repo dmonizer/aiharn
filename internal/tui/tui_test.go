@@ -17,8 +17,14 @@ func newTestModel(t *testing.T) *Model {
 	t.Helper()
 	client := &testllm.FakeClient{}
 	a := agent.New(agent.Spec{ID: "a1", Type: "main", Model: "m", System: "s", Client: client})
+	mgr := agent.NewManager(agent.ManagerOptions{Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
+		return agent.New(agent.Spec{ID: spec.ID, Type: spec.Type, Client: &testllm.FakeClient{}}), nil
+	}})
+	if err := mgr.RegisterTop(a); err != nil {
+		t.Fatal(err)
+	}
 	g := approval.NewGate(approval.ModeAsk)
-	return New(a, g, Status{Model: "m", AgentType: "main", Channel: "devbox", Approval: "ask"})
+	return New(mgr, a, g, Status{Model: "m", AgentType: "main", Channel: "devbox", Approval: "ask"})
 }
 
 // upd runs m.Update and returns the concrete model and command.
@@ -200,7 +206,7 @@ func TestRunTurnReportsCompletion(t *testing.T) {
 	}}
 	a := agent.New(agent.Spec{ID: "a1", Type: "main", Model: "m", System: "s", Client: client})
 
-	msg := runCmd(runTurn(a, "hi"))
+	msg := runCmd(runTurn(a, context.Background(), "hi"))
 	if done, ok := msg.(turnDoneMsg); !ok || done.err != nil {
 		t.Fatalf("msg = %+v", msg)
 	}

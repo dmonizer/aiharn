@@ -78,7 +78,7 @@ func run(args []string) int {
 	}
 	defer rt.Close()
 
-	p := tea.NewProgram(tui.New(rt.Agent, rt.Gate, tui.Status{
+	p := tea.NewProgram(tui.New(rt.Manager, rt.Agent, rt.Gate, tui.Status{
 		Model:     rt.Summary.Model,
 		AgentType: rt.Summary.AgentType,
 		Channel:   rt.Summary.Channel,

@@ -31,12 +31,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendLine(fmt.Sprintf("[approval] %s %s", msg.req.ToolName, msg.req.Command))
 		return m, waitApproval(m.gate)
 
+	case rosterMsg:
+		m.refreshSubagents()
+		return m, waitRoster(m.manager)
+
 	case turnDoneMsg:
 		m.flushText()
 		m.running = false
 		if msg.err != nil {
 			m.appendLine("error: " + msg.err.Error())
 		}
+		m.refreshSubagents()
 		if cmd := m.nextTurn(); cmd != nil {
 			return m, cmd
 		}
@@ -48,6 +53,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		m.quitting = true
+		m.cancel()
 		return m, tea.Quit
 	}
 
@@ -108,7 +114,7 @@ func (m *Model) nextTurn() tea.Cmd {
 	m.queue = m.queue[1:]
 	m.running = true
 	m.appendLine("> " + input)
-	return runTurn(m.agent, input)
+	return runTurn(m.agent, m.ctx, input)
 }
 
 func (m *Model) appendEvent(ev agent.Event) {

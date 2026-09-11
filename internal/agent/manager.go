@@ -64,6 +64,8 @@ type Manager struct {
 	wg           sync.WaitGroup
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
+
+	roster chan struct{} // pinged (non-blocking) whenever a subagent appears, closes, or changes state
 }
 
 // NewManager returns a Manager. opts.Builder is required.
@@ -88,6 +90,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		eventCap:     opts.EventCapacity,
 		builder:      opts.Builder,
 		shutdownDone: make(chan struct{}),
+		roster:       make(chan struct{}, 1),
 	}
 }
 
@@ -113,6 +116,20 @@ func (m *Manager) Agent(id string) *Agent {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.agents[id]
+}
+
+// Roster returns a channel that receives a notification whenever the set of
+// subagents or their statuses may have changed. Subscribers should treat it as
+// a coalescing hint to re-read ListSubagents. The channel is never closed.
+func (m *Manager) Roster() <-chan struct{} { return m.roster }
+
+// notify pings the roster channel without blocking; a full buffer means a
+// subscriber has not yet drained the previous notification, which coalesces.
+func (m *Manager) notify() {
+	select {
+	case m.roster <- struct{}{}:
+	default:
+	}
 }
 
 // SpawnSubagent implements tools.SubagentBackend. It validates the caller's
@@ -168,6 +185,7 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 	sub.setOnComplete(func(result string) {
 		caller.Send(fmt.Sprintf("[subagent %s (%s)] %s", agentType, id, result))
 	})
+	sub.setOnStateChange(m.notify)
 	m.agents[id] = sub
 	m.wg.Add(1)
 	go func() {
@@ -176,6 +194,7 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 	}()
 	m.mu.Unlock()
 
+	m.notify()
 	sub.Send(prompt)
 	return id, nil
 }
@@ -261,6 +280,7 @@ func (m *Manager) CloseSubagent(ctx context.Context, callerID, subagentID string
 	for _, a := range toClose {
 		a.Close()
 	}
+	m.notify()
 	return nil
 }
 
@@ -283,6 +303,7 @@ func (m *Manager) Shutdown() error {
 		close(m.shutdownDone)
 	})
 	<-m.shutdownDone
+	m.notify()
 	return nil
 }
 

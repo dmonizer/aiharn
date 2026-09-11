@@ -118,6 +118,11 @@ type Agent struct {
 	// onComplete, when set, is called once per completed subagent task with the
 	// task's final result (or its error). It is the Manager's delivery hook.
 	onComplete func(result string)
+
+	// onStateChange, when set, is called after every state transition. The
+	// Manager uses it to notify roster subscribers that a subagent's status
+	// changed.
+	onStateChange func()
 }
 
 // New constructs an Agent from a resolved Spec.
@@ -213,6 +218,10 @@ func (a *Agent) setContext(ctx context.Context, cancel context.CancelFunc) {
 
 // setOnComplete installs the delivery hook (Manager-internal).
 func (a *Agent) setOnComplete(fn func(string)) { a.onComplete = fn }
+
+// setOnStateChange installs the state-change hook (Manager-internal). It is set
+// before the subagent's run loop starts and read only from that goroutine.
+func (a *Agent) setOnStateChange(fn func()) { a.onStateChange = fn }
 
 // Turn runs one full turn on behalf of a caller: it drains the inbox (subagent
 // results and other inbound messages, injected as synthetic user messages),
@@ -392,6 +401,9 @@ func (a *Agent) setState(s State) {
 	a.state = s
 	a.mu.Unlock()
 	a.emit(Event{Type: EventState, State: s})
+	if a.onStateChange != nil {
+		a.onStateChange()
+	}
 }
 
 func (a *Agent) emit(e Event) {

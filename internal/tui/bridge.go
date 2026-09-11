@@ -9,12 +9,13 @@ import (
 	"aiharn/internal/approval"
 )
 
-// Message types bridging agent/gate activity into the Bubbletea event loop.
-// They are unexported; Update switches on them.
+// Message types bridging agent/gate/manager activity into the Bubbletea event
+// loop. They are unexported; Update switches on them.
 type (
 	agentEventMsg  struct{ ev agent.Event }
 	approvalReqMsg struct{ req approval.Request }
 	turnDoneMsg    struct{ err error }
+	rosterMsg      struct{}
 )
 
 // waitAgentEvent blocks until the agent emits an event and delivers it as a
@@ -30,10 +31,18 @@ func waitApproval(g *approval.Gate) tea.Cmd {
 	return func() tea.Msg { return approvalReqMsg{req: <-g.Pending()} }
 }
 
-// runTurn runs one agent turn in a goroutine and reports completion. It uses a
-// background context: Phase 7's Manager supplies cancellation.
-func runTurn(a *agent.Agent, input string) tea.Cmd {
+// waitRoster blocks until the manager pings its roster channel.
+func waitRoster(m *agent.Manager) tea.Cmd {
 	return func() tea.Msg {
-		return turnDoneMsg{err: a.Turn(context.Background(), input)}
+		<-m.Roster()
+		return rosterMsg{}
+	}
+}
+
+// runTurn runs one agent turn in a goroutine and reports completion. It uses the
+// model's cancellable context so quitting aborts an in-flight turn.
+func runTurn(a *agent.Agent, ctx context.Context, input string) tea.Cmd {
+	return func() tea.Msg {
+		return turnDoneMsg{err: a.Turn(ctx, input)}
 	}
 }
