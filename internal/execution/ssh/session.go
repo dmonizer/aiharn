@@ -119,6 +119,7 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	if err != nil {
 		if errors.Is(err, execution.ErrSessionReset) {
 			s.markDead()
+			return execution.Result{}, fmt.Errorf("ssh: persistent shell exited before producing output (is %q the right shell on the remote host?): %w", s.opts.DefaultShell, err)
 		}
 		return execution.Result{}, err
 	}

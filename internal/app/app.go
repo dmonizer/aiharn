@@ -129,6 +129,8 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		},
 	})
 
+	fmt.Fprintf(os.Stderr, "aiharn: connecting to channel %q (host %q)...\n", channelCfg.Name, channelCfg.Host)
+
 	top, err := buildAgent(ctx, cfg, tc, mgr, gate, agent.SpawnSpec{
 		ID:       agentType,
 		Type:     agentType,
@@ -194,7 +196,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	}
 	session, err := transport.NewSession(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("app: open %s session: %w", channelCfg.Name, err)
+		return nil, fmt.Errorf("app: open channel %q session (host %q): %w", channelCfg.Name, channelCfg.Host, err)
 	}
 
 	system, err := readSystemPrompt(agentCfg.SystemPrompt, o.PromptFile)
@@ -247,7 +249,7 @@ func resolveDefaultCwd(ctx context.Context, session execution.Session, agentCfg 
 	if strings.Contains(tmpl.Raw, "~") || strings.Contains(tmpl.Raw, "$HOME") {
 		r, err := session.Exec(ctx, `printf '%s' "$HOME"`, execution.ExecOptions{})
 		if err != nil {
-			return "", fmt.Errorf("app: resolve remote home for working_dir: %w", err)
+			return "", fmt.Errorf("app: resolve remote $HOME on channel %q for working_dir %q: %w", channelCfg.Name, tmpl.Raw, err)
 		}
 		home = strings.TrimSpace(r.Stdout)
 	}
