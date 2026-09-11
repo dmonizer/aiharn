@@ -40,7 +40,7 @@ port = 22
 # insecure = false                            # explicit, warned opt-out only
 keep_alive = true          # true: sessions share one client; false: one client per session
 default_shell = "/bin/bash"
-working_dir = "$HOME/ai-work/${agent.type}-${agent.id}"   # remote template
+working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"   # remote template
 
 [agents.main]
 model = "deepseek_flash"     # required; validated at startup
