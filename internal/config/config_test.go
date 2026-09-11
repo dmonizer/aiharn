@@ -1,0 +1,324 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// setup writes files under a temp dir and returns the dir. Prompt files and a
+// known_hosts file are created so validation can pass.
+func setup(t *testing.T, configBody string) (configPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "prompts", "planner.md"), "# planner\n")
+	writeFile(t, filepath.Join(dir, "known_hosts"), "fake-known-hosts\n")
+	configPath = filepath.Join(dir, "config.toml")
+	writeFile(t, configPath, configBody)
+	return configPath
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+const validConfig = `
+[models.opus_via_openrouter]
+provider = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${TEST_API_KEY}"
+model = "anthropic/claude-opus-4"
+
+[[channels]]
+name = "devbox"
+type = "ssh"
+host = "10.0.0.5"
+user = "ubuntu"
+auth = { key_file = "~/.ssh/id_ed25519" }
+known_hosts = "known_hosts"
+keep_alive = true
+working_dir = "/home/ubuntu/work/${agent.type}-${agent.id}"
+
+[agents.planner]
+model = "opus_via_openrouter"
+system_prompt = "prompts/planner.md"
+channel = "devbox"
+tools = "all"
+allow_subagents = true
+
+[limits]
+max_agent_depth = 3
+command_timeout = "45s"
+
+[approval]
+mode = "ask"
+`
+
+func TestLoadValid(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "sk-test-123")
+	path := setup(t, validConfig)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Env interpolation.
+	if got := cfg.Models["opus_via_openrouter"].APIKey; got != "sk-test-123" {
+		t.Errorf("APIKey = %q, want interpolated value", got)
+	}
+
+	// Channel defaults and parsing.
+	ch := cfg.Channels[0]
+	if ch.Port != 22 {
+		t.Errorf("Port = %d, want 22", ch.Port)
+	}
+	if !ch.KeepAliveEnabled() {
+		t.Errorf("KeepAlive should default/enable true")
+	}
+	if ch.DefaultShell != "/bin/bash" {
+		t.Errorf("DefaultShell = %q", ch.DefaultShell)
+	}
+	if ch.WorkingDir.Raw != "/home/ubuntu/work/${agent.type}-${agent.id}" {
+		t.Errorf("WorkingDir = %q", ch.WorkingDir.Raw)
+	}
+
+	// Local path resolution is absolute and relative to config dir.
+	dir := filepath.Dir(path)
+	if got := cfg.Agents["planner"].SystemPrompt; got != filepath.Join(dir, "prompts", "planner.md") {
+		t.Errorf("SystemPrompt = %q, want resolved under config dir", got)
+	}
+	if got := cfg.Channels[0].Auth.KeyFile; !filepath.IsAbs(got) {
+		t.Errorf("KeyFile = %q, want absolute (tilde expanded)", got)
+	}
+
+	// Limits: explicit override + defaults for the rest.
+	if cfg.Limits.MaxAgentDepth != 3 {
+		t.Errorf("MaxAgentDepth = %d, want 3", cfg.Limits.MaxAgentDepth)
+	}
+	if cfg.Limits.CommandTimeout.Std() != 45*time.Second {
+		t.Errorf("CommandTimeout = %v, want 45s", cfg.Limits.CommandTimeout.Std())
+	}
+	if cfg.Limits.MaxOpenAgents != 8 {
+		t.Errorf("MaxOpenAgents = %d, want default 8", cfg.Limits.MaxOpenAgents)
+	}
+	if cfg.Approval.Mode != ApprovalModeAsk {
+		t.Errorf("Approval.Mode = %q", cfg.Approval.Mode)
+	}
+
+	if err := Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}}); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestLoadMissingEnvVar(t *testing.T) {
+	path := setup(t, validConfig)
+	// TEST_API_KEY intentionally unset.
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "missing environment variable") {
+		t.Fatalf("Load error = %v, want missing environment variable", err)
+	}
+	if strings.Contains(err.Error(), "sk-test") {
+		t.Fatalf("error leaked a secret: %v", err)
+	}
+}
+
+func TestLoadUnknownField(t *testing.T) {
+	body := validConfig + "\nbogus_field = true\n"
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("Load error = %v, want unknown field", err)
+	}
+}
+
+func TestLoadInvalidDuration(t *testing.T) {
+	body := strings.Replace(validConfig, `command_timeout = "45s"`, `command_timeout = "not-a-duration"`, 1)
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "invalid duration") {
+		t.Fatalf("Load error = %v, want invalid duration", err)
+	}
+}
+
+func TestLoadInvalidTools(t *testing.T) {
+	body := strings.Replace(validConfig, `tools = "all"`, `tools = "sometimes"`, 1)
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "tools must be") {
+		t.Fatalf("Load error = %v, want tools error", err)
+	}
+}
+
+func TestValidateDuplicateChannel(t *testing.T) {
+	body := validConfig + `
+[[channels]]
+name = "devbox"
+type = "ssh"
+host = "10.0.0.6"
+user = "ubuntu"
+auth = { key_file = "~/.ssh/id_ed25519" }
+known_hosts = "known_hosts"
+`
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = Validate(cfg, ValidateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "duplicate name") {
+		t.Fatalf("Validate error = %v, want duplicate channel", err)
+	}
+}
+
+func TestValidateReferences(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(string) string
+		wantErr string
+	}{
+		{"unknown model", func(s string) string {
+			return strings.Replace(s, `model = "opus_via_openrouter"`, `model = "nope"`, 1)
+		}, "is not defined"},
+		{"unknown channel", func(s string) string {
+			return strings.Replace(s, `channel = "devbox"`, `channel = "nope"`, 1)
+		}, "is not defined"},
+		{"unknown tool", func(s string) string {
+			return strings.Replace(s, `tools = "all"`, `tools = ["mystery_tool"]`, 1)
+		}, "unknown tool"},
+		{"unsupported provider", func(s string) string {
+			return strings.Replace(s, `provider = "openai_responses"`, `provider = "anthropic"`, 1)
+		}, "unsupported"},
+		{"invalid approval", func(s string) string {
+			return strings.Replace(s, `mode = "ask"`, `mode = "sometimes"`, 1)
+		}, "approval.mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := setup(t, tc.mutate(validConfig))
+			t.Setenv("TEST_API_KEY", "x")
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			err = Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateNegativeLimits(t *testing.T) {
+	body := strings.Replace(validConfig, "max_agent_depth = 3", "max_agent_depth = -1", 1)
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = Validate(cfg, ValidateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "max_agent_depth") {
+		t.Fatalf("Validate error = %v, want negative limit", err)
+	}
+}
+
+func TestValidateAuthMutuallyExclusive(t *testing.T) {
+	body := strings.Replace(validConfig, `auth = { key_file = "~/.ssh/id_ed25519" }`,
+		`auth = { key_file = "~/.ssh/id_ed25519", password = "hunter2" }`, 1)
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = Validate(cfg, ValidateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("Validate error = %v, want mutually exclusive auth", err)
+	}
+}
+
+func TestValidateKnownHostsRequired(t *testing.T) {
+	// Remove known_hosts and don't set insecure.
+	body := strings.Replace(validConfig, "\nknown_hosts = \"known_hosts\"\n", "\n", 1)
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = Validate(cfg, ValidateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "known_hosts is required") {
+		t.Fatalf("Validate error = %v, want known_hosts required", err)
+	}
+}
+
+func TestRedacted(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "supersecret")
+	path := setup(t, validConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	r := cfg.Redacted()
+	if got := r.Models["opus_via_openrouter"].APIKey; got == "supersecret" || got == "" {
+		t.Errorf("Redacted APIKey = %q, want masked marker", got)
+	}
+	if strings.Contains(strings.Join([]string{
+		r.Models["opus_via_openrouter"].APIKey,
+	}, ""), "supersecret") {
+		t.Errorf("Redacted config still contains secret")
+	}
+}
+
+func TestParseWorkingDir(t *testing.T) {
+	ok := []string{
+		"/home/ubuntu/work/${agent.type}-${agent.id}",
+		"~/work/planner",
+		"$HOME/scratch",
+		"/fixed/path",
+	}
+	for _, s := range ok {
+		if _, err := ParseWorkingDir(s); err != nil {
+			t.Errorf("ParseWorkingDir(%q) unexpected error: %v", s, err)
+		}
+	}
+	bad := []string{
+		"${HOME}/x",   // ${HOME} is not a runtime placeholder; use ~ or $HOME
+		"${user}/x",   // unknown
+		"/x/${agent}", // unknown
+		"   ",
+	}
+	for _, s := range bad {
+		if _, err := ParseWorkingDir(s); err == nil {
+			t.Errorf("ParseWorkingDir(%q) expected error, got nil", s)
+		}
+	}
+}
+
+func TestToolSelectionUnmarshal(t *testing.T) {
+	// Exercises selection.go via Load.
+	body := strings.Replace(validConfig, `tools = "all"`, `tools = ["execute_command", "spawn_subagent"]`, 1)
+	path := setup(t, body)
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	sel := cfg.Agents["planner"].Tools
+	if sel.Mode != ToolModeList || len(sel.Names) != 2 {
+		t.Errorf("ToolSelection = %+v, want list of 2", sel)
+	}
+}

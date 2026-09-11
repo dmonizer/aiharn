@@ -1,0 +1,17 @@
+# Binaries
+/aiharn
+/cmd/aiharn/aiharn
+*.exe
+*.test
+*.out
+
+# Config with real credentials. The committed config.toml is an example that
+# only references environment variables (no secrets); keep local overrides in
+# *.local.toml.
+*.local.toml
+
+# Editor/OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

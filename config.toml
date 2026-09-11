@@ -1,0 +1,67 @@
+# Aiharn configuration. Local file paths (system prompts, key files, known_hosts)
+# resolve relative to THIS file's directory. ${VAR} interpolates from the
+# environment (a missing referenced variable is fatal). Tilde (~) expands only
+# for LOCAL paths. Secret-bearing fields (api_key, password) are redacted from
+# all error/log output.
+
+[models.gpt5_via_openai]
+provider = "openai_responses"          # protocol the adapter speaks; no silent fallback
+base_url = "https://api.openai.com/v1"
+api_key  = "${OPENAI_API_KEY}"
+model    = "gpt-5"
+
+[models.opus_via_openrouter]
+provider = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key  = "${OPENROUTER_API_KEY}"
+model    = "anthropic/claude-opus-4"
+
+# Execution channels. The first one is the default; overridable via --channel.
+[[channels]]
+name = "devbox"
+type = "ssh"
+host = "10.0.0.5"
+port = 22
+user = "ubuntu"
+auth = { key_file = "~/.ssh/id_ed25519" }   # local path; tilde expanded locally
+known_hosts = "~/.ssh/known_hosts"          # host-key verification (required)
+# insecure = false                            # explicit, warned opt-out only
+keep_alive = true          # true: sessions share one client; false: one client per session
+default_shell = "/bin/bash"
+working_dir = "/home/ubuntu/work/${agent.type}-${agent.id}"   # remote template
+
+[agents.main]
+model = "gpt5_via_openai"     # required; validated at startup
+system_prompt = "prompts/main.md"
+channel = "devbox"            # optional; default = first channel
+tools = "all"                 # "none" | "all" | ["execute_command", "set_approval"]
+allow_subagents = true
+
+[agents.planner]
+model = "opus_via_openrouter"
+system_prompt = "prompts/planner.md"
+channel = "devbox"
+tools = "none"
+allow_subagents = true
+
+[agents.coder]
+model = "gpt5_via_openai"
+system_prompt = "prompts/coder.md"
+channel = "devbox"
+tools = ["execute_command"]
+allow_subagents = false
+
+[limits]
+max_agent_depth = 2            # top-level = depth 0
+max_open_agents = 8            # counts every non-closed agent, including idle
+command_timeout = "30s"
+command_output_bytes = 262144  # raw stdout+stderr cap per command (bytes)
+tool_result_bytes = 65536      # max model-visible tool result (bytes)
+inbox_depth = 32               # per-agent interim-message queue
+event_capacity = 256           # agent->TUI event channel
+request_timeout = "60s"        # provider request timeout
+transcript_max_items = 200     # retained conversation items (0 = unlimited)
+transcript_max_bytes = 1048576 # retained conversation bytes (0 = unlimited)
+
+[approval]
+mode = "ask"                   # "ask" | "allow-all"   (future: "approve-for-me")
