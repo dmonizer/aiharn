@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"aiharn/internal/execution"
+	"aiharn/internal/logging"
 )
 
 // killGrace is how long Exec waits for a terminated command to unwind before
@@ -39,29 +41,44 @@ type Session struct {
 var _ execution.Session = (*Session)(nil)
 
 func openShellSession(ctx context.Context, client *ssh.Client, opts Options, dedicated bool, onDead func()) (*Session, error) {
+	logging.Debug("ssh: openShellSession new session",
+		slog.String("component", "ssh"),
+		slog.String("shell", opts.DefaultShell),
+		slog.Bool("dedicated", dedicated),
+	)
 	sess, err := newSSHSession(ctx, client)
 	if err != nil {
+		logging.Debug("ssh: openShellSession new session failed", slog.String("component", "ssh"), slog.Any("err", err))
 		return nil, fmt.Errorf("ssh: open session: %w", err)
 	}
 	stdin, err := sess.StdinPipe()
 	if err != nil {
+		logging.Debug("ssh: openShellSession stdin pipe failed", slog.String("component", "ssh"), slog.Any("err", err))
 		sess.Close()
 		return nil, fmt.Errorf("ssh: stdin pipe: %w", err)
 	}
 	stdout, err := sess.StdoutPipe()
 	if err != nil {
+		logging.Debug("ssh: openShellSession stdout pipe failed", slog.String("component", "ssh"), slog.Any("err", err))
 		sess.Close()
 		return nil, fmt.Errorf("ssh: stdout pipe: %w", err)
 	}
 	stderr, err := sess.StderrPipe()
 	if err != nil {
+		logging.Debug("ssh: openShellSession stderr pipe failed", slog.String("component", "ssh"), slog.Any("err", err))
 		sess.Close()
 		return nil, fmt.Errorf("ssh: stderr pipe: %w", err)
 	}
 	if err := sess.Start(shellCommand(opts.DefaultShell)); err != nil {
+		logging.Debug("ssh: openShellSession start shell failed",
+			slog.String("component", "ssh"),
+			slog.String("shell", opts.DefaultShell),
+			slog.Any("err", err),
+		)
 		sess.Close()
 		return nil, fmt.Errorf("ssh: start shell: %w", err)
 	}
+	logging.Debug("ssh: openShellSession ok", slog.String("component", "ssh"), slog.String("shell", opts.DefaultShell))
 
 	// Drain shell-level stderr (rare: startup errors, missing setsid/base64) so
 	// it cannot backpressure the shell. Command stderr never flows here; the
@@ -118,6 +135,7 @@ func (s *Session) markDead() {
 	already := s.dead
 	s.dead = true
 	s.deadMu.Unlock()
+	logging.Debug("ssh: markDead", slog.String("component", "ssh"), slog.Bool("already_dead", already))
 	if !already && s.onDead != nil {
 		s.onDead()
 	}
@@ -140,12 +158,23 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	start := time.Now()
+	logging.Debug("ssh: Exec start",
+		slog.String("component", "ssh"),
+		slog.String("cmd", cmd),
+		slog.String("cwd", opts.Cwd),
+		slog.Int64("max_output", opts.MaxOutputBytes),
+	)
+
 	if s.isDead() {
-		return execution.Result{}, fmt.Errorf("%w: session is no longer usable", execution.ErrSessionReset)
+		err := fmt.Errorf("%w: session is no longer usable", execution.ErrSessionReset)
+		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
+		return execution.Result{}, err
 	}
 
 	m, err := newMarkers()
 	if err != nil {
+		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
 		return execution.Result{}, err
 	}
 	script := buildWrapperScript(m, opts.Cwd, cmd)
@@ -161,10 +190,14 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 			break
 		}
 		s.closeDead()
-		return execution.Result{}, fmt.Errorf("%w: write: %v", execution.ErrSessionReset, err)
+		werr := fmt.Errorf("%w: write: %v", execution.ErrSessionReset, err)
+		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", werr))
+		return execution.Result{}, werr
 	case <-ctx.Done():
 		s.Close()
-		return execution.Result{}, fmt.Errorf("%w: cancelled while writing command: %v", execution.ErrSessionReset, ctx.Err())
+		cerr := fmt.Errorf("%w: cancelled while writing command: %v", execution.ErrSessionReset, ctx.Err())
+		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
+		return execution.Result{}, cerr
 	}
 
 	type beginResult struct {
@@ -182,7 +215,9 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 		pid, err = r.pid, r.err
 	case <-ctx.Done():
 		s.Close()
-		return execution.Result{}, fmt.Errorf("%w: cancelled before command started: %v", execution.ErrSessionReset, ctx.Err())
+		cerr := fmt.Errorf("%w: cancelled before command started: %v", execution.ErrSessionReset, ctx.Err())
+		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
+		return execution.Result{}, cerr
 	}
 	if err != nil {
 		if errors.Is(err, execution.ErrSessionReset) {
@@ -190,7 +225,9 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 		} else {
 			s.Close()
 		}
-		return execution.Result{}, fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", s.opts.DefaultShell, err)
+		berr := fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", s.opts.DefaultShell, err)
+		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", berr))
+		return execution.Result{}, berr
 	}
 
 	type bodyResult struct {
@@ -206,20 +243,61 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	for {
 		select {
 		case r := <-ch:
-			return s.finishBody(r.f, r.err)
+			res, err := s.finishBody(r.f, r.err)
+			s.logExecFinish(start, pid, res, err)
+			return res, err
 		case <-ctx.Done():
 			for _, sig := range []string{"TERM", "KILL"} {
+				logging.Debug("ssh: Exec cancellation signal",
+					slog.String("component", "ssh"),
+					slog.String("signal", sig),
+					slog.Int("pid", pid),
+					slog.Int("pgid", pid),
+				)
 				s.signal(pid, sig)
 				select {
 				case r := <-ch:
-					return s.finishBody(r.f, r.err)
+					res, err := s.finishBody(r.f, r.err)
+					s.logExecFinish(start, pid, res, err)
+					return res, err
 				case <-time.After(killGrace):
 				}
 			}
 			s.Close()
-			return execution.Result{}, fmt.Errorf("%w: command survived TERM and KILL", execution.ErrSessionReset)
+			serr := fmt.Errorf("%w: command survived TERM and KILL", execution.ErrSessionReset)
+			logging.Debug("ssh: Exec finish",
+				slog.String("component", "ssh"),
+				slog.Int("pid", pid),
+				slog.Int("pgid", pid),
+				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+				slog.Any("err", serr),
+			)
+			return execution.Result{}, serr
 		}
 	}
+}
+
+// logExecFinish records the outcome of a completed Exec: the remote process
+// group id, exit code, retained byte counts, truncation, duration, and any
+// error. It never logs output contents.
+func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, err error) {
+	attrs := []slog.Attr{
+		slog.String("component", "ssh"),
+		slog.Int("pid", pid),
+		slog.Int("pgid", pid),
+		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+	}
+	if err != nil {
+		attrs = append(attrs, slog.Any("err", err))
+	} else {
+		attrs = append(attrs,
+			slog.Int("exit_code", res.ExitCode),
+			slog.Int("stdout_bytes", len(res.Stdout)),
+			slog.Int("stderr_bytes", len(res.Stderr)),
+			slog.Bool("truncated", res.Truncated),
+		)
+	}
+	logging.Debug("ssh: Exec finish", attrs...)
 }
 
 func (s *Session) finishBody(f execFrame, err error) (execution.Result, error) {
@@ -274,6 +352,7 @@ func (s *Session) signal(pid int, sig string) {
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.markClosed()
+		logging.Debug("ssh: Session.Close", slog.String("component", "ssh"), slog.Bool("dedicated", s.dedicated))
 		if s.shell != nil {
 			s.shell.Close()
 		}
@@ -285,6 +364,7 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) closeDead() {
+	logging.Debug("ssh: closeDead", slog.String("component", "ssh"))
 	s.markDead()
 	_ = s.Close()
 }

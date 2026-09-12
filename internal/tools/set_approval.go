@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"aiharn/internal/approval"
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 )
 
 // SetApproval returns the tool that lets the model tighten the approval mode.
@@ -41,6 +43,11 @@ func (t *setApproval) Run(ctx context.Context, args json.RawMessage) (string, er
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	logging.Debug("tool: set_approval",
+		slog.String("component", "tool"),
+		slog.String("tool", NameSetApproval),
+		slog.String("mode", p.Mode),
+	)
 	var mode approval.Mode
 	switch p.Mode {
 	case "ask":
@@ -51,7 +58,9 @@ func (t *setApproval) Run(ctx context.Context, args json.RawMessage) (string, er
 		return "", fmt.Errorf("invalid mode %q", p.Mode)
 	}
 	if err := t.gate.ApplyModelMode(mode); err != nil {
+		logging.Debug("tool: set_approval result", slog.String("component", "tool"), slog.String("tool", NameSetApproval), slog.Any("err", err))
 		return "", err
 	}
+	logging.Debug("tool: set_approval result", slog.String("component", "tool"), slog.String("tool", NameSetApproval), slog.String("mode", mode.String()))
 	return fmt.Sprintf("approval mode is now %s", mode), nil
 }

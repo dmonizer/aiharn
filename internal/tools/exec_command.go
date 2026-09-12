@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"aiharn/internal/approval"
 	"aiharn/internal/execution"
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 )
 
 // Executor runs a shell command. execution.Session satisfies it.
@@ -52,6 +54,7 @@ func (t *execCommand) Definition() llm.ToolDefinition {
 }
 
 func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, error) {
+	start := time.Now()
 	var p struct {
 		Command string `json:"command"`
 		Cwd     string `json:"cwd"`
@@ -59,6 +62,12 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	logging.Debug("tool: execute_command",
+		slog.String("component", "tool"),
+		slog.String("tool", NameExecuteCommand),
+		slog.String("command", p.Command),
+		slog.String("cwd", p.Cwd),
+	)
 
 	d, err := t.gate.Check(ctx, approval.Request{
 		ToolName: NameExecuteCommand,
@@ -66,8 +75,25 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		Args:     string(args),
 	})
 	if err != nil {
+		logging.Debug("tool: execute_command result",
+			slog.String("component", "tool"),
+			slog.String("tool", NameExecuteCommand),
+			slog.String("command", p.Command),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.Any("err", err),
+		)
 		return "", err
 	}
+	decision := "approved"
+	if d == approval.DecisionDenied {
+		decision = "denied"
+	}
+	logging.Debug("tool: execute_command decision",
+		slog.String("component", "tool"),
+		slog.String("tool", NameExecuteCommand),
+		slog.String("command", p.Command),
+		slog.String("decision", decision),
+	)
 	if d == approval.DecisionDenied {
 		return "denied by user", nil
 	}
@@ -87,8 +113,29 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		MaxOutputBytes: t.maxOutput,
 	})
 	if err != nil {
+		logging.Debug("tool: execute_command result",
+			slog.String("component", "tool"),
+			slog.String("tool", NameExecuteCommand),
+			slog.String("command", p.Command),
+			slog.String("cwd", cwd),
+			slog.String("decision", decision),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.Any("err", err),
+		)
 		return "", err
 	}
+	logging.Debug("tool: execute_command result",
+		slog.String("component", "tool"),
+		slog.String("tool", NameExecuteCommand),
+		slog.String("command", p.Command),
+		slog.String("cwd", cwd),
+		slog.String("decision", decision),
+		slog.Int("exit_code", r.ExitCode),
+		slog.Int("stdout_bytes", len(r.Stdout)),
+		slog.Int("stderr_bytes", len(r.Stderr)),
+		slog.Bool("truncated", r.Truncated),
+		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+	)
 	return formatExecResult(r), nil
 }
 

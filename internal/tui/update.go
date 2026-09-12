@@ -74,6 +74,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if line == "" {
 			return m, nil
 		}
+		if strings.HasPrefix(line, "/") {
+			return m, m.handleCommand(line)
+		}
 		m.queue = append(m.queue, line)
 		return m, m.nextTurn()
 

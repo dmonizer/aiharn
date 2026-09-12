@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"aiharn/internal/execution"
+	"aiharn/internal/logging"
 )
 
 // Options are the channel settings needed to dial and authenticate an SSH
@@ -118,6 +120,13 @@ func validateLocalFile(path string, maxBytes int64, name string) error {
 // NewSession opens a persistent shell. With KeepAlive it reuses one shared
 // client; otherwise it dials a dedicated client owned by the returned session.
 func (t *Transport) NewSession(ctx context.Context) (execution.Session, error) {
+	logging.Debug("ssh: NewSession",
+		slog.String("component", "ssh"),
+		slog.String("host", t.opts.Host),
+		slog.Int("port", t.opts.Port),
+		slog.String("user", t.opts.User),
+		slog.Bool("keep_alive", t.opts.KeepAlive),
+	)
 	client, dedicated, err := t.acquireClient(ctx)
 	if err != nil {
 		return nil, err
@@ -146,8 +155,10 @@ func (t *Transport) Close() error {
 	if t.shared != nil {
 		err := t.shared.Close()
 		t.shared = nil
+		logging.Debug("ssh: Transport.Close", slog.String("component", "ssh"), slog.Bool("closed_shared", true), slog.Any("err", err))
 		return err
 	}
+	logging.Debug("ssh: Transport.Close", slog.String("component", "ssh"), slog.Bool("closed_shared", false))
 	return nil
 }
 
@@ -158,19 +169,40 @@ func (t *Transport) acquireClient(ctx context.Context) (*ssh.Client, bool, error
 		return nil, false, errors.New("ssh: transport closed")
 	}
 	if t.opts.KeepAlive {
+		reused := t.shared != nil
 		if t.shared == nil {
 			c, err := dial(ctx, t.opts)
 			if err != nil {
+				logging.Debug("ssh: acquireClient",
+					slog.String("component", "ssh"),
+					slog.Bool("shared", true),
+					slog.Bool("reused", false),
+					slog.Any("err", err),
+				)
 				return nil, false, err
 			}
 			t.shared = c
 		}
+		logging.Debug("ssh: acquireClient",
+			slog.String("component", "ssh"),
+			slog.Bool("shared", true),
+			slog.Bool("reused", reused),
+		)
 		return t.shared, false, nil
 	}
 	c, err := dial(ctx, t.opts)
 	if err != nil {
+		logging.Debug("ssh: acquireClient",
+			slog.String("component", "ssh"),
+			slog.Bool("shared", false),
+			slog.Any("err", err),
+		)
 		return nil, false, err
 	}
+	logging.Debug("ssh: acquireClient",
+		slog.String("component", "ssh"),
+		slog.Bool("shared", false),
+	)
 	return c, true, nil
 }
 
@@ -182,18 +214,24 @@ func (t *Transport) dropShared(expected *ssh.Client) {
 	if t.shared == expected {
 		t.shared.Close()
 		t.shared = nil
+		logging.Debug("ssh: dropShared", slog.String("component", "ssh"))
+		return
 	}
+	logging.Debug("ssh: dropShared", slog.String("component", "ssh"), slog.Bool("matched", false))
 }
 
 func dial(ctx context.Context, opts Options) (*ssh.Client, error) {
+	addr := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
+	logging.Debug("ssh: dial start", slog.String("component", "ssh"), slog.String("addr", addr))
 	cfg, release, err := buildClientConfigContext(ctx, opts)
 	if err != nil {
+		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, err
 	}
 	defer release()
-	addr := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
+		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, sanitizeSSHError(err, opts)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
@@ -211,13 +249,16 @@ func dial(ctx context.Context, opts Options) (*ssh.Client, error) {
 	close(done)
 	if err != nil {
 		raw.Close()
+		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, sanitizeSSHError(err, opts)
 	}
 	if err := ctx.Err(); err != nil {
 		conn.Close()
+		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, err
 	}
 	_ = raw.SetDeadline(time.Time{})
+	logging.Debug("ssh: dial ok", slog.String("component", "ssh"), slog.String("addr", addr))
 	return ssh.NewClient(conn, chans, reqs), nil
 }
 
@@ -228,10 +269,13 @@ func dial(ctx context.Context, opts Options) (*ssh.Client, error) {
 func buildClientConfigContext(ctx context.Context, opts Options) (*ssh.ClientConfig, func(), error) {
 	release := func() {}
 	var auth ssh.AuthMethod
+	authMethod := "ssh-agent"
 	switch {
 	case opts.Password != "":
+		authMethod = "password"
 		auth = ssh.Password(opts.Password)
 	case opts.KeyFile != "":
+		authMethod = "key-file"
 		const maxPrivateKeyBytes = 1 << 20
 		f, err := os.Open(opts.KeyFile)
 		if err != nil {
@@ -254,12 +298,25 @@ func buildClientConfigContext(ctx context.Context, opts Options) (*ssh.ClientCon
 		}
 		auth = ssh.PublicKeys(signer)
 	default:
+		authMethod = "ssh-agent"
 		var err error
 		auth, release, err = agentAuthContext(ctx)
 		if err != nil {
 			return nil, release, err
 		}
 	}
+
+	authAttrs := []slog.Attr{
+		slog.String("component", "ssh"),
+		slog.String("auth", authMethod),
+		slog.String("user", opts.User),
+		slog.Bool("insecure", opts.Insecure),
+		slog.Bool("has_known_hosts", opts.KnownHosts != ""),
+	}
+	if authMethod == "key-file" {
+		authAttrs = append(authAttrs, slog.String("key_file", opts.KeyFile))
+	}
+	logging.Debug("ssh: buildClientConfig", authAttrs...)
 
 	cfg := &ssh.ClientConfig{
 		User: opts.User,

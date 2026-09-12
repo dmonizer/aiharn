@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"aiharn/internal/approval"
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 )
 
 // Subagent tool names.
@@ -75,6 +77,13 @@ func (t *spawnSubagent) Run(ctx context.Context, args json.RawMessage) (string, 
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	logging.Debug("tool: spawn_subagent",
+		slog.String("component", "tool"),
+		slog.String("tool", NameSpawnSubagent),
+		slog.String("caller_id", t.callerID),
+		slog.String("agent_type", p.AgentType),
+		slog.Int("prompt_bytes", len(p.Prompt)),
+	)
 
 	d, err := t.gate.Check(ctx, approval.Request{
 		ToolName: NameSpawnSubagent,
@@ -82,16 +91,20 @@ func (t *spawnSubagent) Run(ctx context.Context, args json.RawMessage) (string, 
 		Args:     string(args),
 	})
 	if err != nil {
+		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))
 		return "", err
 	}
 	if d == approval.DecisionDenied {
+		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.String("decision", "denied"))
 		return "denied by user", nil
 	}
 
 	id, err := t.backend.SpawnSubagent(ctx, t.callerID, p.AgentType, p.Prompt)
 	if err != nil {
+		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))
 		return "", err
 	}
+	logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.String("subagent_id", id))
 	return fmt.Sprintf("spawned subagent %s", id), nil
 }
 
@@ -130,9 +143,18 @@ func (t *sendSubagentMessage) Run(ctx context.Context, args json.RawMessage) (st
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	logging.Debug("tool: send_subagent_message",
+		slog.String("component", "tool"),
+		slog.String("tool", NameSendSubagentMessage),
+		slog.String("caller_id", t.callerID),
+		slog.String("subagent_id", p.SubagentID),
+		slog.Int("message_bytes", len(p.Message)),
+	)
 	if err := t.backend.SendSubagentMessage(ctx, t.callerID, p.SubagentID, p.Message); err != nil {
+		logging.Debug("tool: send_subagent_message result", slog.String("component", "tool"), slog.String("tool", NameSendSubagentMessage), slog.String("subagent_id", p.SubagentID), slog.Any("err", err))
 		return "", err
 	}
+	logging.Debug("tool: send_subagent_message result", slog.String("component", "tool"), slog.String("tool", NameSendSubagentMessage), slog.String("subagent_id", p.SubagentID))
 	return fmt.Sprintf("message sent to %s", p.SubagentID), nil
 }
 
@@ -168,10 +190,18 @@ func (t *checkSubagent) Run(ctx context.Context, args json.RawMessage) (string, 
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	logging.Debug("tool: check_subagent",
+		slog.String("component", "tool"),
+		slog.String("tool", NameCheckSubagent),
+		slog.String("caller_id", t.callerID),
+		slog.String("subagent_id", p.SubagentID),
+	)
 	s, err := t.backend.CheckSubagent(ctx, t.callerID, p.SubagentID)
 	if err != nil {
+		logging.Debug("tool: check_subagent result", slog.String("component", "tool"), slog.String("tool", NameCheckSubagent), slog.String("subagent_id", p.SubagentID), slog.Any("err", err))
 		return "", err
 	}
+	logging.Debug("tool: check_subagent result", slog.String("component", "tool"), slog.String("tool", NameCheckSubagent), slog.String("subagent_id", p.SubagentID), slog.String("state", s.State))
 	return formatSubagentStatus(s), nil
 }
 
@@ -194,10 +224,17 @@ func (t *listSubagents) Definition() llm.ToolDefinition {
 }
 
 func (t *listSubagents) Run(ctx context.Context, args json.RawMessage) (string, error) {
+	logging.Debug("tool: list_subagents",
+		slog.String("component", "tool"),
+		slog.String("tool", NameListSubagents),
+		slog.String("caller_id", t.callerID),
+	)
 	subs, err := t.backend.ListSubagents(ctx, t.callerID)
 	if err != nil {
+		logging.Debug("tool: list_subagents result", slog.String("component", "tool"), slog.String("tool", NameListSubagents), slog.Any("err", err))
 		return "", err
 	}
+	logging.Debug("tool: list_subagents result", slog.String("component", "tool"), slog.String("tool", NameListSubagents), slog.Int("count", len(subs)))
 	return formatSubagentList(subs), nil
 }
 
@@ -233,9 +270,17 @@ func (t *closeSubagent) Run(ctx context.Context, args json.RawMessage) (string, 
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	logging.Debug("tool: close_subagent",
+		slog.String("component", "tool"),
+		slog.String("tool", NameCloseSubagent),
+		slog.String("caller_id", t.callerID),
+		slog.String("subagent_id", p.SubagentID),
+	)
 	if err := t.backend.CloseSubagent(ctx, t.callerID, p.SubagentID); err != nil {
+		logging.Debug("tool: close_subagent result", slog.String("component", "tool"), slog.String("tool", NameCloseSubagent), slog.String("subagent_id", p.SubagentID), slog.Any("err", err))
 		return "", err
 	}
+	logging.Debug("tool: close_subagent result", slog.String("component", "tool"), slog.String("tool", NameCloseSubagent), slog.String("subagent_id", p.SubagentID))
 	return fmt.Sprintf("closed subagent %s", p.SubagentID), nil
 }
 

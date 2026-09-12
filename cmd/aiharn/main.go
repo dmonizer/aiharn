@@ -13,6 +13,7 @@ import (
 
 	"aiharn/internal/app"
 	"aiharn/internal/config"
+	"aiharn/internal/logging"
 	"aiharn/internal/tools"
 	"aiharn/internal/tui"
 )
@@ -37,11 +38,13 @@ func run(args []string) int {
 		modelName  = fs.String("model", "", "override the model config")
 		approval   = fs.String("approval", "", "override approval mode (ask | allow-all)")
 		showVer    = fs.Bool("version", false, "print version and exit")
+		debug      = fs.Bool("debug", false, "enable debug logging to stderr")
 	)
 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	logging.SetDebug(*debug)
 	if *showVer {
 		fmt.Fprintf(os.Stdout, "aiharn %s\n", version)
 		return 0

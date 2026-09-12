@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 
 	"aiharn/internal/execution"
+	"aiharn/internal/logging"
 )
 
 // Marker prefixes. Each Exec generates a fresh random nonce so a command whose
@@ -37,6 +39,7 @@ func newMarkers() (markers, error) {
 		return markers{}, err
 	}
 	n := hex.EncodeToString(b[:])
+	logging.Debug("ssh: newMarkers", slog.String("component", "ssh"), slog.String("nonce_prefix", n[:8]))
 	return markers{
 		begin: beginPrefix + n,
 		end:   endPrefix + n,
@@ -105,6 +108,7 @@ func readBegin(r *bufio.Reader, m markers) (int, error) {
 	if pid <= 0 {
 		return 0, fmt.Errorf("ssh framing: invalid process-group id %d", pid)
 	}
+	logging.Debug("ssh: readBegin", slog.String("component", "ssh"), slog.Int("pid", pid), slog.Int("pgid", pid))
 	return pid, nil
 }
 
@@ -160,11 +164,22 @@ func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execF
 	}
 	f.stderr = errb.Bytes()
 	f.truncated = truncOut || truncErr
+	logging.Debug("ssh: readBody",
+		slog.String("component", "ssh"),
+		slog.Int("exit_code", f.exitCode),
+		slog.Int("stdout_bytes", len(f.stdout)),
+		slog.Int("stderr_bytes", len(f.stderr)),
+		slog.Bool("truncated", f.truncated),
+	)
 	return f, streamErr
 }
 
 func wrapFrameErr(err error) error {
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		logging.Debug("ssh: shell stream ended before marker",
+			slog.String("component", "ssh"),
+			slog.Any("err", err),
+		)
 		return fmt.Errorf("%w: shell stream ended before marker", execution.ErrSessionReset)
 	}
 	return err
@@ -226,6 +241,7 @@ func readToMarker(r *bufio.Reader, marker string, out *bytes.Buffer, sink io.Wri
 			if len(carry) > 0 {
 				commit(carry)
 			}
+			logging.Debug("ssh: readToMarker error", slog.String("component", "ssh"), slog.Any("err", err))
 			return truncated, err
 		}
 		carry = append(carry, c)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/kevinburke/ssh_config"
+
+	"aiharn/internal/logging"
 )
 
 // defaultSSHConfigPath returns the path to the user's OpenSSH config.
@@ -82,6 +85,14 @@ func resolveAlias(opts Options, configPath string) (Options, error) {
 	if opts.KnownHosts == "" {
 		opts.KnownHosts = filepath.Join(sshDir, "known_hosts")
 	}
+	logging.Debug("ssh: resolveAlias",
+		slog.String("component", "ssh"),
+		slog.String("alias", alias),
+		slog.String("host", opts.Host),
+		slog.Int("port", opts.Port),
+		slog.String("user", opts.User),
+		slog.Bool("has_identity_file", opts.KeyFile != ""),
+	)
 	return opts, nil
 }
 

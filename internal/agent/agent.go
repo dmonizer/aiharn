@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 	"aiharn/internal/tools"
 )
 
@@ -270,9 +272,34 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
 
+	start := time.Now()
+	logging.Debug("agent: turn start",
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.String("agent_type", a.typ),
+		slog.Int("input_bytes", len(input)),
+	)
+	fail := func(err error) error {
+		logging.Debug("agent: turn end",
+			slog.String("component", "agent"),
+			slog.String("agent_id", a.id),
+			slog.String("agent_type", a.typ),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.Any("err", err),
+		)
+		return a.fail(err)
+	}
+
 	a.mu.Lock()
 	if a.state == StateClosed {
 		a.mu.Unlock()
+		logging.Debug("agent: turn end",
+			slog.String("component", "agent"),
+			slog.String("agent_id", a.id),
+			slog.String("agent_type", a.typ),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			slog.Any("err", ErrAgentClosed),
+		)
 		return ErrAgentClosed
 	}
 	a.active.Add(1)
@@ -304,20 +331,45 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 		stream, err := a.client.Stream(rctx, a.buildRequest())
 		if err != nil {
 			cancel()
-			return a.fail(err)
+			logging.Debug("agent: client.Stream error",
+				slog.String("component", "agent"),
+				slog.String("agent_id", a.id),
+				slog.Int("round", round),
+				slog.Any("err", err),
+			)
+			return fail(err)
 		}
 
 		output, err := a.collect(rctx, stream)
 		cancel()
 		if err != nil {
-			return a.fail(err)
+			logging.Debug("agent: collect error",
+				slog.String("component", "agent"),
+				slog.String("agent_id", a.id),
+				slog.Int("round", round),
+				slog.Any("err", err),
+			)
+			return fail(err)
 		}
 		a.append(output...)
 
 		calls := functionCalls(output)
+		logging.Debug("agent: round collected",
+			slog.String("component", "agent"),
+			slog.String("agent_id", a.id),
+			slog.Int("round", round),
+			slog.Int("output_items", len(output)),
+			slog.Int("tool_calls", len(calls)),
+		)
 		if len(calls) == 0 {
 			a.trimHistory()
 			a.setState(StateIdle)
+			logging.Debug("agent: turn end",
+				slog.String("component", "agent"),
+				slog.String("agent_id", a.id),
+				slog.String("agent_type", a.typ),
+				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+			)
 			return nil
 		}
 
@@ -332,7 +384,7 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 		}
 	}
 
-	return a.fail(fmt.Errorf("turn exceeded %d tool-call rounds", a.maxToolRounds))
+	return fail(fmt.Errorf("turn exceeded %d tool-call rounds", a.maxToolRounds))
 }
 
 // run drives a subagent: it consumes one task at a time from the inbox, runs a
@@ -420,39 +472,105 @@ func (a *Agent) buildRequest() llm.Request {
 
 func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Item, error) {
 	var output []llm.Item
+	textDeltas := 0
 	for ev := range stream {
 		switch ev.Type {
 		case llm.EventTextDelta:
+			textDeltas++
 			a.emit(Event{Type: EventText, Text: ev.Text})
 		case llm.EventCompleted:
 			if ev.FinishReason != "" && ev.FinishReason != "stop" {
+				logging.Debug("agent: collect terminal",
+					slog.String("component", "agent"),
+					slog.String("agent_id", a.id),
+					slog.String("reason", "completed"),
+					slog.String("finish_reason", ev.FinishReason),
+					slog.Int("text_deltas", textDeltas),
+				)
 				return nil, fmt.Errorf("llm response incomplete: %s", ev.FinishReason)
 			}
 			output = ev.Items
+			logging.Debug("agent: collect terminal",
+				slog.String("component", "agent"),
+				slog.String("agent_id", a.id),
+				slog.String("reason", "completed"),
+				slog.String("finish_reason", ev.FinishReason),
+				slog.Int("text_deltas", textDeltas),
+				slog.Int("items", len(ev.Items)),
+			)
 		case llm.EventFailed:
+			logging.Debug("agent: collect terminal",
+				slog.String("component", "agent"),
+				slog.String("agent_id", a.id),
+				slog.String("reason", "failed"),
+				slog.Int("text_deltas", textDeltas),
+				slog.Any("err", ev.Err),
+			)
 			return nil, ev.Err
 		}
 	}
 	if output == nil {
 		if err := ctx.Err(); err != nil {
+			logging.Debug("agent: collect terminal",
+				slog.String("component", "agent"),
+				slog.String("agent_id", a.id),
+				slog.String("reason", "context"),
+				slog.Int("text_deltas", textDeltas),
+				slog.Any("err", err),
+			)
 			return nil, err
 		}
+		logging.Debug("agent: collect terminal",
+			slog.String("component", "agent"),
+			slog.String("agent_id", a.id),
+			slog.String("reason", "no_terminal"),
+			slog.Int("text_deltas", textDeltas),
+		)
 		return nil, errors.New("llm stream ended without a terminal event")
 	}
 	return output, nil
 }
 
 func (a *Agent) runTool(ctx context.Context, call llm.Item) string {
+	start := time.Now()
+	argsLog := call.Args
+	if len(argsLog) > 256 {
+		argsLog = argsLog[:256] + "..."
+	}
+	logging.Debug("agent: runTool",
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.String("tool", call.Name),
+		slog.String("args", argsLog),
+		slog.Int("args_bytes", len(call.Args)),
+	)
+	logDone := func(resultBytes int, err error) {
+		attrs := []slog.Attr{
+			slog.String("component", "agent"),
+			slog.String("agent_id", a.id),
+			slog.String("tool", call.Name),
+			slog.Int("result_bytes", resultBytes),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+		}
+		if err != nil {
+			attrs = append(attrs, slog.Any("err", err))
+		}
+		logging.Debug("agent: runTool done", attrs...)
+	}
 	if a.tools == nil {
-		return fmt.Sprintf("error: no tools available (cannot call %q)", call.Name)
+		res := fmt.Sprintf("error: no tools available (cannot call %q)", call.Name)
+		logDone(len(res), errors.New("no tools available"))
+		return res
 	}
 	result, err := a.tools.Run(ctx, call.Name, json.RawMessage(call.Args))
 	if err != nil {
+		logDone(len(result), err)
 		return "error: " + err.Error()
 	}
 	if a.toolResultBytes > 0 && int64(len(result)) > a.toolResultBytes {
 		result = truncateUTF8(result, a.toolResultBytes) + "\n[result truncated]"
 	}
+	logDone(len(result), nil)
 	return result
 }
 
