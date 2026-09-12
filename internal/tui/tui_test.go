@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
@@ -61,8 +63,8 @@ func TestUpdateToolCallFlushesText(t *testing.T) {
 	if len(m.curText) != 0 {
 		t.Fatalf("curText = %q, want flushed", m.curText)
 	}
-	if len(m.lines) == 0 || m.lines[len(m.lines)-1] != "[tool] execute_command {\"command\":\"ls\"}" {
-		t.Fatalf("last line = %q", m.lines[len(m.lines)-1])
+	if len(m.lines) == 0 || m.lines[len(m.lines)-1].text != "[tool] execute_command {\"command\":\"ls\"}" {
+		t.Fatalf("last line = %q", m.lines[len(m.lines)-1].text)
 	}
 }
 
@@ -147,6 +149,58 @@ func TestQuitOnCtrlC(t *testing.T) {
 	}
 }
 
+func TestQuitCommand(t *testing.T) {
+	m := New(nil, nil, nil, Status{})
+	cmd := m.handleCommand("/quit")
+	if cmd == nil {
+		t.Fatal("expected quit command")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("cmd() = %T, want tea.QuitMsg", msg)
+	}
+	if m.ctx.Err() == nil {
+		t.Fatal("expected context cancelled on quit")
+	}
+
+	// /exit is an alias.
+	m = New(nil, nil, nil, Status{})
+	if cmd := m.handleCommand("/exit"); cmd == nil {
+		t.Fatal("expected /exit to quit too")
+	}
+}
+
+func TestStyleLineColors(t *testing.T) {
+	// Force the 16-color ANSI profile so Render emits color codes regardless of
+	// the terminal the test runs under (CI and headless runs detect "no color").
+	lipgloss.SetColorProfile(termenv.ANSI)
+	t.Cleanup(func() { lipgloss.SetColorProfile(termenv.ANSI256) })
+
+	cases := []struct {
+		kind lineKind
+		want string // ANSI SGR color code, "" means unstyled
+	}{
+		{kindPlain, ""},
+		{kindAssistant, ""},
+		{kindUser, "36"},
+		{kindTool, "33"},
+		{kindError, "31"},
+		{kindApproval, "35"},
+	}
+	for _, c := range cases {
+		got := styleLine(c.kind, "hello")
+		if c.want == "" {
+			if strings.Contains(got, "\x1b[") {
+				t.Fatalf("kind=%d got %q, want no ANSI escape", c.kind, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.want+"m") {
+			t.Fatalf("kind=%d got %q, want color %s", c.kind, got, c.want)
+		}
+	}
+}
+
 func TestApprovalKeys(t *testing.T) {
 	m := newTestModel(t)
 	req := approval.Request{ID: "1", ToolName: "execute_command", Command: "ls"}
@@ -176,8 +230,8 @@ func TestApprovalRequestsAreQueued(t *testing.T) {
 
 func TestTerminalControlSequencesAreRemoved(t *testing.T) {
 	m := newTestModel(t)
-	m.appendLine("safe\x1b]52;c;clipboard\a text")
-	got := m.lines[len(m.lines)-1]
+	m.appendLine(kindPlain, "safe\x1b]52;c;clipboard\a text")
+	got := m.lines[len(m.lines)-1].text
 	if strings.ContainsAny(got, "\x1b\a") || got != "safe]52;c;clipboard text" {
 		t.Fatalf("sanitized line = %q", got)
 	}

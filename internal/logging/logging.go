@@ -7,6 +7,7 @@ package logging
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -15,8 +16,15 @@ import (
 
 var (
 	enabled atomic.Bool
-	logger  = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger  = newLogger(os.Stderr)
 )
+
+// newLogger builds a text handler that accepts debug records. The default
+// slog handler level is Info, which silently discards LevelDebug records; the
+// explicit Level is what makes Debug() actually emit.
+func newLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
 
 func init() {
 	enabled.Store(envTruthy(os.Getenv("AIHARN_DEBUG")))

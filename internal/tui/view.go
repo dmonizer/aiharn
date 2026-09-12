@@ -7,6 +7,34 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Per-kind transcript styles. ANSI basic colors work on every terminal.
+var (
+	styleUser      = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	styleAssistant = lipgloss.NewStyle()
+	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleApproval  = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+)
+
+// styleLine renders a transcript line in its kind's color (plain passes through
+// unstyled so structural and system lines keep the terminal default).
+func styleLine(kind lineKind, s string) string {
+	switch kind {
+	case kindUser:
+		return styleUser.Render(s)
+	case kindAssistant:
+		return styleAssistant.Render(s)
+	case kindTool:
+		return styleTool.Render(s)
+	case kindError:
+		return styleError.Render(s)
+	case kindApproval:
+		return styleApproval.Render(s)
+	default:
+		return s
+	}
+}
+
 // View renders the status bar, the focused transcript beside a live subagent
 // list, and either the input line or an approval prompt.
 func (m *Model) View() string {
@@ -88,9 +116,11 @@ func (m *Model) transcriptBlock(rows int) string {
 		lines = nil
 	}
 	out := make([]string, 0, len(lines)+1)
-	out = append(out, lines...)
+	for _, ln := range lines {
+		out = append(out, styleLine(ln.kind, ln.text))
+	}
 	if len(m.curText) != 0 {
-		out = append(out, string(m.curText))
+		out = append(out, styleLine(kindAssistant, string(m.curText)))
 	}
 	return strings.Join(out, "\n")
 }

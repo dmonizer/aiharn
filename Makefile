@@ -1,7 +1,7 @@
 .PHONY: build vet test race run clean
 
 build:
-	go build ./...
+	go build -o aiharn ./cmd/aiharn
 
 vet:
 	go vet ./...

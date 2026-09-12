@@ -68,17 +68,18 @@ type AuthConfig struct {
 // ChannelConfig is an execution channel (transport). The first channel in the
 // list is the default unless an agent overrides it.
 type ChannelConfig struct {
-	Name         string             `toml:"name"`
-	Type         string             `toml:"type"`
-	Host         string             `toml:"host"`
-	Port         int                `toml:"port"`
-	User         string             `toml:"user"`
-	Auth         AuthConfig         `toml:"auth"`
-	KnownHosts   string             `toml:"known_hosts"`
-	Insecure     bool               `toml:"insecure"`
-	KeepAlive    *bool              `toml:"keep_alive"` // non-nil after Load; true = shared client
-	DefaultShell string             `toml:"default_shell"`
-	WorkingDir   WorkingDirTemplate `toml:"working_dir"`
+	Name          string             `toml:"name"`
+	Type          string             `toml:"type"`
+	Host          string             `toml:"host"`
+	Port          int                `toml:"port"`
+	User          string             `toml:"user"`
+	Auth          AuthConfig         `toml:"auth"`
+	KnownHosts    string             `toml:"known_hosts"`
+	Insecure      bool               `toml:"insecure"`
+	KeepAlive     *bool              `toml:"keep_alive"` // non-nil after Load; true = shared client
+	DefaultShell  string             `toml:"default_shell"`
+	RemoteCommand string             `toml:"remote_command"` // optional command run in place of the default shell
+	WorkingDir    WorkingDirTemplate `toml:"working_dir"`
 }
 
 // KeepAliveEnabled reports whether the channel reuses a shared client

@@ -32,6 +32,10 @@ type Options struct {
 	Channel    string // override execution channel
 	Model      string // override model config name
 	Approval   string // override approval mode
+
+	// Observer, when set, receives every history item appended by any agent (the
+	// top-level agent and all subagents), enabling a full conversation log.
+	Observer agent.HistoryObserver
 }
 
 // Summary is the startup banner content. It never carries secret values.
@@ -126,13 +130,14 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 	}()
 
 	var mgr *agent.Manager
+	observer := opts.Observer
 	mgr = agent.NewManager(agent.ManagerOptions{
 		MaxDepth:      cfg.Limits.MaxAgentDepth,
 		MaxAgents:     cfg.Limits.MaxOpenAgents,
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
-			return buildAgent(ctx, cfg, tc, mgr, gate, spec, agentOverrides{})
+			return buildAgent(ctx, cfg, tc, mgr, gate, spec, agentOverrides{}, observer)
 		},
 	})
 
@@ -145,7 +150,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		CallerID:      "",
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
-	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel})
+	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel}, observer)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +184,7 @@ type agentOverrides struct {
 // buildAgent resolves an agent type, model, and channel; opens a dedicated
 // session; reads the system prompt; and constructs a fully-wired Agent whose
 // cleanup closes its session.
-func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, spec agent.SpawnSpec, o agentOverrides) (*agent.Agent, error) {
+func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver) (*agent.Agent, error) {
 	agentCfg, ok := cfg.Agents[spec.Type]
 	if !ok {
 		return nil, fmt.Errorf("app: agent type %q is not defined", spec.Type)
@@ -247,6 +252,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		ToolResultBytes: cfg.Limits.ToolResultBytes,
 		TranscriptItems: cfg.Limits.TranscriptMaxItems,
 		TranscriptBytes: cfg.Limits.TranscriptMaxBytes,
+		Observer:        observer,
 		Cleanup:         func() { session.Close() },
 	})
 	return a, nil
@@ -294,7 +300,33 @@ func resolveDefaultCwd(ctx context.Context, session execution.Session, agentCfg 
 		}
 	}
 
-	return execution.RenderWorkingDir(tmpl.Raw, agentType, agentID, home)
+	dir, err := execution.RenderWorkingDir(tmpl.Raw, agentType, agentID, home)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureRemoteDir(ctx, session, channelCfg.Name, dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// ensureRemoteDir makes dir exist on the remote host (mkdir -p), so a command
+// never fails because its configured working directory is missing.
+func ensureRemoteDir(ctx context.Context, session execution.Session, channelName, dir string) error {
+	r, err := session.Exec(ctx, "mkdir -p -- "+shellQuote(dir), execution.ExecOptions{MaxOutputBytes: 64 << 10})
+	if err != nil {
+		return fmt.Errorf("app: create working_dir %q on channel %q: %w", dir, channelName, err)
+	}
+	if r.ExitCode != 0 {
+		return fmt.Errorf("app: create working_dir %q on channel %q: mkdir exited %d: %s", dir, channelName, r.ExitCode, strings.TrimSpace(r.Stderr))
+	}
+	return nil
+}
+
+// shellQuote single-quotes s so it is treated as one literal argument when the
+// remote shell evals the command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func needsRemoteHome(template string) bool {
@@ -374,6 +406,7 @@ func buildTransport(c config.ChannelConfig) (execution.Transport, error) {
 		Insecure:       c.Insecure,
 		KeepAlive:      c.KeepAliveEnabled(),
 		DefaultShell:   c.DefaultShell,
+		RemoteCommand:  c.RemoteCommand,
 		SSHConfigAlias: c.IsSSHConfigAlias(),
 	})
 }

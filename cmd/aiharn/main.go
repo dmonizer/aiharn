@@ -14,6 +14,7 @@ import (
 	"aiharn/internal/app"
 	"aiharn/internal/config"
 	"aiharn/internal/logging"
+	"aiharn/internal/recorder"
 	"aiharn/internal/tools"
 	"aiharn/internal/tui"
 )
@@ -39,6 +40,7 @@ func run(args []string) int {
 		approval   = fs.String("approval", "", "override approval mode (ask | allow-all)")
 		showVer    = fs.Bool("version", false, "print version and exit")
 		debug      = fs.Bool("debug", false, "enable debug logging to stderr")
+		logPath    = fs.String("log", "aiharn.log.jsonl", "path to the conversation log (JSON Lines); empty disables logging")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -71,18 +73,41 @@ func run(args []string) int {
 		return 1
 	}
 
-	rt, err := app.Build(context.Background(), cfg, app.Options{
+	var rec *recorder.Recorder
+	if *logPath != "" {
+		rec, err = recorder.NewFile(*logPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "aiharn: open conversation log: %v\n", err)
+			return 1
+		}
+		defer rec.Close()
+	}
+
+	buildOpts := app.Options{
 		Agent:      *agentName,
 		PromptFile: *promptFile,
 		Channel:    *channel,
 		Model:      *modelName,
 		Approval:   *approval,
-	})
+	}
+	if rec != nil {
+		buildOpts.Observer = rec
+	}
+	rt, err := app.Build(context.Background(), cfg, buildOpts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
 		return 1
 	}
 	defer rt.Close()
+
+	if rec != nil {
+		rec.SetSession(recorder.Meta{
+			Model:     rt.Summary.Model,
+			AgentType: rt.Summary.AgentType,
+			Channel:   rt.Summary.Channel,
+			Approval:  rt.Summary.Approval,
+		})
+	}
 
 	p := tea.NewProgram(tui.New(rt.Manager, rt.Agent, rt.Gate, tui.Status{
 		Model:     rt.Summary.Model,

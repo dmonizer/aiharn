@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"aiharn/internal/agent"
@@ -116,7 +117,10 @@ func TestResolveDefaultCwd(t *testing.T) {
 
 	t.Run("agent override with home", func(t *testing.T) {
 		sess := testexec.NewSession(func(ctx context.Context, cmd string, opts execution.ExecOptions) (execution.Result, error) {
-			return execution.Result{Stdout: "/home/ubuntu\n"}, nil
+			if strings.HasPrefix(cmd, "printf") {
+				return execution.Result{Stdout: "/home/ubuntu\n"}, nil
+			}
+			return execution.Result{}, nil
 		})
 		wd, _ := config.ParseWorkingDir("$HOME/work/${agent.type}-${agent.id}")
 		got, err := resolveDefaultCwd(context.Background(), sess,
@@ -126,6 +130,9 @@ func TestResolveDefaultCwd(t *testing.T) {
 		}
 		if got != "/home/ubuntu/work/coder-coder-1" {
 			t.Fatalf("got %q", got)
+		}
+		if calls := sess.Calls(); len(calls) != 2 || !strings.HasPrefix(calls[1].Cmd, "mkdir -p") {
+			t.Fatalf("expected $HOME query then mkdir, got %+v", calls)
 		}
 	})
 
@@ -140,8 +147,9 @@ func TestResolveDefaultCwd(t *testing.T) {
 		if got != "/srv/coder" {
 			t.Fatalf("got %q", got)
 		}
-		if len(sess.Calls()) != 0 {
-			t.Fatalf("home queried unnecessarily: %d calls", len(sess.Calls()))
+		calls := sess.Calls()
+		if len(calls) != 1 || !strings.HasPrefix(calls[0].Cmd, "mkdir -p") || !strings.Contains(calls[0].Cmd, "/srv/coder") {
+			t.Fatalf("expected a single mkdir -p for the working dir, got %+v", calls)
 		}
 	})
 }

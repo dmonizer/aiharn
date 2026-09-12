@@ -85,6 +85,7 @@ func resolveAlias(opts Options, configPath string) (Options, error) {
 	if opts.KnownHosts == "" {
 		opts.KnownHosts = filepath.Join(sshDir, "known_hosts")
 	}
+	opts.Env = append(opts.Env, getSetEnv(cfg, alias)...)
 	logging.Debug("ssh: resolveAlias",
 		slog.String("component", "ssh"),
 		slog.String("alias", alias),
@@ -100,6 +101,26 @@ func resolveAlias(opts Options, configPath string) (Options, error) {
 func get(cfg *ssh_config.Config, alias, key string) string {
 	v, _ := cfg.Get(alias, key)
 	return v
+}
+
+// getSetEnv returns the well-formed SetEnv directives applying to alias, each as
+// a "NAME=value" string. Malformed entries (missing "=" or empty name) are
+// dropped rather than failing startup.
+func getSetEnv(cfg *ssh_config.Config, alias string) []string {
+	values, err := cfg.GetAll(alias, "SetEnv")
+	if err != nil {
+		return nil
+	}
+	var envs []string
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		name, _, ok := strings.Cut(v, "=")
+		if !ok || name == "" {
+			continue
+		}
+		envs = append(envs, v)
+	}
+	return envs
 }
 
 // currentUser returns the local username, falling back to $USER.

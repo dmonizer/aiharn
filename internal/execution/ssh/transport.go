@@ -29,15 +29,21 @@ import (
 // transport. It deliberately duplicates config.ChannelConfig rather than
 // importing it, keeping execution independent of the config package.
 type Options struct {
-	Host         string
-	Port         int
-	User         string
-	KeyFile      string // local path to a private key (exclusive with Password)
-	Password     string // exclusive with KeyFile
-	KnownHosts   string // local path to an OpenSSH known_hosts file
-	Insecure     bool   // if true, skip host-key verification (warned opt-out)
-	KeepAlive    bool   // true = sessions share one client; false = one client per session
-	DefaultShell string // e.g. "/bin/bash"
+	Host          string
+	Port          int
+	User          string
+	KeyFile       string // local path to a private key (exclusive with Password)
+	Password      string // exclusive with KeyFile
+	KnownHosts    string // local path to an OpenSSH known_hosts file
+	Insecure      bool   // if true, skip host-key verification (warned opt-out)
+	KeepAlive     bool   // true = sessions share one client; false = one client per session
+	DefaultShell  string // e.g. "/bin/bash"
+	RemoteCommand string // optional command run verbatim in place of DefaultShell
+
+	// Env holds "NAME=value" pairs sent to the remote before the shell starts,
+	// mirroring OpenSSH's SetEnv directive (read from ~/.ssh/config during alias
+	// resolution). A rejected or malformed entry is ignored, matching OpenSSH.
+	Env []string
 
 	// SSHConfigAlias, when true, treats Host as an OpenSSH ~/.ssh/config alias
 	// and resolves HostName, Port, User, IdentityFile, and KnownHosts from it.

@@ -41,9 +41,11 @@ type Session struct {
 var _ execution.Session = (*Session)(nil)
 
 func openShellSession(ctx context.Context, client *ssh.Client, opts Options, dedicated bool, onDead func()) (*Session, error) {
+	interp := interpreterCommand(opts)
 	logging.Debug("ssh: openShellSession new session",
 		slog.String("component", "ssh"),
 		slog.String("shell", opts.DefaultShell),
+		slog.String("command", interp),
 		slog.Bool("dedicated", dedicated),
 	)
 	sess, err := newSSHSession(ctx, client)
@@ -69,16 +71,25 @@ func openShellSession(ctx context.Context, client *ssh.Client, opts Options, ded
 		sess.Close()
 		return nil, fmt.Errorf("ssh: stderr pipe: %w", err)
 	}
-	if err := sess.Start(shellCommand(opts.DefaultShell)); err != nil {
+	for _, e := range opts.Env {
+		name, value, ok := strings.Cut(e, "=")
+		if !ok || name == "" {
+			continue
+		}
+		if err := sess.Setenv(name, value); err != nil {
+			logging.Debug("ssh: openShellSession setenv rejected", slog.String("component", "ssh"), slog.String("name", name), slog.Any("err", err))
+		}
+	}
+	if err := sess.Start(interp); err != nil {
 		logging.Debug("ssh: openShellSession start shell failed",
 			slog.String("component", "ssh"),
-			slog.String("shell", opts.DefaultShell),
+			slog.String("command", interp),
 			slog.Any("err", err),
 		)
 		sess.Close()
 		return nil, fmt.Errorf("ssh: start shell: %w", err)
 	}
-	logging.Debug("ssh: openShellSession ok", slog.String("component", "ssh"), slog.String("shell", opts.DefaultShell))
+	logging.Debug("ssh: openShellSession ok", slog.String("component", "ssh"), slog.String("command", interp))
 
 	// Drain shell-level stderr (rare: startup errors, missing setsid/base64) so
 	// it cannot backpressure the shell. Command stderr never flows here; the
@@ -225,7 +236,7 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 		} else {
 			s.Close()
 		}
-		berr := fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", s.opts.DefaultShell, err)
+		berr := fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", interpreterCommand(s.opts), err)
 		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", berr))
 		return execution.Result{}, berr
 	}
@@ -367,6 +378,19 @@ func (s *Session) closeDead() {
 	logging.Debug("ssh: closeDead", slog.String("component", "ssh"))
 	s.markDead()
 	_ = s.Close()
+}
+
+// interpreterCommand returns the remote command that starts the persistent
+// command interpreter. When RemoteCommand is set it is used verbatim (e.g.
+// "bash"), letting the user force a clean shell and bypass whatever the remote
+// host would otherwise run (a login shell, or a screen/tmux wrapper that
+// disturbs the non-PTY command stream). Otherwise the configured default shell
+// is started in stdin-reading, profile-less mode.
+func interpreterCommand(opts Options) string {
+	if opts.RemoteCommand != "" {
+		return opts.RemoteCommand
+	}
+	return shellCommand(opts.DefaultShell)
 }
 
 // shellCommand builds the remote command that starts the persistent shell. The

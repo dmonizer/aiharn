@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -358,6 +359,57 @@ func TestTurnAfterCloseDoesNotDrainInbox(t *testing.T) {
 	}
 	if got := a.History(); len(got) != 0 {
 		t.Fatalf("closed turn mutated history: %+v", got)
+	}
+}
+
+type recordingObserver struct {
+	mu        sync.Mutex
+	agentID   string
+	agentType string
+	items     []llm.Item
+}
+
+func (o *recordingObserver) ObserveHistory(agentID, agentType string, items []llm.Item) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.agentID = agentID
+	o.agentType = agentType
+	o.items = append(o.items, items...)
+}
+
+func TestObserverReceivesAppendedHistory(t *testing.T) {
+	client := &testllm.FakeClient{
+		Script: [][]llm.Event{
+			{
+				{Type: llm.EventCompleted, Items: []llm.Item{
+					{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "Hello"},
+				}},
+			},
+		},
+	}
+	obs := &recordingObserver{}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", System: "sys", Client: client,
+		Observer: obs,
+	})
+
+	if err := a.Turn(context.Background(), "hi"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if obs.agentID != "a1" || obs.agentType != "main" {
+		t.Fatalf("observer saw agent %q/%q, want a1/main", obs.agentID, obs.agentType)
+	}
+	if len(obs.items) != 2 {
+		t.Fatalf("observer items = %+v, want user + assistant", obs.items)
+	}
+	if obs.items[0].Role != llm.RoleUser || obs.items[0].Content != "hi" {
+		t.Fatalf("observer items[0] = %+v", obs.items[0])
+	}
+	if obs.items[1].Role != llm.RoleAssistant || obs.items[1].Content != "Hello" {
+		t.Fatalf("observer items[1] = %+v", obs.items[1])
 	}
 }
 

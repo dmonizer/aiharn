@@ -26,6 +26,24 @@ type Status struct {
 	Approval  string // initial approval mode
 }
 
+// lineKind discriminates a transcript line for color styling.
+type lineKind int
+
+const (
+	kindPlain lineKind = iota
+	kindUser
+	kindAssistant
+	kindTool
+	kindError
+	kindApproval
+)
+
+// line is one flushed transcript line with its presentation kind.
+type line struct {
+	text string
+	kind lineKind
+}
+
 // Model is the Bubbletea root model.
 type Model struct {
 	manager *agent.Manager
@@ -33,7 +51,7 @@ type Model struct {
 	gate    *approval.Gate
 	status  Status
 
-	lines   []string // flushed transcript lines, oldest first
+	lines   []line   // flushed transcript lines, oldest first
 	curText []byte   // streamed text not yet flushed to a line
 	input   string   // current input buffer
 	queue   []string // inputs waiting for the agent to become idle
@@ -63,7 +81,7 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 		ctx:     ctx,
 		cancel:  cancel,
 	}
-	m.appendLine(fmt.Sprintf("aiharn: agent %s · model %s · channel %s · approval %s",
+	m.appendLine(kindPlain, fmt.Sprintf("aiharn: agent %s · model %s · channel %s · approval %s",
 		status.AgentType, status.Model, status.Channel, status.Approval))
 	m.refreshSubagents()
 	return m
@@ -88,10 +106,12 @@ func (m *Model) refreshSubagents() {
 	m.subagents = subs
 }
 
-// appendLine appends a completed transcript line.
-func (m *Model) appendLine(s string) {
+// appendLine appends a completed transcript line with the given kind.
+func (m *Model) appendLine(kind lineKind, s string) {
 	m.flushText()
-	m.lines = append(m.lines, strings.Split(sanitizeTerminalText(s), "\n")...)
+	for _, part := range strings.Split(sanitizeTerminalText(s), "\n") {
+		m.lines = append(m.lines, line{text: part, kind: kind})
+	}
 	m.trimLines()
 }
 
@@ -112,7 +132,7 @@ func (m *Model) appendText(s string) {
 		if i < 0 {
 			return
 		}
-		m.lines = append(m.lines, string(m.curText[:i]))
+		m.lines = append(m.lines, line{text: string(m.curText[:i]), kind: kindAssistant})
 		m.trimLines()
 		m.curText = m.curText[i+1:]
 	}
@@ -125,14 +145,14 @@ const (
 
 func (m *Model) trimLines() {
 	if len(m.lines) > maxBufferedTranscriptLines {
-		m.lines = append([]string(nil), m.lines[len(m.lines)-maxBufferedTranscriptLines:]...)
+		m.lines = append([]line(nil), m.lines[len(m.lines)-maxBufferedTranscriptLines:]...)
 	}
 }
 
 // flushText moves any partial streamed text into the transcript.
 func (m *Model) flushText() {
 	if len(m.curText) != 0 {
-		m.lines = append(m.lines, string(m.curText))
+		m.lines = append(m.lines, line{text: string(m.curText), kind: kindAssistant})
 		m.curText = nil
 		m.trimLines()
 	}

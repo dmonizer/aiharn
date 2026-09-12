@@ -32,7 +32,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.approvals = append(m.approvals, msg.req)
 		}
-		m.appendLine(fmt.Sprintf("[approval] %s %s", msg.req.ToolName, msg.req.Command))
+		m.appendLine(kindApproval, fmt.Sprintf("[approval] %s %s", msg.req.ToolName, msg.req.Command))
 		return m, waitApprovalContext(m.ctx, m.gate)
 
 	case rosterMsg:
@@ -46,7 +46,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.flushText()
 		m.running = false
 		if msg.err != nil {
-			m.appendLine("error: " + msg.err.Error())
+			m.appendLine(kindError, "error: "+msg.err.Error())
 		}
 		m.refreshSubagents()
 		if cmd := m.nextTurn(); cmd != nil {
@@ -111,7 +111,7 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 	if err != nil {
-		m.appendLine("approval error: " + err.Error())
+		m.appendLine(kindError, "approval error: "+err.Error())
 	}
 	if len(m.approvals) == 0 {
 		m.pending = nil
@@ -132,7 +132,7 @@ func (m *Model) nextTurn() tea.Cmd {
 	input := m.queue[0]
 	m.queue = m.queue[1:]
 	m.running = true
-	m.appendLine("> " + input)
+	m.appendLine(kindUser, "> "+input)
 	return runTurn(m.agent, m.ctx, input)
 }
 
@@ -141,7 +141,7 @@ func (m *Model) appendEvent(ev agent.Event) {
 	case agent.EventText:
 		m.appendText(ev.Text)
 	case agent.EventToolCall:
-		m.appendLine(fmt.Sprintf("[tool] %s %s", ev.Call.Name, ev.Call.Args))
+		m.appendLine(kindTool, fmt.Sprintf("[tool] %s %s", ev.Call.Name, ev.Call.Args))
 	case agent.EventState:
 		m.flushText()
 	}

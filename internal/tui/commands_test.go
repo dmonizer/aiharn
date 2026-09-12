@@ -22,8 +22,15 @@ func TestSlashCommandsHandledLocally(t *testing.T) {
 	if len(m.queue) != 0 {
 		t.Fatalf("slash command enqueued to agent: %v", m.queue)
 	}
-	if len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1], "/help") {
-		t.Fatalf("expected help text, last line = %q", m.lines[len(m.lines)-1])
+	found := false
+	for _, ln := range m.lines {
+		if strings.Contains(ln.text, "/help") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected help text in transcript: %+v", m.lines)
 	}
 
 	// An unknown command is also handled locally.
@@ -32,8 +39,8 @@ func TestSlashCommandsHandledLocally(t *testing.T) {
 	if cmd != nil || len(m.queue) != 0 {
 		t.Fatalf("unknown command leaked to agent: cmd=%v queue=%v", cmd != nil, m.queue)
 	}
-	if len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1], "unknown command") {
-		t.Fatalf("expected unknown-command message, last line = %q", m.lines[len(m.lines)-1])
+	if len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1].text, "unknown command") {
+		t.Fatalf("expected unknown-command message, last line = %q", m.lines[len(m.lines)-1].text)
 	}
 }
 

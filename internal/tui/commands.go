@@ -8,8 +8,7 @@ import (
 )
 
 // handleCommand intercepts a slash command typed on the input line so it never
-// reaches the AI. It returns a tea.Cmd for future extension; no command
-// currently needs to start a turn or emit a message, so it always returns nil.
+// reaches the AI. It returns a tea.Cmd; only /quit and /exit need one.
 func (m *Model) handleCommand(line string) tea.Cmd {
 	name := ""
 	if fields := strings.Fields(line); len(fields) > 0 {
@@ -17,11 +16,15 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 	}
 
 	switch name {
+	case "/quit", "/exit":
+		m.cancel()
+		return tea.Quit
 	case "/help", "/":
-		m.appendLine("available commands:")
-		m.appendLine("  /help - show this help")
+		m.appendLine(kindPlain, "available commands:")
+		m.appendLine(kindPlain, "  /help - show this help")
+		m.appendLine(kindPlain, "  /quit - quit")
 	default:
-		m.appendLine(fmt.Sprintf("unknown command %q; type /help for help", name))
+		m.appendLine(kindPlain, fmt.Sprintf("unknown command %q; type /help for help", name))
 	}
 	return nil
 }

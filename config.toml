@@ -40,25 +40,27 @@ port = 22
 # insecure = false                            # explicit, warned opt-out only
 keep_alive = true          # true: sessions share one client; false: one client per session
 default_shell = "/bin/bash"
+remote_command = "/bin/bash"    # optional: run this command instead of default_shell,
+                           # e.g. to force a clean shell and bypass login shell/screen/tmux
 working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"   # remote template
 
 [agents.main]
 model = "deepseek_flash"     # required; validated at startup
-system_prompt = "prompts/main.md"
+system_prompt = "prompts/main_pentester.md"
 channel = "sf"            # optional; default = first channel
 tools = "all"                 # "none" | "all" | ["execute_command", "set_approval"]
 allow_subagents = true
 
 [agents.planner]
 model = "zai_glm"
-system_prompt = "prompts/planner.md"
+system_prompt = "prompts/planner_pentester.md"
 channel = "sf"
 tools = "none"
 allow_subagents = true
 
-[agents.coder]
+[agents.operator]
 model = "deepseek_flash"
-system_prompt = "prompts/coder.md"
+system_prompt = "prompts/operator_pentester.md"
 channel = "sf"
 tools = ["execute_command"]
 allow_subagents = false

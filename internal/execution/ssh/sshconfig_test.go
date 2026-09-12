@@ -85,6 +85,30 @@ func TestResolveAliasWithoutIdentityFile(t *testing.T) {
 	}
 }
 
+func TestResolveAliasSetEnv(t *testing.T) {
+	config := `Host myalias
+	HostName 10.0.0.5
+	SetEnv SECRET=abc123
+	SetEnv TOKEN=def456
+	SetEnv EMPTY=
+	SetEnv noequals
+`
+	opts, err := resolveAlias(Options{Host: "myalias"}, writeSSHConfig(t, config))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"SECRET=abc123", "TOKEN=def456", "EMPTY="}
+	if len(opts.Env) != len(want) {
+		t.Fatalf("Env = %#v, want %#v", opts.Env, want)
+	}
+	for i := range want {
+		if opts.Env[i] != want[i] {
+			t.Fatalf("Env[%d] = %q, want %q", i, opts.Env[i], want[i])
+		}
+	}
+}
+
 func TestResolveAliasMissingConfig(t *testing.T) {
 	_, err := resolveAlias(Options{Host: "myalias"}, filepath.Join(t.TempDir(), "nope"))
 	if err == nil || !strings.Contains(err.Error(), "open") {

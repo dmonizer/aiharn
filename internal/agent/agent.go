@@ -65,6 +65,14 @@ type Event struct {
 	State   State    // EventState
 }
 
+// HistoryObserver receives history items as they are appended to an agent's
+// conversation. It is invoked after the items are committed and without the
+// agent's lock held, so the observer may do its own I/O. The recorder package
+// implements it to persist a full, untrimmed conversation.
+type HistoryObserver interface {
+	ObserveHistory(agentID, agentType string, items []llm.Item)
+}
+
 // Spec is the resolved, immutable configuration for one agent instance.
 type Spec struct {
 	ID              string
@@ -83,6 +91,7 @@ type Spec struct {
 	ToolResultBytes int64         // cap on model-visible tool output (0 = none)
 	TranscriptItems int           // retained completed transcript items (0 = unlimited)
 	TranscriptBytes int64         // retained completed transcript content bytes (0 = unlimited)
+	Observer        HistoryObserver
 	Cleanup         func()        // invoked once at close (e.g. release the session)
 }
 
@@ -142,6 +151,10 @@ type Agent struct {
 	// Manager uses it to notify roster subscribers that a subagent's status
 	// changed.
 	onStateChange func()
+
+	// observer, when set, is notified of every appended history item so an
+	// external recorder can persist the full conversation (see HistoryObserver).
+	observer HistoryObserver
 }
 
 // New constructs an Agent from a resolved Spec.
@@ -171,6 +184,7 @@ func New(spec Spec) *Agent {
 		transcriptItems: spec.TranscriptItems,
 		transcriptBytes: spec.TranscriptBytes,
 		cleanup:         spec.Cleanup,
+		observer:        spec.Observer,
 		state:           StateStarting,
 		events:          make(chan Event, spec.EventCapacity),
 		inbox:           make(chan string, spec.InboxCapacity),
@@ -596,6 +610,9 @@ func (a *Agent) append(items ...llm.Item) {
 	a.mu.Lock()
 	a.history = append(a.history, items...)
 	a.mu.Unlock()
+	if a.observer != nil {
+		a.observer.ObserveHistory(a.id, a.typ, items)
+	}
 }
 
 // trimHistory bounds completed transcript retention. It runs only at legal
