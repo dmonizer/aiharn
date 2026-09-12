@@ -219,6 +219,19 @@ func TestWaitAgentEventDelivers(t *testing.T) {
 	}
 }
 
+func TestInputPinnedToBottom(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 120
+	m.height = 10
+	lines := strings.Split(m.View(), "\n")
+	if len(lines) != 10 {
+		t.Fatalf("view has %d lines, want 10", len(lines))
+	}
+	if lines[len(lines)-1] != "> " {
+		t.Fatalf("last line = %q, want input prompt", lines[len(lines)-1])
+	}
+}
+
 func TestRunTurnReportsCompletion(t *testing.T) {
 	client := &testllm.FakeClient{Script: [][]llm.Event{
 		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "ok"}}}},

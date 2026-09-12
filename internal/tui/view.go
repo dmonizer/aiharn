@@ -37,7 +37,7 @@ func (m *Model) body() string {
 	right := m.subagentBlock(rows)
 
 	if m.width < subWidth+40 {
-		return left + "\n" + right
+		return fill(left+"\n"+right, rows)
 	}
 
 	leftW := m.width - subWidth - 1
@@ -46,15 +46,32 @@ func (m *Model) body() string {
 	}
 	l := lipgloss.NewStyle().Width(leftW).Render(left)
 	r := lipgloss.NewStyle().Width(subWidth).Render(right)
-	return lipgloss.JoinHorizontal(lipgloss.Top, l, r)
+	return fill(lipgloss.JoinHorizontal(lipgloss.Top, l, r), rows)
 }
 
 // rows is the number of body rows available, or 0 when unknown.
 func (m *Model) rows() int {
-	if m.height <= 3 {
+	if m.height <= 2 {
 		return 0
 	}
-	return m.height - 3
+	return m.height - 2
+}
+
+// fill pads s to exactly n lines (truncating or appending blank lines) so the
+// input line rendered below the body stays pinned to the bottom of the screen.
+func fill(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	} else {
+		for len(lines) < n {
+			lines = append(lines, "")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // transcriptBlock returns up to rows transcript lines (plus any partial streamed
