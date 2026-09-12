@@ -48,7 +48,7 @@ func TestUpdateTextDelta(t *testing.T) {
 	m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventText, Text: "Hel"}})
 	m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventText, Text: "lo"}})
 
-	if m.curText != "Hello" {
+	if string(m.curText) != "Hello" {
 		t.Fatalf("curText = %q, want Hello", m.curText)
 	}
 }
@@ -58,7 +58,7 @@ func TestUpdateToolCallFlushesText(t *testing.T) {
 	m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventText, Text: "run"}})
 	m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventToolCall, Call: llm.Item{Name: "execute_command", Args: `{"command":"ls"}`}}})
 
-	if m.curText != "" {
+	if len(m.curText) != 0 {
 		t.Fatalf("curText = %q, want flushed", m.curText)
 	}
 	if len(m.lines) == 0 || m.lines[len(m.lines)-1] != "[tool] execute_command {\"command\":\"ls\"}" {
@@ -142,9 +142,6 @@ func TestKeyHandling(t *testing.T) {
 func TestQuitOnCtrlC(t *testing.T) {
 	m := newTestModel(t)
 	_, cmd := upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlC})
-	if !m.quitting {
-		t.Fatal("expected quitting")
-	}
 	if cmd == nil {
 		t.Fatal("expected quit command")
 	}
@@ -159,8 +156,30 @@ func TestApprovalKeys(t *testing.T) {
 	if m.pending != nil {
 		t.Fatal("expected approval cleared")
 	}
-	if cmd == nil {
-		t.Fatal("expected re-subscription")
+	if cmd != nil {
+		t.Fatal("approval bridge was already re-subscribed when the request arrived")
+	}
+}
+
+func TestApprovalRequestsAreQueued(t *testing.T) {
+	m := newTestModel(t)
+	m, _ = upd(t, m, approvalReqMsg{req: approval.Request{ID: "1", Command: "one"}})
+	m, _ = upd(t, m, approvalReqMsg{req: approval.Request{ID: "2", Command: "two"}})
+	if m.pending == nil || m.pending.ID != "1" || len(m.approvals) != 1 {
+		t.Fatalf("pending=%+v queue=%+v", m.pending, m.approvals)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if m.pending == nil || m.pending.ID != "2" || len(m.approvals) != 0 {
+		t.Fatalf("pending=%+v queue=%+v", m.pending, m.approvals)
+	}
+}
+
+func TestTerminalControlSequencesAreRemoved(t *testing.T) {
+	m := newTestModel(t)
+	m.appendLine("safe\x1b]52;c;clipboard\a text")
+	got := m.lines[len(m.lines)-1]
+	if strings.ContainsAny(got, "\x1b\a") || got != "safe]52;c;clipboard text" {
+		t.Fatalf("sanitized line = %q", got)
 	}
 }
 
@@ -194,7 +213,7 @@ func TestWaitAgentEventDelivers(t *testing.T) {
 
 	// The bridge delivers whatever event the agent emits; the first is the
 	// running state transition, not a text delta.
-	msg := runCmd(waitAgentEvent(a))
+	msg := runCmd(waitAgentEventContext(context.Background(), a))
 	if _, ok := msg.(agentEventMsg); !ok {
 		t.Fatalf("msg = %+v, want agentEventMsg", msg)
 	}

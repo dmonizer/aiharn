@@ -24,7 +24,7 @@ func TestReadToMarker(t *testing.T) {
 	marker := "AIHARN-END-abc123"
 	r := bufio.NewReader(strings.NewReader("hello " + marker + " world"))
 	var out bytes.Buffer
-	trunc, err := readToMarker(r, marker, &out, nil, 0)
+	trunc, err := readToMarker(r, marker, &out, nil, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestReadToMarkerDelimiterLike(t *testing.T) {
 	payload := "pre AIHARN-END-" + strings.Repeat("1", 32) + " post"
 	r := bufio.NewReader(strings.NewReader(payload + "\n" + marker + "\n"))
 	var out bytes.Buffer
-	_, err := readToMarker(r, marker, &out, nil, 0)
+	_, err := readToMarker(r, marker, &out, nil, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,5 +71,49 @@ func TestReadToMarkerTruncation(t *testing.T) {
 	}
 	if out.Len() != 10 {
 		t.Fatalf("got %d bytes, want 10", out.Len())
+	}
+}
+
+func TestReadBodyCombinedCapWhenStdoutFillsBudget(t *testing.T) {
+	m := markers{end: "END", err: "ERR"}
+	framed := "12345END rc=0\nERR\nstderr must be droppedERR"
+	f, err := readBody(bufio.NewReader(strings.NewReader(framed)), m, 5, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(f.stdout); got != "12345" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if got := string(f.stderr); got != "" {
+		t.Fatalf("stderr exceeded combined cap: %q", got)
+	}
+	if !f.truncated {
+		t.Fatal("expected truncation")
+	}
+}
+
+func TestReadBeginRejectsNonPositivePID(t *testing.T) {
+	for _, pid := range []string{"0", "-1"} {
+		m := markers{begin: "BEGIN"}
+		if _, err := readBegin(bufio.NewReader(strings.NewReader("BEGIN pid="+pid+"\n")), m); err == nil {
+			t.Fatalf("pid %s was accepted", pid)
+		}
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("sink failed") }
+
+func TestReadToMarkerReportsSinkErrorAfterConsumingFrame(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("payloadENDafter"))
+	var out bytes.Buffer
+	_, err := readToMarker(r, "END", &out, failingWriter{}, -1)
+	if err == nil || !strings.Contains(err.Error(), "sink failed") {
+		t.Fatalf("err = %v", err)
+	}
+	rest, _ := io.ReadAll(r)
+	if string(rest) != "after" {
+		t.Fatalf("frame was not consumed: %q", rest)
 	}
 }

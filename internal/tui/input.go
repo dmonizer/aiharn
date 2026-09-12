@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -19,4 +21,21 @@ func truncateLastRune(s string) string {
 // to a named control key).
 func isPrintable(k tea.KeyMsg) bool {
 	return k.Type == tea.KeyRunes || k.Type == tea.KeySpace
+}
+
+// sanitizeTerminalText removes terminal control sequences from untrusted model,
+// tool, and remote-command text while preserving normal whitespace. In
+// particular ESC and C1 controls must never reach the user's terminal.
+func sanitizeTerminalText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, s)
+}
+
+func sanitizeTerminalLine(s string) string {
+	s = sanitizeTerminalText(s)
+	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(s)
 }

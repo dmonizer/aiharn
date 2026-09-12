@@ -3,6 +3,7 @@ package execution
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // Remote-home tokens that resolve on the remote host. These are the literal
@@ -47,7 +48,11 @@ func RenderWorkingDir(template, agentType, agentID, remoteHome string) (string, 
 // segment (start, or after a "/"), so a stray "~" inside a segment is left
 // alone.
 func replaceRemoteHome(s, home string) string {
-	s = regexp.MustCompile(`(^|/)~($|/)`).ReplaceAllString(s, `${1}`+home+`${2}`)
-	s = regexp.MustCompile(`(^|/)\$HOME($|/)`).ReplaceAllString(s, `${1}`+home+`${2}`)
-	return s
+	parts := strings.Split(s, "/")
+	for i, part := range parts {
+		if part == remoteHomeTilde || part == remoteHomeVar {
+			parts[i] = home
+		}
+	}
+	return strings.Join(parts, "/")
 }

@@ -12,30 +12,49 @@ import (
 // Message types bridging agent/gate/manager activity into the Bubbletea event
 // loop. They are unexported; Update switches on them.
 type (
-	agentEventMsg  struct{ ev agent.Event }
-	approvalReqMsg struct{ req approval.Request }
-	turnDoneMsg    struct{ err error }
-	rosterMsg      struct{}
+	agentEventMsg    struct{ ev agent.Event }
+	approvalReqMsg   struct{ req approval.Request }
+	turnDoneMsg      struct{ err error }
+	rosterMsg        struct{}
+	bridgeStoppedMsg struct{}
 )
 
 // waitAgentEvent blocks until the agent emits an event and delivers it as a
 // message. The model re-subscribes after each event, so the bridge never blocks
 // Update: the goroutine waits on the channel, and delivery is just a message
 // enqueue.
-func waitAgentEvent(a *agent.Agent) tea.Cmd {
-	return func() tea.Msg { return agentEventMsg{ev: <-a.Events()} }
+func waitAgentEventContext(ctx context.Context, a *agent.Agent) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case ev := <-a.Events():
+			return agentEventMsg{ev: ev}
+		case <-ctx.Done():
+			return bridgeStoppedMsg{}
+		}
+	}
 }
 
 // waitApproval blocks until the gate publishes a pending request.
-func waitApproval(g *approval.Gate) tea.Cmd {
-	return func() tea.Msg { return approvalReqMsg{req: <-g.Pending()} }
+func waitApprovalContext(ctx context.Context, g *approval.Gate) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case req := <-g.Pending():
+			return approvalReqMsg{req: req}
+		case <-ctx.Done():
+			return bridgeStoppedMsg{}
+		}
+	}
 }
 
 // waitRoster blocks until the manager pings its roster channel.
-func waitRoster(m *agent.Manager) tea.Cmd {
+func waitRosterContext(ctx context.Context, m *agent.Manager) tea.Cmd {
 	return func() tea.Msg {
-		<-m.Roster()
-		return rosterMsg{}
+		select {
+		case <-m.Roster():
+			return rosterMsg{}
+		case <-ctx.Done():
+			return bridgeStoppedMsg{}
+		}
 	}
 }
 

@@ -134,7 +134,10 @@ func TestVerticalSlice(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if err := config.Validate(cfg, config.ValidateOptions{
-		KnownProviders:    map[string]bool{config.ProviderOpenAIResponses: true},
+		KnownProviders: map[string]bool{
+			config.ProviderOpenAIResponses:       true,
+			config.ProviderOpenAIChatCompletions: true,
+		},
 		KnownChannelTypes: map[string]bool{config.ChannelTypeSSH: true},
 		KnownTools:        map[string]bool{"execute_command": true, "set_approval": true},
 	}); err != nil {

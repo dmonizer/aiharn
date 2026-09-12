@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
@@ -134,6 +135,13 @@ func decodeJSON(raw json.RawMessage) (interface{}, error) {
 	dec.UseNumber()
 	var v interface{}
 	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
 		return nil, err
 	}
 	return v, nil

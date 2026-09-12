@@ -8,6 +8,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -30,6 +31,9 @@ func (d *Duration) UnmarshalTOML(v interface{}) error {
 		*d = Duration(p)
 		return nil
 	case int64:
+		if t > math.MaxInt64/int64(time.Second) || t < math.MinInt64/int64(time.Second) {
+			return fmt.Errorf("duration integer seconds %d overflows time.Duration", t)
+		}
 		*d = Duration(time.Duration(t) * time.Second)
 		return nil
 	default:
@@ -123,8 +127,9 @@ type ApprovalConfig struct {
 
 // Known tool-set names and provider/channel types used as defaults in Validate.
 const (
-	ProviderOpenAIResponses = "openai_responses"
-	ChannelTypeSSH          = "ssh"
+	ProviderOpenAIResponses       = "openai_responses"
+	ProviderOpenAIChatCompletions = "openai_chat_completions"
+	ChannelTypeSSH                = "ssh"
 
 	ToolModeNone = "none"
 	ToolModeAll  = "all"
@@ -141,7 +146,6 @@ const (
 	defaultChannelType  = ChannelTypeSSH
 	defaultToolsMode    = ToolModeNone
 	defaultApprovalMode = ApprovalModeAsk
-	defaultProvider     = ProviderOpenAIResponses
 
 	defaultMaxAgentDepth      = 2
 	defaultMaxOpenAgents      = 8

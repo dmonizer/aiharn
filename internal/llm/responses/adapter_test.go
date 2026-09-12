@@ -182,6 +182,16 @@ func TestBuildRequestRoundTrip(t *testing.T) {
 	if tool["type"] != "function" {
 		t.Errorf("tool type = %v, want function", tool["type"])
 	}
+	if tool["name"] != "execute_command" || tool["description"] != "run a command" {
+		t.Errorf("tool = %#v, want inline Responses function definition", tool)
+	}
+	if _, nested := tool["function"]; nested {
+		t.Errorf("tool uses Chat Completions nesting: %#v", tool)
+	}
+	parameters, ok := tool["parameters"].(map[string]any)
+	if !ok || parameters["type"] != "object" {
+		t.Errorf("tool parameters = %#v", tool["parameters"])
+	}
 }
 
 func TestStreamSetupError(t *testing.T) {

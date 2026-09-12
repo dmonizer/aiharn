@@ -24,16 +24,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentEventMsg:
 		m.appendEvent(msg.ev)
-		return m, waitAgentEvent(m.agent)
+		return m, waitAgentEventContext(m.ctx, m.agent)
 
 	case approvalReqMsg:
-		m.pending = &msg.req
+		if m.pending == nil {
+			m.pending = &msg.req
+		} else {
+			m.approvals = append(m.approvals, msg.req)
+		}
 		m.appendLine(fmt.Sprintf("[approval] %s %s", msg.req.ToolName, msg.req.Command))
-		return m, waitApproval(m.gate)
+		return m, waitApprovalContext(m.ctx, m.gate)
 
 	case rosterMsg:
 		m.refreshSubagents()
-		return m, waitRoster(m.manager)
+		return m, waitRosterContext(m.ctx, m.manager)
+
+	case bridgeStoppedMsg:
+		return m, nil
 
 	case turnDoneMsg:
 		m.flushText()
@@ -52,7 +59,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
-		m.quitting = true
 		m.cancel()
 		return m, tea.Quit
 	}
@@ -89,19 +95,29 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleApprovalKey(msg tea.KeyMsg) tea.Cmd {
 	req := m.pending
+	var err error
 	switch msg.String() {
 	case "y":
-		_ = m.gate.Decide(req.ID, approval.DecisionApproved)
+		err = m.gate.Decide(req.ID, approval.DecisionApproved)
 	case "n":
-		_ = m.gate.Decide(req.ID, approval.DecisionDenied)
+		err = m.gate.Decide(req.ID, approval.DecisionDenied)
 	case "a":
 		m.gate.SetMode(approval.ModeAllowAll)
-		_ = m.gate.Decide(req.ID, approval.DecisionApproved)
+		err = m.gate.Decide(req.ID, approval.DecisionApproved)
 	default:
 		return nil
 	}
-	m.pending = nil
-	return waitApproval(m.gate)
+	if err != nil {
+		m.appendLine("approval error: " + err.Error())
+	}
+	if len(m.approvals) == 0 {
+		m.pending = nil
+	} else {
+		next := m.approvals[0]
+		m.approvals = m.approvals[1:]
+		m.pending = &next
+	}
+	return nil
 }
 
 // nextTurn starts the next queued input if the agent is idle and a turn is not

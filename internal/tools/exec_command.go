@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"aiharn/internal/approval"
 	"aiharn/internal/execution"
@@ -18,11 +19,12 @@ type Executor interface {
 
 var _ Executor = (execution.Session)(nil)
 
-// ExecuteCommand returns the tool that runs a shell command on the agent's
+// ExecuteCommand returns a tool that runs a shell command on the agent's
 // executor, gated by the approval Gate. maxOutput caps retained stdout+stderr
-// (0 = unlimited). defaultCwd is the directory used when the model omits cwd.
-func ExecuteCommand(ex Executor, gate *approval.Gate, maxOutput int64, defaultCwd string) Tool {
-	return &execCommand{ex: ex, gate: gate, maxOutput: maxOutput, defaultCwd: defaultCwd}
+// (0 = unlimited), and defaultCwd applies when the model omits cwd. The timeout
+// starts after approval so user decision time does not consume command runtime.
+func ExecuteCommand(ex Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, timeout time.Duration) Tool {
+	return &execCommand{ex: ex, gate: gate, maxOutput: maxOutput, defaultCwd: defaultCwd, timeout: timeout}
 }
 
 type execCommand struct {
@@ -30,6 +32,7 @@ type execCommand struct {
 	gate       *approval.Gate
 	maxOutput  int64
 	defaultCwd string
+	timeout    time.Duration
 }
 
 func (t *execCommand) Definition() llm.ToolDefinition {
@@ -73,7 +76,13 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 	if cwd == "" {
 		cwd = t.defaultCwd
 	}
-	r, err := t.ex.Exec(ctx, p.Command, execution.ExecOptions{
+	execCtx := ctx
+	cancel := func() {}
+	if t.timeout > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, t.timeout)
+	}
+	defer cancel()
+	r, err := t.ex.Exec(execCtx, p.Command, execution.ExecOptions{
 		Cwd:            cwd,
 		MaxOutputBytes: t.maxOutput,
 	})

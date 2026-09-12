@@ -124,11 +124,16 @@ func (g *Gate) Pending() <-chan Request { return g.pending }
 func (g *Gate) Decide(id string, d Decision) error {
 	g.mu.Lock()
 	ch, ok := g.byID[id]
-	g.mu.Unlock()
 	if !ok {
+		g.mu.Unlock()
 		return fmt.Errorf("approval: no pending request %q", id)
 	}
+	// Claim the request while holding the lock. This makes Decide one-shot and
+	// prevents completed requests from accumulating in byID for the lifetime of
+	// the process.
+	delete(g.byID, id)
 	ch <- d
+	g.mu.Unlock()
 	return nil
 }
 

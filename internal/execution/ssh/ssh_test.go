@@ -96,6 +96,40 @@ func TestExecRoundTrip(t *testing.T) {
 	}
 }
 
+func TestClosingSharedSessionDoesNotCloseOtherSessions(t *testing.T) {
+	srv := newServer(t)
+	tr := newTransport(t, srv, execssh.Options{Insecure: true, KeepAlive: true})
+	first := openSession(t, tr)
+	second := openSession(t, tr)
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := execCmd(t, second, "printf 'still-alive'")
+	if r.Stdout != "still-alive" {
+		t.Fatalf("stdout = %q", r.Stdout)
+	}
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) { return 0, errors.New("writer failed") }
+
+func TestStreamWriterErrorLeavesFramingAligned(t *testing.T) {
+	srv := newServer(t)
+	tr := newTransport(t, srv, execssh.Options{Insecure: true})
+	s := openSession(t, tr)
+
+	_, err := s.Exec(context.Background(), "printf output", execution.ExecOptions{Stream: errorWriter{}})
+	if err == nil || !strings.Contains(err.Error(), "writer failed") {
+		t.Fatalf("err = %v", err)
+	}
+	r := execCmd(t, s, "printf aligned")
+	if r.Stdout != "aligned" {
+		t.Fatalf("stdout = %q", r.Stdout)
+	}
+}
+
 func TestNonZeroExit(t *testing.T) {
 	srv := newServer(t)
 	tr := newTransport(t, srv, execssh.Options{Insecure: true})
@@ -302,6 +336,7 @@ func TestNewTransportValidation(t *testing.T) {
 		{"missing user", execssh.Options{Host: "h", Password: "p", Insecure: true}, "user"},
 		{"both auth", execssh.Options{Host: "h", User: "u", KeyFile: "k", Password: "p", Insecure: true}, "mutually exclusive"},
 		{"missing known_hosts", execssh.Options{Host: "h", User: "u", Password: "p"}, "known_hosts"},
+		{"invalid port", execssh.Options{Host: "h", Port: 70000, User: "u", Password: "p", Insecure: true}, "port"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

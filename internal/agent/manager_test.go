@@ -362,6 +362,56 @@ func TestCloseSubagentRecursive(t *testing.T) {
 	}
 }
 
+func TestSubagentOperationsCannotEscapeCallerSubtree(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxDepth: 5, MaxAgents: 16, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
+	defer mgr.Shutdown()
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	left, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "left")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "right")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.SendSubagentMessage(context.Background(), left, right, "intrude"); !errors.Is(err, agent.ErrSubagentNotOwned) {
+		t.Fatalf("send err = %v", err)
+	}
+	if _, err := mgr.CheckSubagent(context.Background(), left, right); !errors.Is(err, agent.ErrSubagentNotOwned) {
+		t.Fatalf("check err = %v", err)
+	}
+	if err := mgr.CloseSubagent(context.Background(), left, "main"); !errors.Is(err, agent.ErrSubagentNotOwned) {
+		t.Fatalf("close parent err = %v", err)
+	}
+	subs, err := mgr.ListSubagents(context.Background(), left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 0 {
+		t.Fatalf("left can see agents outside its subtree: %+v", subs)
+	}
+}
+
+func TestRegisterTopRejectsSecondOrClosedRoot(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RegisterTop(agent.New(agent.Spec{ID: "other", Type: "main", Client: &testllm.FakeClient{}})); err == nil {
+		t.Fatal("expected second top-level agent to be rejected")
+	}
+
+	closedManager := agent.NewManager(agent.ManagerOptions{})
+	closed := agent.New(agent.Spec{ID: "closed", Type: "main", Client: &testllm.FakeClient{}})
+	closed.Close()
+	if err := closedManager.RegisterTop(closed); !errors.Is(err, agent.ErrCallerUnavailable) {
+		t.Fatalf("closed root err = %v", err)
+	}
+}
+
 func TestErroredAgentReleasesSlot(t *testing.T) {
 	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 2, Builder: builderError()})
 	if err := mgr.RegisterTop(newTop(t, true)); err != nil {

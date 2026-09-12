@@ -71,22 +71,34 @@ func TestBuildRegistrySelection(t *testing.T) {
 	sess := testexec.NewSession(nil)
 	gate := approval.NewGate(approval.ModeAllowAll)
 
-	none := buildRegistry(sess, gate, 0, "", config.ToolSelection{Mode: config.ToolModeNone}, nil, "a1")
+	none, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeNone}, nil, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(none.Names()) != 0 {
 		t.Fatalf("none: got %v", none.Names())
 	}
 
-	all := buildRegistry(sess, gate, 0, "", config.ToolSelection{Mode: config.ToolModeAll}, nil, "a1")
+	all, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeAll}, nil, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(all.Names()) != len(tools.Names()) {
 		t.Fatalf("all: got %v, want %v", all.Names(), tools.Names())
 	}
 
-	list := buildRegistry(sess, gate, 0, "", config.ToolSelection{
+	list, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
 		Mode:  config.ToolModeList,
-		Names: []string{"execute_command", "not_a_tool"},
+		Names: []string{"execute_command"},
 	}, nil, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(list.Names()) != 1 || list.Names()[0] != "execute_command" {
 		t.Fatalf("list: got %v", list.Names())
+	}
+	if _, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeList, Names: []string{"not_a_tool"}}, nil, "a1"); err == nil {
+		t.Fatal("expected unknown tool error")
 	}
 }
 

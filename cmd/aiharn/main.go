@@ -57,7 +57,10 @@ func run(args []string) int {
 		return 1
 	}
 	if err := config.Validate(cfg, config.ValidateOptions{
-		KnownProviders:    map[string]bool{config.ProviderOpenAIResponses: true},
+		KnownProviders: map[string]bool{
+			config.ProviderOpenAIResponses:       true,
+			config.ProviderOpenAIChatCompletions: true,
+		},
 		KnownChannelTypes: map[string]bool{config.ChannelTypeSSH: true},
 		KnownTools:        toolSet(tools.Names()),
 	}); err != nil {

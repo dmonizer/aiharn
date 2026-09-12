@@ -2,7 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strings"
 )
 
 // ValidateOptions carries the sets known to the layers above config, so config
@@ -19,7 +22,10 @@ func (o ValidateOptions) providers() map[string]bool {
 	if o.KnownProviders != nil {
 		return o.KnownProviders
 	}
-	return map[string]bool{defaultProvider: true}
+	return map[string]bool{
+		ProviderOpenAIResponses:       true,
+		ProviderOpenAIChatCompletions: true,
+	}
 }
 
 func (o ValidateOptions) channelTypes() map[string]bool {
@@ -32,16 +38,28 @@ func (o ValidateOptions) channelTypes() map[string]bool {
 // Validate performs semantic validation. All errors are returned together where
 // feasible so the user sees the full picture. Secret values are never embedded.
 func Validate(cfg *Config, opts ValidateOptions) error {
+	if cfg == nil {
+		return fmt.Errorf("config: validation failed:\n  - config is nil")
+	}
 	var errs []string
+	providers := opts.providers()
+	channelTypes := opts.channelTypes()
 
 	// Models.
 	for name, m := range cfg.Models {
+		if name == "" {
+			errs = append(errs, "models: name must not be empty")
+		}
 		if m.Model == "" {
 			errs = append(errs, fmt.Sprintf("models[%q].model is required", name))
 		}
-		if !opts.providers()[m.Provider] {
+		if !providers[m.Provider] {
 			errs = append(errs, fmt.Sprintf("models[%q].provider %q is unsupported", name, m.Provider))
 		}
+		if m.APIKey == "" {
+			errs = append(errs, fmt.Sprintf("models[%q].api_key is required", name))
+		}
+		validateModelBaseURL(&errs, name, m)
 	}
 
 	// Channels: names unique, required fields, type known, auth set.
@@ -57,11 +75,14 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		}
 		seenChannels[c.Name] = true
 
-		if !opts.channelTypes()[c.Type] {
+		if !channelTypes[c.Type] {
 			errs = append(errs, fmt.Sprintf("channels[%q].type %q is unsupported", c.Name, c.Type))
 		}
 		if c.Host == "" {
 			errs = append(errs, fmt.Sprintf("channels[%q].host is required", c.Name))
+		}
+		if c.Port < 1 || c.Port > 65535 {
+			errs = append(errs, fmt.Sprintf("channels[%q].port must be between 1 and 65535", c.Name))
 		}
 		// An SSH alias (name + host only) resolves user/auth/known_hosts from
 		// ~/.ssh/config at runtime, so those fields are not required here.
@@ -77,13 +98,14 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		if c.Auth.KeyFile != "" && c.Auth.Password != "" {
 			errs = append(errs, fmt.Sprintf("channels[%q].auth: key_file and password are mutually exclusive", c.Name))
 		}
+		if c.Auth.KeyFile != "" {
+			validateRegularFile(&errs, fmt.Sprintf("channels[%q].auth.key_file", c.Name), c.Auth.KeyFile)
+		}
 		if !c.Insecure && c.KnownHosts == "" {
 			errs = append(errs, fmt.Sprintf("channels[%q].known_hosts is required unless insecure=true", c.Name))
 		}
 		if c.KnownHosts != "" {
-			if _, err := os.Stat(c.KnownHosts); err != nil {
-				errs = append(errs, fmt.Sprintf("channels[%q].known_hosts: %v", c.Name, err))
-			}
+			validateRegularFile(&errs, fmt.Sprintf("channels[%q].known_hosts", c.Name), c.KnownHosts)
 		}
 	}
 
@@ -93,6 +115,9 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 
 	// Agents.
 	for name, a := range cfg.Agents {
+		if name == "" {
+			errs = append(errs, "agents: name must not be empty")
+		}
 		if a.Model == "" {
 			errs = append(errs, fmt.Sprintf("agents[%q].model is required", name))
 		} else if _, ok := cfg.Models[a.Model]; !ok {
@@ -103,8 +128,8 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		}
 		if a.SystemPrompt == "" {
 			errs = append(errs, fmt.Sprintf("agents[%q].system_prompt is required", name))
-		} else if _, err := os.Stat(a.SystemPrompt); err != nil {
-			errs = append(errs, fmt.Sprintf("agents[%q].system_prompt: %v", name, err))
+		} else {
+			validateRegularFile(&errs, fmt.Sprintf("agents[%q].system_prompt", name), a.SystemPrompt)
 		}
 		switch a.Tools.Mode {
 		case ToolModeNone, ToolModeAll:
@@ -112,7 +137,12 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 			if len(a.Tools.Names) == 0 {
 				errs = append(errs, fmt.Sprintf("agents[%q].tools: list must not be empty", name))
 			}
+			seenTools := make(map[string]bool, len(a.Tools.Names))
 			for _, tn := range a.Tools.Names {
+				if seenTools[tn] {
+					errs = append(errs, fmt.Sprintf("agents[%q].tools: duplicate tool %q", name, tn))
+				}
+				seenTools[tn] = true
 				if opts.KnownTools != nil && !opts.KnownTools[tn] {
 					errs = append(errs, fmt.Sprintf("agents[%q].tools: unknown tool %q", name, tn))
 				}
@@ -174,4 +204,54 @@ func joinErrs(errs []string) string {
 		out += "\n  - " + e
 	}
 	return out
+}
+
+func validateRegularFile(errs *[]string, field, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: %v", field, err))
+		return
+	}
+	if !info.Mode().IsRegular() {
+		*errs = append(*errs, fmt.Sprintf("%s: %s is not a regular file", field, path))
+	}
+}
+
+func validateModelBaseURL(errs *[]string, name string, model ModelConfig) {
+	field := fmt.Sprintf("models[%q].base_url", name)
+	if model.BaseURL == "" {
+		*errs = append(*errs, field+" is required")
+		return
+	}
+	parsed, err := url.Parse(model.BaseURL)
+	invalid := err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" ||
+		parsed.ForceQuery || parsed.Fragment != ""
+	if invalid {
+		*errs = append(*errs, field+" must be an HTTP(S) API root without credentials, query, or fragment")
+		return
+	}
+	if parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname()) {
+		*errs = append(*errs, field+" must use HTTPS unless it targets a loopback host")
+		return
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	switch model.Provider {
+	case ProviderOpenAIResponses:
+		if strings.HasSuffix(path, "/responses") {
+			*errs = append(*errs, field+" must be the API root; the adapter appends /responses")
+		}
+	case ProviderOpenAIChatCompletions:
+		if strings.HasSuffix(path, "/chat/completions") {
+			*errs = append(*errs, field+" must be the API root; the adapter appends /chat/completions")
+		}
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

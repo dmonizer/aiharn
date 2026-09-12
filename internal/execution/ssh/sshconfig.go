@@ -1,7 +1,9 @@
 package ssh
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -33,7 +35,15 @@ func resolveAlias(opts Options, configPath string) (Options, error) {
 	}
 	defer f.Close()
 
-	cfg, err := ssh_config.Decode(f)
+	const maxSSHConfigBytes = 4 << 20
+	data, err := io.ReadAll(io.LimitReader(f, maxSSHConfigBytes+1))
+	if err != nil {
+		return opts, fmt.Errorf("ssh: read %s: %w", configPath, err)
+	}
+	if len(data) > maxSSHConfigBytes {
+		return opts, fmt.Errorf("ssh: config %s exceeds %d-byte limit", configPath, maxSSHConfigBytes)
+	}
+	cfg, err := ssh_config.Decode(bytes.NewReader(data))
 	if err != nil {
 		return opts, fmt.Errorf("ssh: parse %s: %w", configPath, err)
 	}

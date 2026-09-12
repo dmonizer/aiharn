@@ -7,15 +7,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/execution"
 	execssh "aiharn/internal/execution/ssh"
+	"aiharn/internal/llm"
+	"aiharn/internal/llm/chatcompletions"
 	"aiharn/internal/llm/responses"
 	"aiharn/internal/tools"
 )
@@ -74,6 +78,9 @@ func (r *Runtime) Close() error {
 // makes no model calls and runs no commands, but it does open the top-level
 // agent's SSH session so connection problems surface at startup.
 func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, err error) {
+	if cfg == nil {
+		return nil, errors.New("app: config is nil")
+	}
 	agentType := opts.Agent
 	if agentType == "" {
 		agentType = "main"
@@ -132,10 +139,12 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 	fmt.Fprintf(os.Stderr, "aiharn: connecting to channel %q (host %q)...\n", channelCfg.Name, channelCfg.Host)
 
 	top, err := buildAgent(ctx, cfg, tc, mgr, gate, agent.SpawnSpec{
-		ID:       agentType,
-		Type:     agentType,
-		Depth:    0,
-		CallerID: "",
+		ID:            agentType,
+		Type:          agentType,
+		Depth:         0,
+		CallerID:      "",
+		InboxCapacity: cfg.Limits.InboxDepth,
+		EventCapacity: cfg.Limits.EventCapacity,
 	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel})
 	if err != nil {
 		return nil, err
@@ -184,6 +193,10 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	if !ok {
 		return nil, fmt.Errorf("app: model %q is not defined", modelName)
 	}
+	client, err := buildModelClient(modelCfg)
+	if err != nil {
+		return nil, err
+	}
 
 	channelCfg, err := selectChannel(cfg, agentCfg.Channel, o.Channel)
 	if err != nil {
@@ -211,25 +224,43 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		return nil, err
 	}
 
-	reg := buildRegistry(session, gate, cfg.Limits.CommandOutputBytes, defaultCwd, agentCfg.Tools, mgr, spec.ID)
+	reg, err := buildRegistry(session, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
+		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, spec.ID)
+	if err != nil {
+		session.Close()
+		return nil, err
+	}
 
 	a := agent.New(agent.Spec{
 		ID:              spec.ID,
 		Type:            spec.Type,
 		Model:           modelCfg.Model,
 		System:          system,
-		Client:          responses.NewAdapter(modelCfg.BaseURL, modelCfg.APIKey),
+		Client:          client,
 		Tools:           reg,
 		Depth:           spec.Depth,
 		CallerID:        spec.CallerID,
 		AllowSubagents:  agentCfg.AllowSubagents,
-		EventCapacity:   cfg.Limits.EventCapacity,
-		InboxCapacity:   cfg.Limits.InboxDepth,
+		EventCapacity:   spec.EventCapacity,
+		InboxCapacity:   spec.InboxCapacity,
 		RequestTimeout:  cfg.Limits.RequestTimeout.Std(),
 		ToolResultBytes: cfg.Limits.ToolResultBytes,
+		TranscriptItems: cfg.Limits.TranscriptMaxItems,
+		TranscriptBytes: cfg.Limits.TranscriptMaxBytes,
 		Cleanup:         func() { session.Close() },
 	})
 	return a, nil
+}
+
+func buildModelClient(model config.ModelConfig) (llm.Client, error) {
+	switch model.Provider {
+	case config.ProviderOpenAIResponses:
+		return responses.NewAdapter(model.BaseURL, model.APIKey), nil
+	case config.ProviderOpenAIChatCompletions:
+		return chatcompletions.NewAdapter(model.BaseURL, model.APIKey), nil
+	default:
+		return nil, fmt.Errorf("app: unsupported model provider %q", model.Provider)
+	}
 }
 
 // resolveDefaultCwd renders the working_dir template (agent override, else the
@@ -246,15 +277,33 @@ func resolveDefaultCwd(ctx context.Context, session execution.Session, agentCfg 
 	}
 
 	home := ""
-	if strings.Contains(tmpl.Raw, "~") || strings.Contains(tmpl.Raw, "$HOME") {
-		r, err := session.Exec(ctx, `printf '%s' "$HOME"`, execution.ExecOptions{})
+	if needsRemoteHome(tmpl.Raw) {
+		r, err := session.Exec(ctx, `printf '%s' "$HOME"`, execution.ExecOptions{MaxOutputBytes: 64 << 10})
 		if err != nil {
 			return "", fmt.Errorf("app: resolve remote $HOME on channel %q for working_dir %q: %w", channelCfg.Name, tmpl.Raw, err)
 		}
+		if r.ExitCode != 0 {
+			return "", fmt.Errorf("app: resolve remote $HOME on channel %q: command exited %d: %s", channelCfg.Name, r.ExitCode, strings.TrimSpace(r.Stderr))
+		}
+		if r.Truncated {
+			return "", fmt.Errorf("app: resolve remote $HOME on channel %q: output exceeded limit", channelCfg.Name)
+		}
 		home = strings.TrimSpace(r.Stdout)
+		if home == "" {
+			return "", fmt.Errorf("app: resolve remote $HOME on channel %q: remote returned an empty path", channelCfg.Name)
+		}
 	}
 
 	return execution.RenderWorkingDir(tmpl.Raw, agentType, agentID, home)
+}
+
+func needsRemoteHome(template string) bool {
+	for _, segment := range strings.Split(template, "/") {
+		if segment == "~" || segment == "$HOME" {
+			return true
+		}
+	}
+	return false
 }
 
 // transportCache returns one Transport per channel name, created lazily and
@@ -344,10 +393,10 @@ func buildGate(mode string) (*approval.Gate, error) {
 // The session and gate are shared by all built-ins; backend (the Manager) and
 // callerID wire the subagent tools to the runtime. defaultCwd is the directory
 // execute_command falls back to when the model omits one.
-func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, sel config.ToolSelection, backend tools.SubagentBackend, callerID string) *tools.Registry {
+func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID string) (*tools.Registry, error) {
 	reg := tools.New()
 	all := map[string]tools.Tool{
-		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd),
+		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd, commandTimeout),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),
 		tools.NameCheckSubagent:       tools.CheckSubagent(backend, callerID),
@@ -357,21 +406,29 @@ func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int
 	}
 	switch sel.Mode {
 	case config.ToolModeNone:
-		return reg
+		return reg, nil
 	case config.ToolModeAll:
 		for _, name := range tools.Names() {
 			if t, ok := all[name]; ok {
-				reg.Register(t)
+				if err := reg.Register(t); err != nil {
+					return nil, fmt.Errorf("app: register tool %q: %w", name, err)
+				}
 			}
 		}
 	case config.ToolModeList:
 		for _, name := range sel.Names {
-			if t, ok := all[name]; ok {
-				reg.Register(t)
+			t, ok := all[name]
+			if !ok {
+				return nil, fmt.Errorf("app: unknown tool %q", name)
+			}
+			if err := reg.Register(t); err != nil {
+				return nil, fmt.Errorf("app: register tool %q: %w", name, err)
 			}
 		}
+	default:
+		return nil, fmt.Errorf("app: invalid tool selection mode %q", sel.Mode)
 	}
-	return reg
+	return reg, nil
 }
 
 func readSystemPrompt(configPath, overridePath string) (string, error) {
@@ -379,9 +436,18 @@ func readSystemPrompt(configPath, overridePath string) (string, error) {
 	if overridePath != "" {
 		p = overridePath
 	}
-	b, err := os.ReadFile(p)
+	const maxSystemPromptBytes = 4 << 20
+	f, err := os.Open(p)
 	if err != nil {
 		return "", fmt.Errorf("app: read system prompt %s: %w", p, err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxSystemPromptBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("app: read system prompt %s: %w", p, err)
+	}
+	if len(b) > maxSystemPromptBytes {
+		return "", fmt.Errorf("app: system prompt %s exceeds %d-byte limit", p, maxSystemPromptBytes)
 	}
 	return string(b), nil
 }

@@ -8,17 +8,17 @@
 provider = "openai_responses"          # protocol the adapter speaks; no silent fallback
 base_url = "https://api.deepseek.com"
 api_key  = "${DEEPSEEK_API_KEY}"
-model    = "deepseek-flash"
+model    = "deepseek-v4-flash"
 
 [models.zai_glm]
-provider = "openai_responses"
-base_url = "https://api.z.ai/api/paas/v4/chat/completions"
+provider = "openai_chat_completions"
+base_url = "https://api.z.ai/api/paas/v4"
 api_key  = "${ZAI_API_KEY}"
 model    = "glm-5.3"
 
 [models.zai_glm_flash]
-provider = "openai_responses"
-base_url = "https://api.z.ai/api/paas/v4/chat/completions"
+provider = "openai_chat_completions"
+base_url = "https://api.z.ai/api/paas/v4"
 api_key  = "${ZAI_API_KEY}"
 model    = "glm-5.3-flash"
 
@@ -72,8 +72,8 @@ tool_result_bytes = 65536      # max model-visible tool result (bytes)
 inbox_depth = 32               # per-agent interim-message queue
 event_capacity = 256           # agent->TUI event channel
 request_timeout = "60s"        # provider request timeout
-transcript_max_items = 200     # retained conversation items (0 = unlimited)
-transcript_max_bytes = 1048576 # retained conversation bytes (0 = unlimited)
+transcript_max_items = 200     # retained conversation items (0 = default)
+transcript_max_bytes = 1048576 # retained conversation content bytes (0 = default)
 
 [approval]
 mode = "ask"                   # "ask" | "allow-all"   (future: "approve-for-me")

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -81,12 +82,16 @@ type execFrame struct {
 	truncated bool
 }
 
+type streamWriteError struct{ err error }
+
+func (e *streamWriteError) Error() string { return "ssh: stream writer: " + e.err.Error() }
+func (e *streamWriteError) Unwrap() error { return e.err }
+
 // readBegin consumes the begin marker and returns the remote process-group id of
 // the running command. It is called synchronously (before the command can
 // block) so the caller can kill the command on cancellation.
 func readBegin(r *bufio.Reader, m markers) (int, error) {
-	var discard bytes.Buffer
-	if _, err := readToMarker(r, m.begin, &discard, nil, 0); err != nil {
+	if _, err := readToMarker(r, m.begin, nil, nil, -1); err != nil {
 		return 0, wrapFrameErr(err)
 	}
 	line, err := readLine(r)
@@ -96,6 +101,9 @@ func readBegin(r *bufio.Reader, m markers) (int, error) {
 	pid, err := parseField(line, "pid")
 	if err != nil {
 		return 0, err
+	}
+	if pid <= 0 {
+		return 0, fmt.Errorf("ssh framing: invalid process-group id %d", pid)
 	}
 	return pid, nil
 }
@@ -108,10 +116,18 @@ func readBegin(r *bufio.Reader, m markers) (int, error) {
 func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execFrame, error) {
 	var f execFrame
 	var out bytes.Buffer
-	truncOut, err := readToMarker(r, m.end, &out, sink, maxBytes)
-	if err != nil {
-		return f, wrapFrameErr(err)
+	outputCap := maxBytes
+	if outputCap == 0 {
+		outputCap = -1
 	}
+	truncOut, err := readToMarker(r, m.end, &out, sink, outputCap)
+	if err != nil {
+		var sinkErr *streamWriteError
+		if !errors.As(err, &sinkErr) {
+			return f, wrapFrameErr(err)
+		}
+	}
+	streamErr := err
 	f.stdout = out.Bytes()
 
 	line, err := readLine(r)
@@ -124,8 +140,7 @@ func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execF
 	}
 	f.exitCode = rc
 
-	var discard bytes.Buffer
-	if _, err := readToMarker(r, m.err, &discard, nil, 0); err != nil {
+	if _, err := readToMarker(r, m.err, nil, nil, -1); err != nil {
 		return f, wrapFrameErr(err)
 	}
 	// The first err marker is a complete line ("<marker>\n"); consume its
@@ -135,7 +150,7 @@ func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execF
 	}
 
 	var errb bytes.Buffer
-	remaining := int64(0)
+	remaining := int64(-1)
 	if maxBytes > 0 {
 		remaining = maxBytes - int64(out.Len())
 	}
@@ -145,7 +160,7 @@ func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execF
 	}
 	f.stderr = errb.Bytes()
 	f.truncated = truncOut || truncErr
-	return f, nil
+	return f, streamErr
 }
 
 func wrapFrameErr(err error) error {
@@ -157,24 +172,29 @@ func wrapFrameErr(err error) error {
 
 // readToMarker reads from r until the byte sequence marker is found, consuming
 // it. Bytes before the marker are appended to out and (if non-nil) sink, up to
-// cap bytes (cap <= 0 means unlimited). It reports whether the cap was exceeded.
+// cap bytes (a negative cap means unlimited). It reports whether the cap was exceeded.
 // The bytes are written to out/sink only as they are confirmed not to be part of
 // a marker, so no framing bytes leak into the result.
 func readToMarker(r *bufio.Reader, marker string, out *bytes.Buffer, sink io.Writer, cap int64) (truncated bool, err error) {
 	m := []byte(marker)
 	var carry []byte
 	var written int64
+	var writeErr error
 
 	commit := func(b []byte) {
 		if len(b) == 0 {
 			return
 		}
-		if cap <= 0 {
+		if cap < 0 {
 			if out != nil {
-				out.Write(b)
+				_, _ = out.Write(b)
 			}
-			if sink != nil {
-				sink.Write(b)
+			if sink != nil && writeErr == nil {
+				if n, err := sink.Write(b); err != nil {
+					writeErr = err
+				} else if n != len(b) {
+					writeErr = io.ErrShortWrite
+				}
 			}
 			return
 		}
@@ -189,10 +209,14 @@ func readToMarker(r *bufio.Reader, marker string, out *bytes.Buffer, sink io.Wri
 		}
 		written += int64(len(take))
 		if out != nil {
-			out.Write(take)
+			_, _ = out.Write(take)
 		}
-		if sink != nil {
-			sink.Write(take)
+		if sink != nil && writeErr == nil {
+			if n, err := sink.Write(take); err != nil {
+				writeErr = err
+			} else if n != len(take) {
+				writeErr = io.ErrShortWrite
+			}
 		}
 	}
 
@@ -207,6 +231,9 @@ func readToMarker(r *bufio.Reader, marker string, out *bytes.Buffer, sink io.Wri
 		carry = append(carry, c)
 		if bytes.HasSuffix(carry, m) {
 			commit(carry[:len(carry)-len(m)])
+			if writeErr != nil {
+				return truncated, &streamWriteError{err: writeErr}
+			}
 			return truncated, nil
 		}
 		if len(carry) >= len(m) {

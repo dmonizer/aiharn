@@ -22,11 +22,19 @@ func (c *Config) Redacted() *Config {
 	out.Channels = make([]ChannelConfig, len(c.Channels))
 	for i, ch := range c.Channels {
 		ch.Auth.Password = redactedValue(ch.Auth.Password)
+		if ch.KeepAlive != nil {
+			keepAlive := *ch.KeepAlive
+			ch.KeepAlive = &keepAlive
+		}
 		out.Channels[i] = ch
 	}
 
 	out.Agents = make(map[string]AgentConfig, len(c.Agents))
 	for name, a := range c.Agents {
+		if a.WorkingDir != nil {
+			workingDir := *a.WorkingDir
+			a.WorkingDir = &workingDir
+		}
 		out.Agents[name] = a
 	}
 

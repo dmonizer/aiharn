@@ -97,7 +97,7 @@ func TestTurnToolCall(t *testing.T) {
 	})
 	gate := approval.NewGate(approval.ModeAllowAll)
 	reg := tools.New()
-	if err := reg.Register(tools.ExecuteCommand(ex, gate, 0, "")); err != nil {
+	if err := reg.Register(tools.ExecuteCommand(ex, gate, 0, "", 0)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -261,6 +261,103 @@ func TestTurnRequestTimeout(t *testing.T) {
 	}
 	if a.State() != agent.StateErrored {
 		t.Fatalf("state = %v, want errored", a.State())
+	}
+}
+
+func TestTurnTrimsTranscriptAtCompletedBoundary(t *testing.T) {
+	client := &testllm.FakeClient{Script: [][]llm.Event{
+		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "first"}}}},
+		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "second"}}}},
+	}}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", Client: client,
+		TranscriptItems: 2, TranscriptBytes: 8,
+	})
+	if err := a.Turn(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Turn(context.Background(), "two"); err != nil {
+		t.Fatal(err)
+	}
+	hist := a.History()
+	if len(hist) != 1 || hist[0].Content != "second" {
+		t.Fatalf("history = %+v", hist)
+	}
+	if got := client.Requests(); len(got) != 2 || len(got[1].Input) != 2 {
+		t.Fatalf("request history was not bounded before the second turn: %+v", got)
+	}
+}
+
+func TestTurnTruncatesSingleOversizedTranscriptItemUTF8Safe(t *testing.T) {
+	client := &testllm.FakeClient{Script: [][]llm.Event{
+		{{
+			Type:  llm.EventCompleted,
+			Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "éééé"}},
+		}},
+	}}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", Client: client, TranscriptBytes: 5,
+	})
+	if err := a.Turn(context.Background(), "long input"); err != nil {
+		t.Fatal(err)
+	}
+	hist := a.History()
+	if len(hist) != 1 || hist[0].Content != "éé" || !utf8.ValidString(hist[0].Content) {
+		t.Fatalf("history = %+v", hist)
+	}
+}
+
+func TestTranscriptTrimmingDoesNotRetainOrphanedToolOutput(t *testing.T) {
+	reg := tools.New()
+	if err := reg.Register(stubTool{name: "tool", out: "result"}); err != nil {
+		t.Fatal(err)
+	}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", Client: &testllm.FakeClient{Script: toolCallScript("tool")},
+		Tools: reg, TranscriptItems: 2,
+	})
+	if err := a.Turn(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range a.History() {
+		if it.Type == llm.ItemFunctionCallOutput {
+			t.Fatalf("orphaned tool output retained: %+v", a.History())
+		}
+	}
+}
+
+func TestCloseCancelsAndWaitsForActiveTurn(t *testing.T) {
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: blockingClient{}})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(a); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.Turn(context.Background(), "wait") }()
+	waitFor(t, time.Second, "turn to start", func() bool { return a.State() == agent.StateRunning })
+	a.Close()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("turn err = %v, want cancellation", err)
+	}
+	if err := a.Turn(context.Background(), "again"); !errors.Is(err, agent.ErrAgentClosed) {
+		t.Fatalf("turn after close err = %v", err)
+	}
+}
+
+func TestTurnAfterCloseDoesNotDrainInbox(t *testing.T) {
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: &testllm.FakeClient{}})
+	if !a.Send("queued") {
+		t.Fatal("failed to queue message before close")
+	}
+	a.Close()
+	if a.Send("after close") {
+		t.Fatal("Send succeeded after close")
+	}
+	if err := a.Turn(context.Background(), "after close"); !errors.Is(err, agent.ErrAgentClosed) {
+		t.Fatalf("turn after close err = %v", err)
+	}
+	if got := a.History(); len(got) != 0 {
+		t.Fatalf("closed turn mutated history: %+v", got)
 	}
 }
 

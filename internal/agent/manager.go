@@ -13,10 +13,12 @@ import (
 // SpawnSpec is what the Manager needs to construct a subagent: a unique id, the
 // configured agent type, its depth, and its caller.
 type SpawnSpec struct {
-	ID       string
-	Type     string
-	Depth    int
-	CallerID string
+	ID            string
+	Type          string
+	Depth         int
+	CallerID      string
+	InboxCapacity int
+	EventCapacity int
 }
 
 // Builder constructs a fully-wired Agent for a SpawnSpec. The app layer supplies
@@ -35,31 +37,33 @@ type ManagerOptions struct {
 
 // Sentinel errors returned by Manager methods, surfaced to the model via tools.
 var (
-	ErrClosed             = errors.New("agent: manager closed")
-	ErrCallerNotFound     = errors.New("agent: caller not found")
+	ErrClosed              = errors.New("agent: manager closed")
+	ErrCallerNotFound      = errors.New("agent: caller not found")
+	ErrCallerUnavailable   = errors.New("agent: caller is not open")
 	ErrSubagentsNotAllowed = errors.New("agent: caller may not spawn subagents")
-	ErrMaxDepth           = errors.New("agent: maximum agent depth reached")
-	ErrMaxAgents          = errors.New("agent: maximum open agents reached")
-	ErrSubagentNotFound   = errors.New("agent: subagent not found")
-	ErrCannotMessageSelf  = errors.New("agent: cannot message self")
+	ErrMaxDepth            = errors.New("agent: maximum agent depth reached")
+	ErrMaxAgents           = errors.New("agent: maximum open agents reached")
+	ErrSubagentNotFound    = errors.New("agent: subagent not found")
+	ErrSubagentNotOwned    = errors.New("agent: subagent is outside caller's subtree")
+	ErrCannotMessageSelf   = errors.New("agent: cannot message self")
 	ErrSubagentUnavailable = errors.New("agent: subagent is not open")
-	ErrInboxFull          = errors.New("agent: subagent inbox is full")
+	ErrInboxFull           = errors.New("agent: subagent inbox is full")
 )
 
 // Manager owns every agent (the top-level agent and all subagents), assigns
 // unique ids, enforces the spawn limits (allow_subagents, depth, open count),
 // routes messages, and provides idempotent shutdown.
 type Manager struct {
-	mu         sync.Mutex
-	agents     map[string]*Agent
-	seq        int
-	building   int // in-flight spawns, counted against the open limit
-	maxDepth   int
-	maxAgents  int
-	inboxCap   int
-	eventCap   int
-	builder    Builder
-	closed     bool
+	mu        sync.Mutex
+	agents    map[string]*Agent
+	seq       int
+	building  int // in-flight spawns, counted against the open limit
+	maxDepth  int
+	maxAgents int
+	inboxCap  int
+	eventCap  int
+	builder   Builder
+	closed    bool
 
 	wg           sync.WaitGroup
 	shutdownOnce sync.Once
@@ -98,6 +102,12 @@ func NewManager(opts ManagerOptions) *Manager {
 // lifecycle context but starts no run loop; the TUI drives the top-level agent
 // directly.
 func (m *Manager) RegisterTop(a *Agent) error {
+	if a == nil {
+		return errors.New("agent: top-level agent is nil")
+	}
+	if a.Depth() != 0 || a.CallerID() != "" {
+		return errors.New("agent: top-level agent must have depth 0 and no caller")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -105,6 +115,14 @@ func (m *Manager) RegisterTop(a *Agent) error {
 	}
 	if _, ok := m.agents[a.ID()]; ok {
 		return fmt.Errorf("agent: duplicate id %q", a.ID())
+	}
+	if !isOpen(a) {
+		return ErrCallerUnavailable
+	}
+	for _, existing := range m.agents {
+		if existing.Depth() == 0 {
+			return errors.New("agent: top-level agent is already registered")
+		}
 	}
 	a.setContext(context.WithCancel(context.Background()))
 	m.agents[a.ID()] = a
@@ -136,6 +154,9 @@ func (m *Manager) notify() {
 // right to spawn, reserves a slot against the open-agent limit, builds the
 // subagent off the lock, then registers it and starts its run loop.
 func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -145,6 +166,10 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 	if caller == nil {
 		m.mu.Unlock()
 		return "", ErrCallerNotFound
+	}
+	if !isOpen(caller) {
+		m.mu.Unlock()
+		return "", ErrCallerUnavailable
 	}
 	if !caller.AllowSubagents() {
 		m.mu.Unlock()
@@ -162,15 +187,39 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 	m.seq++
 	id := fmt.Sprintf("%s-%d", agentType, m.seq)
 	m.building++
+	m.wg.Add(1)
 	builder := m.builder
 	m.mu.Unlock()
+	defer m.wg.Done()
+	if builder == nil {
+		m.mu.Lock()
+		m.building--
+		m.mu.Unlock()
+		return "", errors.New("agent: no subagent builder configured")
+	}
 
-	sub, err := builder(ctx, SpawnSpec{ID: id, Type: agentType, Depth: depth, CallerID: callerID})
+	sub, err := builder(ctx, SpawnSpec{
+		ID: id, Type: agentType, Depth: depth, CallerID: callerID,
+		InboxCapacity: m.inboxCap, EventCapacity: m.eventCap,
+	})
 	if err != nil {
 		m.mu.Lock()
 		m.building--
 		m.mu.Unlock()
 		return "", fmt.Errorf("agent: spawn %q: %w", agentType, err)
+	}
+	if sub == nil {
+		m.mu.Lock()
+		m.building--
+		m.mu.Unlock()
+		return "", fmt.Errorf("agent: spawn %q: builder returned nil agent", agentType)
+	}
+	if sub.ID() != id || sub.Type() != agentType || sub.Depth() != depth || sub.CallerID() != callerID {
+		m.mu.Lock()
+		m.building--
+		m.mu.Unlock()
+		sub.Close()
+		return "", fmt.Errorf("agent: spawn %q: builder returned an agent that does not match its spawn spec", agentType)
 	}
 
 	m.mu.Lock()
@@ -179,6 +228,17 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 		m.mu.Unlock()
 		sub.Close()
 		return "", ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		m.mu.Unlock()
+		sub.Close()
+		return "", err
+	}
+	caller = m.agents[callerID]
+	if caller == nil || !isOpen(caller) {
+		m.mu.Unlock()
+		sub.Close()
+		return "", ErrCallerUnavailable
 	}
 	subCtx, subCancel := context.WithCancel(context.Background())
 	sub.setContext(subCtx, subCancel)
@@ -191,6 +251,9 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 	go func() {
 		defer m.wg.Done()
 		sub.run(subCtx)
+		if sub.State() == StateErrored {
+			sub.releaseResources()
+		}
 	}()
 	m.mu.Unlock()
 
@@ -201,6 +264,9 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 
 // SendSubagentMessage implements tools.SubagentBackend.
 func (m *Manager) SendSubagentMessage(ctx context.Context, callerID, subagentID, message string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -210,14 +276,23 @@ func (m *Manager) SendSubagentMessage(ctx context.Context, callerID, subagentID,
 		m.mu.Unlock()
 		return ErrCannotMessageSelf
 	}
-	if m.agents[callerID] == nil {
+	caller := m.agents[callerID]
+	if caller == nil {
 		m.mu.Unlock()
 		return ErrCallerNotFound
+	}
+	if !isOpen(caller) {
+		m.mu.Unlock()
+		return ErrCallerUnavailable
 	}
 	sub := m.agents[subagentID]
 	if sub == nil {
 		m.mu.Unlock()
 		return ErrSubagentNotFound
+	}
+	if !m.isDescendantLocked(callerID, subagentID) {
+		m.mu.Unlock()
+		return ErrSubagentNotOwned
 	}
 	m.mu.Unlock()
 
@@ -233,22 +308,59 @@ func (m *Manager) SendSubagentMessage(ctx context.Context, callerID, subagentID,
 
 // CheckSubagent implements tools.SubagentBackend.
 func (m *Manager) CheckSubagent(ctx context.Context, callerID, subagentID string) (tools.SubagentStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return tools.SubagentStatus{}, err
+	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return tools.SubagentStatus{}, ErrClosed
+	}
+	caller := m.agents[callerID]
+	if caller == nil {
+		m.mu.Unlock()
+		return tools.SubagentStatus{}, ErrCallerNotFound
+	}
+	if !isOpen(caller) {
+		m.mu.Unlock()
+		return tools.SubagentStatus{}, ErrCallerUnavailable
+	}
 	sub := m.agents[subagentID]
-	m.mu.Unlock()
 	if sub == nil {
+		m.mu.Unlock()
 		return tools.SubagentStatus{}, ErrSubagentNotFound
 	}
+	if !m.isDescendantLocked(callerID, subagentID) {
+		m.mu.Unlock()
+		return tools.SubagentStatus{}, ErrSubagentNotOwned
+	}
+	m.mu.Unlock()
 	return statusOf(sub), nil
 }
 
 // ListSubagents implements tools.SubagentBackend. It lists all subagents
 // (depth > 0) in id order, regardless of state.
 func (m *Manager) ListSubagents(ctx context.Context, callerID string) ([]tools.SubagentStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, ErrClosed
+	}
+	caller := m.agents[callerID]
+	if caller == nil {
+		m.mu.Unlock()
+		return nil, ErrCallerNotFound
+	}
+	if !isOpen(caller) {
+		m.mu.Unlock()
+		return nil, ErrCallerUnavailable
+	}
 	subs := make([]*Agent, 0, len(m.agents))
 	for _, a := range m.agents {
-		if a.Depth() > 0 {
+		if m.isDescendantLocked(callerID, a.ID()) {
 			subs = append(subs, a)
 		}
 	}
@@ -265,14 +377,30 @@ func (m *Manager) ListSubagents(ctx context.Context, callerID string) ([]tools.S
 // CloseSubagent implements tools.SubagentBackend. It closes the subagent and,
 // recursively, every descendant it spawned.
 func (m *Manager) CloseSubagent(ctx context.Context, callerID, subagentID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return ErrClosed
 	}
+	caller := m.agents[callerID]
+	if caller == nil {
+		m.mu.Unlock()
+		return ErrCallerNotFound
+	}
+	if !isOpen(caller) {
+		m.mu.Unlock()
+		return ErrCallerUnavailable
+	}
 	if m.agents[subagentID] == nil {
 		m.mu.Unlock()
 		return ErrSubagentNotFound
+	}
+	if !m.isDescendantLocked(callerID, subagentID) {
+		m.mu.Unlock()
+		return ErrSubagentNotOwned
 	}
 	toClose := m.descendantsLocked(subagentID)
 	m.mu.Unlock()
@@ -349,4 +477,24 @@ func statusOf(a *Agent) tools.SubagentStatus {
 		Depth: a.Depth(),
 		Tail:  a.lastAssistant(),
 	}
+}
+
+func isOpen(a *Agent) bool {
+	switch a.State() {
+	case StateStarting, StateRunning, StateIdle:
+		return true
+	default:
+		return false
+	}
+}
+
+// isDescendantLocked reports whether targetID is below callerID in the spawn
+// tree. The caller itself is intentionally not considered a descendant.
+func (m *Manager) isDescendantLocked(callerID, targetID string) bool {
+	for target := m.agents[targetID]; target != nil && target.CallerID() != ""; target = m.agents[target.CallerID()] {
+		if target.CallerID() == callerID {
+			return true
+		}
+	}
+	return false
 }

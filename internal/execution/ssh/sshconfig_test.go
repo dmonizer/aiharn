@@ -102,6 +102,12 @@ func TestNewTransportResolvesAlias(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(sshDir, "id_ed25519"), []byte("test key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sshDir, "known_hosts"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("HOME", home)
 
 	tr, err := NewTransport(Options{Host: "foo", SSHConfigAlias: true})

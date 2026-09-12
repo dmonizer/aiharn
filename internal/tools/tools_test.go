@@ -3,6 +3,7 @@ package tools_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +35,7 @@ func echoExecutor(t *testing.T) *testexec.Session {
 func TestExecuteCommandAllowAll(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0))
 
 	out, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"echo hi"}`))
 	if err != nil {
@@ -51,7 +52,7 @@ func TestExecuteCommandAllowAll(t *testing.T) {
 func TestExecuteCommandDefaultCwd(t *testing.T) {
 	ex := testexec.NewSession(nil)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "/srv/work"))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "/srv/work", 0))
 
 	// No cwd in args → the default applies.
 	if _, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"pwd"}`)); err != nil {
@@ -77,7 +78,7 @@ func TestExecuteCommandDefaultCwd(t *testing.T) {
 func TestExecuteCommandAskApproved(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAsk)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0))
 
 	done := make(chan string, 1)
 	go func() {
@@ -111,7 +112,7 @@ func TestExecuteCommandAskApproved(t *testing.T) {
 func TestExecuteCommandAskDenied(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAsk)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0))
 
 	done := make(chan string, 1)
 	go func() {
@@ -146,7 +147,7 @@ func TestExecuteCommandAskDenied(t *testing.T) {
 func TestExecuteCommandInvalidArgs(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0))
 
 	_, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{}`))
 	if err == nil || !strings.Contains(err.Error(), "invalid arguments") {
@@ -157,11 +158,36 @@ func TestExecuteCommandInvalidArgs(t *testing.T) {
 func TestExecuteCommandMalformedJSON(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0))
 
 	_, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{not json`))
 	if err == nil {
 		t.Fatal("expected error for malformed args")
+	}
+}
+
+func TestExecuteCommandRejectsTrailingJSON(t *testing.T) {
+	ex := echoExecutor(t)
+	gate := approval.NewGate(approval.ModeAllowAll)
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0))
+
+	_, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"pwd"} {}`))
+	if err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestExecuteCommandTimeout(t *testing.T) {
+	ex := testexec.NewSession(func(ctx context.Context, cmd string, opts execution.ExecOptions) (execution.Result, error) {
+		<-ctx.Done()
+		return execution.Result{}, ctx.Err()
+	})
+	gate := approval.NewGate(approval.ModeAllowAll)
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 20*time.Millisecond))
+
+	_, err := r.Run(context.Background(), tools.NameExecuteCommand, json.RawMessage(`{"command":"sleep"}`))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
 	}
 }
 
@@ -204,7 +230,7 @@ func TestRegistryUnknownTool(t *testing.T) {
 func TestRegistryDefinitionsOrder(t *testing.T) {
 	ex := echoExecutor(t)
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, ""), tools.SetApproval(gate))
+	r := newRegistry(t, tools.ExecuteCommand(ex, gate, 0, "", 0), tools.SetApproval(gate))
 
 	defs := r.Definitions()
 	if len(defs) != 2 {

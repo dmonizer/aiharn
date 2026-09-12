@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
 
@@ -29,7 +30,7 @@ type Adapter struct {
 func NewAdapter(baseURL, apiKey string) *Adapter {
 	cfg := openai.DefaultConfig(apiKey)
 	if baseURL != "" {
-		cfg.BaseURL = baseURL
+		cfg.BaseURL = strings.TrimRight(baseURL, "/")
 	}
 	return &Adapter{client: openai.NewClientWithConfig(cfg)}
 }
@@ -73,9 +74,18 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 					return
 				}
 			case openai.ResponseStreamEventCompleted:
+				if evt.Response == nil {
+					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: completed event has no response")})
+					return
+				}
+				items, err := translateOutputItems(responseOutput(evt))
+				if err != nil {
+					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: translate output: %w", err)})
+					return
+				}
 				emit(ctx, out, llm.Event{
 					Type:         llm.EventCompleted,
-					Items:        translateOutputItems(responseOutput(evt)),
+					Items:        items,
 					Usage:        usage(responseUsage(evt)),
 					FinishReason: finishReason(evt.Response),
 				})

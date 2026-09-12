@@ -147,6 +147,24 @@ func TestDecideUnknownID(t *testing.T) {
 	}
 }
 
+func TestDecideIsOneShot(t *testing.T) {
+	g := NewGate(ModeAsk)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = g.Check(context.Background(), Request{ToolName: "execute_command", Command: "ls"})
+	}()
+
+	req := <-g.Pending()
+	if err := g.Decide(req.ID, DecisionApproved); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if err := g.Decide(req.ID, DecisionApproved); err == nil {
+		t.Fatal("expected a completed request to be removed")
+	}
+}
+
 func TestCloseUnblocksPending(t *testing.T) {
 	g := NewGate(ModeAsk)
 	done := make(chan struct{})

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,8 @@ import (
 // path. It performs the mechanical steps only; call Validate for semantic
 // checks. Secret-bearing fields are never embedded in returned errors.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	const maxConfigBytes = 4 << 20
+	data, err := readLimitedFile(path, maxConfigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
@@ -41,6 +43,22 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+func readLimitedFile(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("file exceeds %d-byte limit", maxBytes)
+	}
+	return b, nil
+}
+
 // applyDefaults fills zero-valued fields with their defaults. Zero = "use the
 // default" for every defaultable field; the only field needing pointer
 // semantics is ChannelConfig.KeepAlive, whose meaningful explicit value (false)
@@ -52,7 +70,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Agents == nil {
 		cfg.Agents = map[string]AgentConfig{}
 	}
-
 	for i := range cfg.Channels {
 		c := &cfg.Channels[i]
 		if c.Type == "" {

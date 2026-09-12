@@ -31,12 +31,6 @@ func (t *WorkingDirTemplate) UnmarshalTOML(v interface{}) error {
 // separate remote-home tokens handled below, not ${...} placeholders.
 var placeholderPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
 
-// remoteHomeTokens are the literal spellings that resolve on the remote host.
-const (
-	remoteHomeTilde = "~"
-	remoteHomeVar   = "$HOME"
-)
-
 // ParseWorkingDir validates a working-directory template and returns it.
 // Allowed placeholders: ${agent.type}, ${agent.id}. Allowed remote-home tokens:
 // "~" and "$HOME" (resolved remotely, not here). Any other ${...} is rejected.
@@ -56,10 +50,4 @@ func ParseWorkingDir(s string) (WorkingDirTemplate, error) {
 		return WorkingDirTemplate{}, fmt.Errorf("working_dir must not be empty")
 	}
 	return WorkingDirTemplate{Raw: s}, nil
-}
-
-// UsesRuntimePlaceholder reports whether the template references a value only
-// known at runtime (agent type or id).
-func (t WorkingDirTemplate) UsesRuntimePlaceholder() bool {
-	return placeholderPattern.MatchString(t.Raw)
 }

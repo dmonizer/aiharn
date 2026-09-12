@@ -79,6 +79,8 @@ type Spec struct {
 	MaxToolRounds   int           // per-turn cap on tool-call iterations
 	RequestTimeout  time.Duration // per-provider-request timeout (0 = none)
 	ToolResultBytes int64         // cap on model-visible tool output (0 = none)
+	TranscriptItems int           // retained completed transcript items (0 = unlimited)
+	TranscriptBytes int64         // retained completed transcript content bytes (0 = unlimited)
 	Cleanup         func()        // invoked once at close (e.g. release the session)
 }
 
@@ -88,9 +90,12 @@ const (
 	defaultMaxToolRounds = 64
 )
 
-// Agent runs the turn loop for one agent instance. Turn is not safe for
-// concurrent use; the Manager serializes access to a subagent's inbox and the
-// top-level agent is driven by a single TUI event loop.
+// ErrAgentClosed is returned when a new turn is attempted after Close.
+var ErrAgentClosed = errors.New("agent: agent closed")
+
+// Agent runs the turn loop for one agent instance. Turns are serialized; the
+// Manager also serializes a subagent's inbox and the TUI drives the top-level
+// agent from one event loop.
 type Agent struct {
 	id             string
 	typ            string
@@ -105,8 +110,12 @@ type Agent struct {
 	maxToolRounds   int
 	requestTimeout  time.Duration
 	toolResultBytes int64
+	transcriptItems int
+	transcriptBytes int64
 
 	mu      sync.Mutex
+	turnMu  sync.Mutex
+	active  sync.WaitGroup
 	history []llm.Item
 	state   State
 	events  chan Event
@@ -120,6 +129,8 @@ type Agent struct {
 	// uses it to release the agent's execution session.
 	cleanup     func()
 	cleanupOnce sync.Once
+	closeOnce   sync.Once
+	closeDone   chan struct{}
 
 	// onComplete, when set, is called once per completed subagent task with the
 	// task's final result (or its error). It is the Manager's delivery hook.
@@ -155,10 +166,13 @@ func New(spec Spec) *Agent {
 		maxToolRounds:   spec.MaxToolRounds,
 		requestTimeout:  spec.RequestTimeout,
 		toolResultBytes: spec.ToolResultBytes,
+		transcriptItems: spec.TranscriptItems,
+		transcriptBytes: spec.TranscriptBytes,
 		cleanup:         spec.Cleanup,
 		state:           StateStarting,
 		events:          make(chan Event, spec.EventCapacity),
 		inbox:           make(chan string, spec.InboxCapacity),
+		closeDone:       make(chan struct{}),
 	}
 }
 
@@ -197,6 +211,11 @@ func (a *Agent) History() []llm.Item {
 // Send enqueues text into the agent's inbox. It never blocks; on overflow the
 // message is dropped and false is returned.
 func (a *Agent) Send(text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == StateClosed || a.state == StateErrored {
+		return false
+	}
 	select {
 	case a.inbox <- text:
 		return true
@@ -237,18 +256,48 @@ func (a *Agent) setOnStateChange(fn func()) { a.onStateChange = fn }
 // with no tool calls. On error it returns the error and sets the state to
 // errored (or idle for cancellation).
 func (a *Agent) Turn(ctx context.Context, input string) error {
-	for _, m := range a.drainInbox() {
-		a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: m})
-	}
-	return a.turn(ctx, input)
+	return a.runTurn(ctx, input, true)
 }
 
 // turn is the core loop: append input and iterate stream → tools until the model
 // stops calling tools. It does not drain the inbox; Turn and the subagent run
 // loop manage that.
 func (a *Agent) turn(ctx context.Context, input string) error {
+	return a.runTurn(ctx, input, false)
+}
+
+func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) error {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+
+	a.mu.Lock()
+	if a.state == StateClosed {
+		a.mu.Unlock()
+		return ErrAgentClosed
+	}
+	a.active.Add(1)
+	lifecycle := a.ctx
+	a.mu.Unlock()
+	defer a.active.Done()
+	if drainInbox {
+		for _, m := range a.drainInbox() {
+			a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: m})
+		}
+	}
+
+	if lifecycle != nil {
+		turnCtx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(lifecycle, cancel)
+		defer func() {
+			stop()
+			cancel()
+		}()
+		ctx = turnCtx
+	}
+
 	a.setState(StateRunning)
 	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input})
+	a.trimHistory()
 
 	for round := 0; round < a.maxToolRounds; round++ {
 		rctx, cancel := a.requestContext(ctx)
@@ -267,6 +316,7 @@ func (a *Agent) turn(ctx context.Context, input string) error {
 
 		calls := functionCalls(output)
 		if len(calls) == 0 {
+			a.trimHistory()
 			a.setState(StateIdle)
 			return nil
 		}
@@ -313,21 +363,29 @@ func (a *Agent) run(ctx context.Context) {
 // runs its cleanup exactly once, and emits a state event. It is idempotent and
 // safe to call concurrently.
 func (a *Agent) Close() {
-	a.mu.Lock()
-	if a.state == StateClosed {
+	a.closeOnce.Do(func() {
+		a.mu.Lock()
+		a.state = StateClosed
 		a.mu.Unlock()
-		return
-	}
-	a.state = StateClosed
-	a.mu.Unlock()
 
-	if a.cancel != nil {
-		a.cancel()
-	}
+		if a.cancel != nil {
+			a.cancel()
+		}
+		a.active.Wait()
+		a.releaseResources()
+		a.emit(Event{Type: EventState, State: StateClosed})
+		close(a.closeDone)
+	})
+	<-a.closeDone
+}
+
+// releaseResources releases external resources without changing lifecycle
+// state. The Manager uses it for errored subagents so diagnostics remain
+// visible without leaking their execution sessions.
+func (a *Agent) releaseResources() {
 	if a.cleanup != nil {
 		a.cleanupOnce.Do(a.cleanup)
 	}
-	a.emit(Event{Type: EventState, State: StateClosed})
 }
 
 // lastAssistant returns the content of the most recent assistant message.
@@ -367,6 +425,9 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Ite
 		case llm.EventTextDelta:
 			a.emit(Event{Type: EventText, Text: ev.Text})
 		case llm.EventCompleted:
+			if ev.FinishReason != "" && ev.FinishReason != "stop" {
+				return nil, fmt.Errorf("llm response incomplete: %s", ev.FinishReason)
+			}
 			output = ev.Items
 		case llm.EventFailed:
 			return nil, ev.Err
@@ -417,6 +478,82 @@ func (a *Agent) append(items ...llm.Item) {
 	a.mu.Lock()
 	a.history = append(a.history, items...)
 	a.mu.Unlock()
+}
+
+// trimHistory bounds completed transcript retention. It runs only at legal
+// turn boundaries, never between a function call and its output. The newest
+// suffix is retained; if the newest item alone exceeds the byte limit, its
+// dynamic text is truncated so the configured bound still holds.
+func (a *Agent) trimHistory() {
+	if a.transcriptItems <= 0 && a.transcriptBytes <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	start := len(a.history)
+	var bytesUsed int64
+	for start > 0 {
+		if a.transcriptItems > 0 && len(a.history)-start >= a.transcriptItems {
+			break
+		}
+		n := transcriptItemBytes(a.history[start-1])
+		if a.transcriptBytes > 0 && bytesUsed+n > a.transcriptBytes {
+			break
+		}
+		start--
+		bytesUsed += n
+	}
+
+	if start == len(a.history) && len(a.history) > 0 {
+		// Keep a bounded form of the newest item rather than erasing the entire
+		// conversation. At a completed boundary this is normally the final
+		// assistant message and remains valid provider input on its own.
+		last := a.history[len(a.history)-1]
+		last = truncateTranscriptItem(last, a.transcriptBytes)
+		a.history = []llm.Item{last}
+		return
+	}
+	a.history = append([]llm.Item(nil), a.history[start:]...)
+	a.removeOrphanedToolItemsLocked()
+}
+
+func (a *Agent) removeOrphanedToolItemsLocked() {
+	calls := make(map[string]bool)
+	outputs := make(map[string]bool)
+	for _, it := range a.history {
+		switch it.Type {
+		case llm.ItemFunctionCall:
+			calls[it.CallID] = true
+		case llm.ItemFunctionCallOutput:
+			outputs[it.CallID] = true
+		}
+	}
+	filtered := a.history[:0]
+	for _, it := range a.history {
+		if it.Type == llm.ItemFunctionCall && !outputs[it.CallID] {
+			continue
+		}
+		if it.Type == llm.ItemFunctionCallOutput && !calls[it.CallID] {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	a.history = filtered
+}
+
+func transcriptItemBytes(it llm.Item) int64 {
+	return int64(len(it.Content) + len(it.Args))
+}
+
+func truncateTranscriptItem(it llm.Item, max int64) llm.Item {
+	if max <= 0 {
+		return it
+	}
+	it.Content = truncateUTF8(it.Content, max)
+	remaining := max - int64(len(it.Content))
+	it.Args = truncateUTF8(it.Args, remaining)
+	return it
 }
 
 func (a *Agent) setState(s State) {

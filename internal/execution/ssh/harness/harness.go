@@ -27,11 +27,11 @@ type Server struct {
 	hostKey  ssh.PublicKey
 	host     string
 
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
-	procs map[*exec.Cmd]struct{}
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	procs  map[*exec.Cmd]struct{}
 	closed bool
-	wg    sync.WaitGroup
+	wg     sync.WaitGroup
 
 	errs chan error
 }
@@ -177,6 +177,9 @@ func (s *Server) handleChannel(newCh ssh.NewChannel) {
 
 	reap := func(c *exec.Cmd) {
 		c.Wait()
+		s.mu.Lock()
+		delete(s.procs, c)
+		s.mu.Unlock()
 		mu.Lock()
 		done = true
 		mu.Unlock()

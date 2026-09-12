@@ -11,15 +11,18 @@ import (
 // list, and either the input line or an approval prompt.
 func (m *Model) View() string {
 	var b strings.Builder
-	b.WriteString(m.statusLine())
+	b.WriteString(sanitizeTerminalLine(m.statusLine()))
 	b.WriteString("\n")
 	b.WriteString(m.body())
 	b.WriteString("\n")
 
 	if m.pending != nil {
-		b.WriteString(fmt.Sprintf("approve %s? [y]es [n]o [a]llow-all", m.pending.Command))
+		b.WriteString(fmt.Sprintf("approve %s? [y]es [n]o [a]llow-all", sanitizeTerminalLine(m.pending.Command)))
+		if len(m.approvals) > 0 {
+			b.WriteString(fmt.Sprintf(" (%d queued)", len(m.approvals)))
+		}
 	} else {
-		b.WriteString("> " + m.input)
+		b.WriteString("> " + sanitizeTerminalLine(m.input))
 	}
 	return b.String()
 }
@@ -58,13 +61,19 @@ func (m *Model) rows() int {
 // text), oldest first, newline-separated.
 func (m *Model) transcriptBlock(rows int) string {
 	lines := m.lines
-	if rows > 0 && len(lines) > rows {
-		lines = lines[len(lines)-rows:]
+	lineBudget := rows
+	if lineBudget > 0 && len(m.curText) != 0 {
+		lineBudget--
+	}
+	if lineBudget > 0 && len(lines) > lineBudget {
+		lines = lines[len(lines)-lineBudget:]
+	} else if rows > 0 && lineBudget == 0 {
+		lines = nil
 	}
 	out := make([]string, 0, len(lines)+1)
 	out = append(out, lines...)
-	if m.curText != "" {
-		out = append(out, m.curText)
+	if len(m.curText) != 0 {
+		out = append(out, string(m.curText))
 	}
 	return strings.Join(out, "\n")
 }
@@ -73,7 +82,7 @@ func (m *Model) transcriptBlock(rows int) string {
 func (m *Model) subagentBlock(rows int) string {
 	lines := []string{fmt.Sprintf("subagents (%d)", len(m.subagents))}
 	for _, s := range m.subagents {
-		lines = append(lines, fmt.Sprintf("%s %s", s.ID, s.State))
+		lines = append(lines, sanitizeTerminalLine(fmt.Sprintf("%s %s", s.ID, s.State)))
 	}
 	if rows > 0 && len(lines) > rows {
 		lines = lines[:rows]

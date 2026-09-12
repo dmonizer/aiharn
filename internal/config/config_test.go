@@ -15,6 +15,7 @@ func setup(t *testing.T, configBody string) (configPath string) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "prompts", "planner.md"), "# planner\n")
 	writeFile(t, filepath.Join(dir, "known_hosts"), "fake-known-hosts\n")
+	writeFile(t, filepath.Join(dir, "id_ed25519"), "fake-private-key\n")
 	configPath = filepath.Join(dir, "config.toml")
 	writeFile(t, configPath, configBody)
 	return configPath
@@ -42,7 +43,7 @@ name = "devbox"
 type = "ssh"
 host = "10.0.0.5"
 user = "ubuntu"
-auth = { key_file = "~/.ssh/id_ed25519" }
+auth = { key_file = "id_ed25519" }
 known_hosts = "known_hosts"
 keep_alive = true
 working_dir = "/home/ubuntu/work/${agent.type}-${agent.id}"
@@ -96,8 +97,8 @@ func TestLoadValid(t *testing.T) {
 	if got := cfg.Agents["planner"].SystemPrompt; got != filepath.Join(dir, "prompts", "planner.md") {
 		t.Errorf("SystemPrompt = %q, want resolved under config dir", got)
 	}
-	if got := cfg.Channels[0].Auth.KeyFile; !filepath.IsAbs(got) {
-		t.Errorf("KeyFile = %q, want absolute (tilde expanded)", got)
+	if got := cfg.Channels[0].Auth.KeyFile; got != filepath.Join(dir, "id_ed25519") {
+		t.Errorf("KeyFile = %q, want resolved under config dir", got)
 	}
 
 	// Limits: explicit override + defaults for the rest.
@@ -148,6 +149,23 @@ func TestLoadInvalidDuration(t *testing.T) {
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "invalid duration") {
 		t.Fatalf("Load error = %v, want invalid duration", err)
+	}
+}
+
+func TestDurationIntegerOverflow(t *testing.T) {
+	var d Duration
+	if err := d.UnmarshalTOML(int64(^uint64(0) >> 1)); err == nil {
+		t.Fatal("expected duration overflow error")
+	}
+}
+
+func TestExpandTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := expandTilde("~/key"); got != filepath.Join(home, "key") {
+		t.Fatalf("expandTilde = %q", got)
 	}
 }
 
@@ -221,6 +239,47 @@ func TestValidateReferences(t *testing.T) {
 	}
 }
 
+func TestValidateModelEndpointAndCredentials(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(string) string
+		wantErr string
+	}{
+		{"missing base URL", func(s string) string {
+			return strings.Replace(s, `base_url = "https://openrouter.ai/api/v1"`, `base_url = ""`, 1)
+		}, "base_url is required"},
+		{"missing API key", func(s string) string {
+			return strings.Replace(s, `api_key = "${TEST_API_KEY}"`, `api_key = ""`, 1)
+		}, "api_key is required"},
+		{"credentials in URL", func(s string) string {
+			return strings.Replace(s, `https://openrouter.ai/api/v1`, `https://secret@openrouter.ai/api/v1`, 1)
+		}, "without credentials"},
+		{"plaintext remote URL", func(s string) string {
+			return strings.Replace(s, `https://openrouter.ai/api/v1`, `http://openrouter.ai/api/v1`, 1)
+		}, "must use HTTPS"},
+		{"responses suffix", func(s string) string {
+			return strings.Replace(s, `https://openrouter.ai/api/v1`, `https://openrouter.ai/api/v1/responses`, 1)
+		}, "appends /responses"},
+		{"chat suffix", func(s string) string {
+			s = strings.Replace(s, `provider = "openai_responses"`, `provider = "openai_chat_completions"`, 1)
+			return strings.Replace(s, `https://openrouter.ai/api/v1`, `https://example.com/chat/completions`, 1)
+		}, "appends /chat/completions"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := setup(t, tc.mutate(validConfig))
+			t.Setenv("TEST_API_KEY", "x")
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Validate(cfg, ValidateOptions{}); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateNegativeLimits(t *testing.T) {
 	body := strings.Replace(validConfig, "max_agent_depth = 3", "max_agent_depth = -1", 1)
 	path := setup(t, body)
@@ -236,8 +295,8 @@ func TestValidateNegativeLimits(t *testing.T) {
 }
 
 func TestValidateAuthMutuallyExclusive(t *testing.T) {
-	body := strings.Replace(validConfig, `auth = { key_file = "~/.ssh/id_ed25519" }`,
-		`auth = { key_file = "~/.ssh/id_ed25519", password = "hunter2" }`, 1)
+	body := strings.Replace(validConfig, `auth = { key_file = "id_ed25519" }`,
+		`auth = { key_file = "id_ed25519", password = "hunter2" }`, 1)
 	path := setup(t, body)
 	t.Setenv("TEST_API_KEY", "x")
 	cfg, err := Load(path)
@@ -361,6 +420,10 @@ func TestRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	wd, _ := ParseWorkingDir("/original")
+	agentCfg := cfg.Agents["planner"]
+	agentCfg.WorkingDir = &wd
+	cfg.Agents["planner"] = agentCfg
 	r := cfg.Redacted()
 	if got := r.Models["opus_via_openrouter"].APIKey; got == "supersecret" || got == "" {
 		t.Errorf("Redacted APIKey = %q, want masked marker", got)
@@ -369,6 +432,11 @@ func TestRedacted(t *testing.T) {
 		r.Models["opus_via_openrouter"].APIKey,
 	}, ""), "supersecret") {
 		t.Errorf("Redacted config still contains secret")
+	}
+	*r.Channels[0].KeepAlive = false
+	r.Agents["planner"].WorkingDir.Raw = "/changed"
+	if !*cfg.Channels[0].KeepAlive || cfg.Agents["planner"].WorkingDir.Raw != "/original" {
+		t.Fatal("Redacted returned shared mutable pointers")
 	}
 }
 
