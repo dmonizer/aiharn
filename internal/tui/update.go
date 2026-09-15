@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -25,6 +24,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseMsg:
+		return m, m.handleMouse(msg)
+
 	case cursor.BlinkMsg:
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
@@ -40,7 +42,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.approvals = append(m.approvals, msg.req)
 		}
-		m.appendLine(kindApproval, fmt.Sprintf("[approval] %s %s", msg.req.ToolName, msg.req.Command))
 		return m, waitApprovalContext(m.ctx, m.gate)
 
 	case rosterMsg:
@@ -75,6 +76,30 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.handleApprovalKey(msg)
 	}
 
+	if msg.String() == "ctrl+s" {
+		m.cycleShell()
+		return m, nil
+	}
+
+	if m.shellMode == shellMaximized {
+		switch msg.String() {
+		case "up":
+			m.scrollShell(-1)
+		case "down":
+			m.scrollShell(1)
+		case "pgup":
+			m.scrollShell(-m.shellPageSize())
+		case "pgdn":
+			m.scrollShell(m.shellPageSize())
+		case "home":
+			m.shellScroll = 0
+			m.clampShellScroll()
+		case "end":
+			m.shellScroll = m.shellMaxScroll()
+		}
+		return m, nil
+	}
+
 	// Any key other than ESC disarms a pending double-ESC clear.
 	if msg.String() != "esc" {
 		m.lastEsc = time.Time{}
@@ -87,6 +112,32 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.pressEsc(time.Now())
 		return m, nil
+
+	case "up":
+		m.historyUp()
+		m.resizeInput()
+		return m, nil
+
+	case "down":
+		m.historyDown()
+		m.resizeInput()
+		return m, nil
+
+	case "pgup", "pgdn", "home", "end":
+		if m.shellMode != shellClosed {
+			switch msg.String() {
+			case "pgup":
+				m.scrollShell(-m.shellPageSize())
+			case "pgdn":
+				m.scrollShell(m.shellPageSize())
+			case "home":
+				m.shellScroll = 0
+				m.clampShellScroll()
+			case "end":
+				m.shellScroll = m.shellMaxScroll()
+			}
+			return m, nil
+		}
 	}
 
 	// Everything else is editing input: printable runes (typing or bracketed
@@ -110,12 +161,17 @@ func (m *Model) submitInput() tea.Cmd {
 	line := strings.TrimSpace(m.textarea.Value())
 	m.textarea.Reset()
 	m.resizeInput()
+	m.histIdx = -1
 	if line == "" {
+		m.draft = ""
 		return nil
 	}
 	if !strings.Contains(line, "\n") && strings.HasPrefix(line, "/") {
+		m.draft = ""
 		return m.handleCommand(line)
 	}
+	m.pushHistory(line)
+	m.draft = ""
 	m.queue = append(m.queue, line)
 	return m.nextTurn()
 }
@@ -165,7 +221,9 @@ func (m *Model) appendEvent(ev agent.Event) {
 	case agent.EventText:
 		m.appendText(ev.Text)
 	case agent.EventToolCall:
-		m.appendLine(kindTool, fmt.Sprintf("[tool] %s %s", ev.Call.Name, ev.Call.Args))
+		m.appendToolCall(ev.Call)
+	case agent.EventToolResult:
+		m.appendToolResult(ev.Call, ev.Text)
 	case agent.EventState:
 		m.flushText()
 	}

@@ -36,14 +36,16 @@ const (
 	kindUser
 	kindAssistant
 	kindTool
+	kindCommand
 	kindError
-	kindApproval
 )
 
-// line is one flushed transcript line with its presentation kind.
+// line is one flushed transcript line with its presentation kind. cmd indexes
+// into the shell command list for clickable command lines, or -1.
 type line struct {
 	text string
 	kind lineKind
+	cmd  int
 }
 
 // Model is the Bubbletea root model.
@@ -65,6 +67,24 @@ type Model struct {
 
 	pending   *approval.Request  // active approval modal, nil when none
 	approvals []approval.Request // additional requests waiting behind the modal
+
+	// shell session view
+	shellCmds   []shellCmd
+	shellFlat   []string // flattened display rows (header + output)
+	shellStart  []int    // per command, index of its header row in shellFlat
+	shellRowCmd []int    // per shellFlat row, owning command index or -1
+	shellMode   shellViewMode
+	shellScroll int
+	shellFocus  int // index into shellCmds, -1 = none
+
+	// click hit-testing (computed in View, consumed by mouse handling)
+	clickRows  []int // per transcript row: shellCmds index or -1
+	clickWidth int   // transcript pane width; 0 = no column constraint
+
+	// input history
+	history []string
+	histIdx int    // -1 = not navigating (draft/empty area)
+	draft   string // saved half-finished prompt during navigation
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -88,6 +108,8 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 	m.textarea = newTextarea()
 	m.textarea.Focus()
 	m.resizeInput()
+	m.shellFocus = -1
+	m.histIdx = -1
 	m.appendLine(kindPlain, fmt.Sprintf("aiharn: agent %s · model %s · channel %s · approval %s",
 		status.AgentType, status.Model, status.Channel, status.Approval))
 	m.refreshSubagents()
@@ -117,7 +139,7 @@ func (m *Model) refreshSubagents() {
 func (m *Model) appendLine(kind lineKind, s string) {
 	m.flushText()
 	for _, part := range strings.Split(sanitizeTerminalText(s), "\n") {
-		m.lines = append(m.lines, line{text: part, kind: kind})
+		m.lines = append(m.lines, line{text: part, kind: kind, cmd: -1})
 	}
 	m.trimLines()
 }
@@ -139,7 +161,7 @@ func (m *Model) appendText(s string) {
 		if i < 0 {
 			return
 		}
-		m.lines = append(m.lines, line{text: string(m.curText[:i]), kind: kindAssistant})
+		m.lines = append(m.lines, line{text: string(m.curText[:i]), kind: kindAssistant, cmd: -1})
 		m.trimLines()
 		m.curText = m.curText[i+1:]
 	}
@@ -159,7 +181,7 @@ func (m *Model) trimLines() {
 // flushText moves any partial streamed text into the transcript.
 func (m *Model) flushText() {
 	if len(m.curText) != 0 {
-		m.lines = append(m.lines, line{text: string(m.curText), kind: kindAssistant})
+		m.lines = append(m.lines, line{text: string(m.curText), kind: kindAssistant, cmd: -1})
 		m.curText = nil
 		m.trimLines()
 	}

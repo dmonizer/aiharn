@@ -174,7 +174,7 @@ func run(args []string) int {
 		AgentType: rt.Summary.AgentType,
 		Channel:   rt.Summary.Channel,
 		Approval:  rt.Summary.Approval,
-	}))
+	}), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
 		return 1

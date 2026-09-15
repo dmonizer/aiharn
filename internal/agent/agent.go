@@ -53,6 +53,7 @@ type EventType int
 const (
 	EventText EventType = iota
 	EventToolCall
+	EventToolResult
 	EventState
 )
 
@@ -60,8 +61,8 @@ const (
 type Event struct {
 	AgentID string
 	Type    EventType
-	Text    string   // EventText
-	Call    llm.Item // EventToolCall
+	Text    string   // EventText delta, or EventToolResult output
+	Call    llm.Item // EventToolCall / EventToolResult
 	State   State    // EventState
 }
 
@@ -571,20 +572,27 @@ func (a *Agent) runTool(ctx context.Context, call llm.Item) string {
 		}
 		logging.Debug("agent: runTool done", attrs...)
 	}
+	var result string
+	var err error
 	if a.tools == nil {
-		res := fmt.Sprintf("error: no tools available (cannot call %q)", call.Name)
-		logDone(len(res), errors.New("no tools available"))
-		return res
+		result = fmt.Sprintf("error: no tools available (cannot call %q)", call.Name)
+		err = errors.New("no tools available")
+	} else {
+		result, err = a.tools.Run(ctx, call.Name, json.RawMessage(call.Args))
+		if err != nil {
+			result = "error: " + err.Error()
+		}
 	}
-	result, err := a.tools.Run(ctx, call.Name, json.RawMessage(call.Args))
+	// Emit the full result before the model-visible truncation so the UI can show
+	// the whole command output; the model still sees only the truncated form.
+	a.emit(Event{Type: EventToolResult, Call: call, Text: result})
+	logDone(len(result), err)
 	if err != nil {
-		logDone(len(result), err)
-		return "error: " + err.Error()
+		return result
 	}
 	if a.toolResultBytes > 0 && int64(len(result)) > a.toolResultBytes {
 		result = truncateUTF8(result, a.toolResultBytes) + "\n[result truncated]"
 	}
-	logDone(len(result), nil)
 	return result
 }
 

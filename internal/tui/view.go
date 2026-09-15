@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/rivo/uniseg"
 )
 
 // Per-kind transcript styles. ANSI basic colors work on every terminal.
@@ -13,7 +14,6 @@ var (
 	styleAssistant = lipgloss.NewStyle()
 	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	styleApproval  = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
 )
 
 // styleLine renders a transcript line in its kind's color (plain passes through
@@ -26,21 +26,27 @@ func styleLine(kind lineKind, s string) string {
 		return styleAssistant.Render(s)
 	case kindTool:
 		return styleTool.Render(s)
+	case kindCommand:
+		return styleCommand.Render(s)
 	case kindError:
 		return styleError.Render(s)
-	case kindApproval:
-		return styleApproval.Render(s)
 	default:
 		return s
 	}
 }
 
-// View renders the status bar, the focused transcript beside a live subagent
-// list, and either the input line or an approval prompt.
+// View renders the status bar, the transcript (and, when open, the shell pane),
+// and either the input line or an approval prompt.
 func (m *Model) View() string {
 	var b strings.Builder
 	b.WriteString(sanitizeTerminalLine(m.statusLine()))
 	b.WriteString("\n")
+
+	if m.shellMode == shellMaximized {
+		b.WriteString(m.shellPane(m.height - 1))
+		return b.String()
+	}
+
 	b.WriteString(m.body())
 	b.WriteString("\n")
 
@@ -55,26 +61,74 @@ func (m *Model) View() string {
 	return b.String()
 }
 
-// body renders the transcript and subagent panes side by side, or stacked when
-// the terminal is too narrow.
+// body renders the transcript and subagent panes (plus an open shell pane),
+// pinned to the bottom so the newest content stays visible.
 func (m *Model) body() string {
-	rows := m.rows()
+	if m.shellMode == shellOpen {
+		shellRows := m.shellOpenRows()
+		transRows := m.rows() - shellRows
+		if transRows < 0 {
+			transRows = 0
+		}
+		return m.transcriptAndSubagents(transRows) + "\n" + m.shellPane(shellRows)
+	}
+	return m.transcriptAndSubagents(m.rows())
+}
 
+// transcriptAndSubagents lays out the transcript beside (or above) the subagent
+// list, recording the transcript's clickable command rows for mouse handling.
+func (m *Model) transcriptAndSubagents(rows int) string {
 	const subWidth = 32
-	left := m.transcriptBlock(rows)
+	split := m.width >= subWidth+40
+	tw := m.width
+	if split {
+		tw = m.width - subWidth - 1
+		if tw < 20 {
+			tw = 20
+		}
+	}
+	left, click := m.transcriptRows(tw, rows)
+	m.clickRows = click
+	m.clickWidth = tw
+
 	right := m.subagentBlock(rows)
+	if split {
+		l := lipgloss.NewStyle().Width(tw).Render(strings.Join(left, "\n"))
+		r := lipgloss.NewStyle().Width(subWidth).Render(right)
+		return fill(lipgloss.JoinHorizontal(lipgloss.Top, l, r), rows)
+	}
+	return fill(strings.Join(left, "\n")+"\n"+right, rows)
+}
 
-	if m.width < subWidth+40 {
-		return fill(left+"\n"+right, rows)
+// transcriptRows returns the wrapped transcript as visual rows, bottom-pinned to
+// `rows`, plus a parallel per-row clickable-command index (-1 for non-command).
+func (m *Model) transcriptRows(width, rows int) ([]string, []int) {
+	logical := m.lines
+	if rows <= 0 {
+		logical = nil
+	} else if len(logical) > rows {
+		logical = logical[len(logical)-rows:]
 	}
 
-	leftW := m.width - subWidth - 1
-	if leftW < 20 {
-		leftW = 20
+	var visual []string
+	var click []int
+	for _, ln := range logical {
+		for _, wl := range wrapLine(ln.text, width) {
+			visual = append(visual, styleLine(ln.kind, wl))
+			click = append(click, ln.cmd)
+		}
 	}
-	l := lipgloss.NewStyle().Width(leftW).Render(left)
-	r := lipgloss.NewStyle().Width(subWidth).Render(right)
-	return fill(lipgloss.JoinHorizontal(lipgloss.Top, l, r), rows)
+	if len(m.curText) != 0 {
+		for _, wl := range wrapLine(string(m.curText), width) {
+			visual = append(visual, styleLine(kindAssistant, wl))
+			click = append(click, -1)
+		}
+	}
+	if rows > 0 && len(visual) > rows {
+		visual = visual[len(visual)-rows:]
+		click = click[len(click)-rows:]
+	}
+	return visual, click
 }
 
 // rows is the number of body rows available, or 0 when unknown. The input box
@@ -104,29 +158,6 @@ func fill(s string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// transcriptBlock returns up to rows transcript lines (plus any partial streamed
-// text), oldest first, newline-separated.
-func (m *Model) transcriptBlock(rows int) string {
-	lines := m.lines
-	lineBudget := rows
-	if lineBudget > 0 && len(m.curText) != 0 {
-		lineBudget--
-	}
-	if lineBudget > 0 && len(lines) > lineBudget {
-		lines = lines[len(lines)-lineBudget:]
-	} else if rows > 0 && lineBudget == 0 {
-		lines = nil
-	}
-	out := make([]string, 0, len(lines)+1)
-	for _, ln := range lines {
-		out = append(out, styleLine(ln.kind, ln.text))
-	}
-	if len(m.curText) != 0 {
-		out = append(out, styleLine(kindAssistant, string(m.curText)))
-	}
-	return strings.Join(out, "\n")
-}
-
 // subagentBlock returns up to rows subagent status lines under a header.
 func (m *Model) subagentBlock(rows int) string {
 	lines := []string{fmt.Sprintf("subagents (%d)", len(m.subagents))}
@@ -146,4 +177,36 @@ func (m *Model) statusLine() string {
 	}
 	return fmt.Sprintf("model %s · agent %s · channel %s · approval %s",
 		m.status.Model, m.status.AgentType, m.status.Channel, approval)
+}
+
+// wrapLine hard-wraps s into visual rows no wider than width grapheme columns,
+// preserving explicit newlines. Long lines never overflow the pane width, which
+// keeps the fixed-height layout intact and the newest output visible.
+func wrapLine(s string, width int) []string {
+	if width <= 0 {
+		return strings.Split(s, "\n")
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		if para == "" {
+			out = append(out, "")
+			continue
+		}
+		var cur strings.Builder
+		curW := 0
+		gr := uniseg.NewGraphemes(para)
+		for gr.Next() {
+			g := gr.Str()
+			gw := uniseg.StringWidth(g)
+			if curW+gw > width && curW > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+				curW = 0
+			}
+			cur.WriteString(g)
+			curW += gw
+		}
+		out = append(out, cur.String())
+	}
+	return out
 }

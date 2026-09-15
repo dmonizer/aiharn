@@ -23,6 +23,10 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 		m.appendLine(kindPlain, "available commands:")
 		m.appendLine(kindPlain, "  /help - show this help")
 		m.appendLine(kindPlain, "  /quit - quit")
+		m.appendLine(kindPlain, "keys:")
+		m.appendLine(kindPlain, "  up/down - previous prompts")
+		m.appendLine(kindPlain, "  ctrl+s - toggle shell view (closed/open/maximized)")
+		m.appendLine(kindPlain, "  click a command - open shell view focused on it")
 	default:
 		m.appendLine(kindPlain, fmt.Sprintf("unknown command %q; type /help for help", name))
 	}

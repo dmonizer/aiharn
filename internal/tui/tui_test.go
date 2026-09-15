@@ -64,8 +64,11 @@ func TestUpdateToolCallFlushesText(t *testing.T) {
 	if len(m.curText) != 0 {
 		t.Fatalf("curText = %q, want flushed", m.curText)
 	}
-	if len(m.lines) == 0 || m.lines[len(m.lines)-1].text != "[tool] execute_command {\"command\":\"ls\"}" {
-		t.Fatalf("last line = %q", m.lines[len(m.lines)-1].text)
+	if len(m.lines) == 0 || m.lines[len(m.lines)-1].text != "ls" {
+		t.Fatalf("last line = %q, want command preview", m.lines[len(m.lines)-1].text)
+	}
+	if len(m.shellCmds) != 1 || m.shellCmds[0].command != "ls" {
+		t.Fatalf("shellCmds = %+v, want one ls command", m.shellCmds)
 	}
 }
 
@@ -248,12 +251,10 @@ func TestInputCappedAndScrollable(t *testing.T) {
 	if got := m.textarea.Value(); got != strings.Join(lines, "\n") {
 		t.Fatalf("value = %q", got)
 	}
-	// Up/down move the cursor within the textarea (which scrolls its own
-	// viewport) without altering the value.
+	// Up/down now navigate prompt history rather than move the cursor.
 	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyUp})
-	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	if got := m.textarea.Value(); got != strings.Join(lines, "\n") {
-		t.Fatalf("value after cursor moves = %q", got)
+		t.Fatalf("value after up = %q, want the draft preserved", got)
 	}
 }
 
@@ -301,7 +302,6 @@ func TestStyleLineColors(t *testing.T) {
 		{kindUser, "36"},
 		{kindTool, "33"},
 		{kindError, "31"},
-		{kindApproval, "35"},
 	}
 	for _, c := range cases {
 		got := styleLine(c.kind, "hello")
