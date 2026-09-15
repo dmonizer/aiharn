@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 )
 
 const (
@@ -101,7 +103,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc("/api/v1/messages", s.handleMessages)
 	mux.HandleFunc("/api/v1/approvals/", s.handleApproval)
-	s.handler = s.securityHeaders(s.cors(s.authenticate(mux)))
+	s.handler = s.requestLog(s.securityHeaders(s.cors(s.authenticate(mux))))
 
 	go s.runMessages()
 	return s, nil
@@ -414,6 +416,50 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
+	})
+}
+
+// statusRecorder captures the response status code for request logging.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// requestLog logs each incoming request at debug level. It is the outermost
+// middleware so it sees requests rejected by CORS or auth, and the final status.
+// It never logs the Authorization value, only whether one was present.
+func (s *Server) requestLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !logging.Enabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rec := &statusRecorder{ResponseWriter: w}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		logging.Debug("api request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("remote", r.RemoteAddr),
+			slog.String("origin", r.Header.Get("Origin")),
+			slog.Bool("auth", r.Header.Get("Authorization") != ""),
+			slog.Int("status", rec.status),
+			slog.Duration("dur", time.Since(start)),
+		)
 	})
 }
 
