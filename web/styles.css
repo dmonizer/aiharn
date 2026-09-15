@@ -342,7 +342,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 .composer:focus-within { border-color: #5c713d; }
 .composer textarea {
-  max-height: 180px;
+  height: 64px;
+  min-height: 40px;
+  max-height: 40vh;
   resize: none;
   border: 0;
   outline: 0;
@@ -350,6 +352,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: transparent;
   line-height: 1.5;
 }
+.composer-resize {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 12px;
+  margin: -2px 0 0;
+  cursor: ns-resize;
+  touch-action: none;
+}
+.composer-resize::before {
+  content: "";
+  width: 44px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-bright);
+  transition: background .15s ease;
+}
+.composer-resize:hover::before { background: var(--accent); }
+body.resizing { user-select: none; cursor: ns-resize; }
+body.resizing .composer-resize::before { background: var(--accent); }
 .composer textarea::placeholder { color: var(--faint); }
 .composer textarea:disabled { cursor: not-allowed; }
 .send-button {

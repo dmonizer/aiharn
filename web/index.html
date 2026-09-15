@@ -47,7 +47,8 @@
       </main>
 
       <form id="composer" class="composer">
-        <textarea id="message" rows="1" maxlength="65536" placeholder="Message Aiharn…" aria-label="Message Aiharn" disabled></textarea>
+        <div class="composer-resize" title="Drag to resize input" aria-hidden="true"></div>
+        <textarea id="message" rows="3" maxlength="65536" placeholder="Message Aiharn…" aria-label="Message Aiharn" disabled></textarea>
         <button id="send" type="submit" class="send-button" disabled aria-label="Send message">↑</button>
         <div class="composer-hint"><span id="queue-state"></span><span>Enter to send · Shift Enter for newline</span></div>
       </form>

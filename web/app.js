@@ -438,7 +438,7 @@
         method: "POST", body: JSON.stringify({ content })
       });
       elements.message.value = "";
-      resizeComposer();
+      updateComposer();
       await poll(true);
     } catch (error) {
       showConnection(error.message);
@@ -462,9 +462,7 @@
     setTimeout(() => elements.tokenValue.focus(), 0);
   }
 
-  function resizeComposer() {
-    elements.message.style.height = "auto";
-    elements.message.style.height = Math.min(elements.message.scrollHeight, 180) + "px";
+  function updateComposer() {
     elements.send.disabled = !state.connected || !elements.message.value.trim();
   }
 
@@ -526,13 +524,33 @@
   });
 
   elements.composer.addEventListener("submit", sendMessage);
-  elements.message.addEventListener("input", resizeComposer);
+  elements.message.addEventListener("input", updateComposer);
   elements.message.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       sendMessage();
     }
   });
+
+  const composerResize = document.querySelector(".composer-resize");
+  let resizeStart = null;
+  composerResize.addEventListener("pointerdown", (event) => {
+    resizeStart = { y: event.clientY, h: elements.message.offsetHeight };
+    composerResize.setPointerCapture(event.pointerId);
+    document.body.classList.add("resizing");
+  });
+  composerResize.addEventListener("pointermove", (event) => {
+    if (!resizeStart) return;
+    const max = Math.round(window.innerHeight * 0.4);
+    const height = Math.min(Math.max(resizeStart.h + (resizeStart.y - event.clientY), 40), max);
+    elements.message.style.height = height + "px";
+  });
+  const endResize = () => {
+    resizeStart = null;
+    document.body.classList.remove("resizing");
+  };
+  composerResize.addEventListener("pointerup", endResize);
+  composerResize.addEventListener("pointercancel", endResize);
 
   renderEndpointList();
   renderWaiting();
