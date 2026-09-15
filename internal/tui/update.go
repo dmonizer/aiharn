@@ -81,6 +81,15 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	switch msg.String() {
+	case "ctrl+up":
+		m.resizeInputBy(1)
+		return m, nil
+	case "ctrl+down":
+		m.resizeInputBy(-1)
+		return m, nil
+	}
+
 	if m.shellMode == shellMaximized {
 		switch msg.String() {
 		case "up":

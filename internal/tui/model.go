@@ -55,11 +55,13 @@ type Model struct {
 	gate    *approval.Gate
 	status  Status
 
-	lines   []line   // flushed transcript lines, oldest first
-	curText []byte   // streamed text not yet flushed to a line
+	lines    []line // flushed transcript lines, oldest first
+	curText  []byte // streamed text not yet flushed to a line
 	textarea textarea.Model
-	queue   []string // inputs waiting for the agent to become idle
-	running bool
+	queue    []string // inputs waiting for the agent to become idle
+	running  bool
+
+	inputMax int // user-adjustable max input-box height in lines
 
 	lastEsc time.Time // when a first ESC press armed the clear, zero if none
 
@@ -69,15 +71,15 @@ type Model struct {
 	approvals []approval.Request // additional requests waiting behind the modal
 
 	// shell session view
-	shellCmds     []shellCmd
-	shellFlat     []string // flattened display rows (header + output)
-	shellStart    []int    // per command, index of its header row in shellFlat
-	shellRowCmd   []int    // per shellFlat row, owning command index or -1
-	shellMode     shellViewMode
-	shellScroll   int
-	shellFocus    int  // index into shellCmds, -1 = none
-	shellFollow   bool // autoscroll to newest output while pinned to the bottom
-	shellButtons  []shellButton
+	shellCmds    []shellCmd
+	shellFlat    []string // flattened display rows (header + output)
+	shellStart   []int    // per command, index of its header row in shellFlat
+	shellRowCmd  []int    // per shellFlat row, owning command index or -1
+	shellMode    shellViewMode
+	shellScroll  int
+	shellFocus   int  // index into shellCmds, -1 = none
+	shellFollow  bool // autoscroll to newest output while pinned to the bottom
+	shellButtons []shellButton
 
 	// click hit-testing (computed in View, consumed by mouse handling)
 	clickRows  []int // per transcript row: shellCmds index or -1
@@ -100,12 +102,13 @@ type Model struct {
 func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Model{
-		manager: mgr,
-		agent:   top,
-		gate:    g,
-		status:  status,
-		ctx:     ctx,
-		cancel:  cancel,
+		manager:  mgr,
+		agent:    top,
+		gate:     g,
+		status:   status,
+		ctx:      ctx,
+		cancel:   cancel,
+		inputMax: defaultInputHeight,
 	}
 	m.textarea = newTextarea()
 	m.textarea.Focus()

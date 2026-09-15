@@ -14,6 +14,13 @@ import (
 // that clears the input line.
 const escClearWindow = 500 * time.Millisecond
 
+const (
+	// defaultInputHeight is the input box's starting max height: a few lines.
+	defaultInputHeight = 4
+	// minInputHeight is the smallest the input box can be shrunk to.
+	minInputHeight = 1
+)
+
 // newTextarea builds the multi-line input widget. Enter is reserved for
 // submitting to the agent, so a literal newline is inserted with Ctrl+J.
 func newTextarea() textarea.Model {
@@ -49,14 +56,28 @@ func sanitizeTerminalLine(s string) string {
 	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(s)
 }
 
-// maxInputHeight caps the input box at one quarter of the screen height, but
-// never below one line.
+// maxInputHeight returns the user-adjustable cap for the input box, clamped so
+// it can never grow beyond the screen minus a status line and one transcript
+// row. It never returns below one line.
 func (m *Model) maxInputHeight() int {
-	h := m.height / 4
-	if h < 1 {
-		h = 1
+	h := m.inputMax
+	if h < minInputHeight {
+		h = minInputHeight
+	}
+	if limit := m.height - 2; limit > 0 && h > limit {
+		h = limit
 	}
 	return h
+}
+
+// resizeInputBy grows (delta > 0) or shrinks (delta < 0) the input box's max
+// height and re-applies it.
+func (m *Model) resizeInputBy(delta int) {
+	m.inputMax += delta
+	if m.inputMax < minInputHeight {
+		m.inputMax = minInputHeight
+	}
+	m.resizeInput()
 }
 
 // inputBoxHeight is the number of rows the input widget currently renders.
@@ -80,7 +101,7 @@ func (m *Model) inputContentWidth() int {
 // inputDisplayHeight is the number of rows the input occupies after soft
 // wrapping. It over-estimates by treating every line as character-wrapped so
 // the box never clips; the textarea's own viewport absorbs any residual
-// overflow once the quarter-screen cap is reached.
+// overflow once the max-height cap is reached.
 func (m *Model) inputDisplayHeight() int {
 	w := m.inputContentWidth()
 	n := 0
@@ -96,7 +117,7 @@ func (m *Model) inputDisplayHeight() int {
 }
 
 // resizeInput applies the current terminal size to the input widget: full
-// width, height grown to fit the content up to a quarter of the screen.
+// width, height grown to fit the content up to the configured max height.
 func (m *Model) resizeInput() {
 	if m.width > 0 {
 		m.textarea.SetWidth(m.width)

@@ -133,7 +133,7 @@ func (m *Model) transcriptRows(width, rows int) ([]string, []int) {
 }
 
 // rows is the number of body rows available, or 0 when unknown. The input box
-// can grow to a quarter of the screen, so the body shrinks accordingly.
+// can grow up to its configured max height, so the body shrinks accordingly.
 func (m *Model) rows() int {
 	h := m.height - 1 - m.inputBoxHeight()
 	if h < 0 {

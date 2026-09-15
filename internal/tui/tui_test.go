@@ -197,7 +197,7 @@ func TestMultilinePasteStartingWithSlashIsNotACommand(t *testing.T) {
 	}
 }
 
-func TestInputBoxHeightCappedAtQuarter(t *testing.T) {
+func TestInputBoxHeightCappedAtConfiguredMax(t *testing.T) {
 	m := newTestModel(t)
 	m.height = 20
 	lines := make([]string, 20)
@@ -206,18 +206,40 @@ func TestInputBoxHeightCappedAtQuarter(t *testing.T) {
 	}
 	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune(strings.Join(lines, "\n"))})
 
-	if got := m.maxInputHeight(); got != 5 {
-		t.Fatalf("maxInputHeight = %d, want 5", got)
+	if got := m.maxInputHeight(); got != defaultInputHeight {
+		t.Fatalf("maxInputHeight = %d, want %d", got, defaultInputHeight)
 	}
-	if got := m.inputBoxHeight(); got != 5 {
-		t.Fatalf("inputBoxHeight = %d, want 5", got)
+	if got := m.inputBoxHeight(); got != defaultInputHeight {
+		t.Fatalf("inputBoxHeight = %d, want %d", got, defaultInputHeight)
+	}
+}
+
+func TestInputBoxResizesWithCtrlUpDown(t *testing.T) {
+	m := newTestModel(t)
+	m.height = 20
+
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlUp})
+	if got := m.maxInputHeight(); got != defaultInputHeight+1 {
+		t.Fatalf("maxInputHeight after ctrl+up = %d, want %d", got, defaultInputHeight+1)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlDown})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlDown})
+	if got := m.maxInputHeight(); got != defaultInputHeight-1 {
+		t.Fatalf("maxInputHeight after two ctrl+down = %d, want %d", got, defaultInputHeight-1)
+	}
+	// Shrinking floors at one line, no matter how many times it is pressed.
+	for i := 0; i < 10; i++ {
+		m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlDown})
+	}
+	if got := m.maxInputHeight(); got != minInputHeight {
+		t.Fatalf("maxInputHeight after many ctrl+down = %d, want %d", got, minInputHeight)
 	}
 }
 
 func TestInputAutoScrollsToBottom(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 120
-	m.height = 16 // maxInputHeight = 4
+	m.height = 16 // defaultInputHeight = 4
 	m.resizeInput()
 
 	lines := make([]string, 20)
@@ -237,16 +259,16 @@ func TestInputAutoScrollsToBottom(t *testing.T) {
 
 func TestInputCappedAndScrollable(t *testing.T) {
 	m := newTestModel(t)
-	m.height = 16 // maxInputHeight = 4
+	m.height = 16 // defaultInputHeight = 4
 	lines := make([]string, 10)
 	for i := range lines {
 		lines[i] = fmt.Sprintf("line%d", i)
 	}
 	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune(strings.Join(lines, "\n"))})
 
-	// The box is capped at a quarter of the screen but the value is intact.
-	if got := m.inputBoxHeight(); got != 4 {
-		t.Fatalf("inputBoxHeight = %d, want 4", got)
+	// The box is capped at the configured max height but the value is intact.
+	if got := m.inputBoxHeight(); got != defaultInputHeight {
+		t.Fatalf("inputBoxHeight = %d, want %d", got, defaultInputHeight)
 	}
 	if got := m.textarea.Value(); got != strings.Join(lines, "\n") {
 		t.Fatalf("value = %q", got)
