@@ -67,8 +67,9 @@ type Model struct {
 
 	subagents []tools.SubagentStatus // current roster snapshot
 
-	pending   *approval.Request  // active approval modal, nil when none
-	approvals []approval.Request // additional requests waiting behind the modal
+	pending            *approval.Request   // active approval modal, nil when none
+	approvals          []approval.Request  // additional requests waiting behind the modal
+	cancelledApprovals map[string]struct{} // stopped requests whose notifications may still arrive
 
 	// shell session view
 	shellCmds    []shellCmd
@@ -92,6 +93,10 @@ type Model struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	// turnCancel interrupts the scheduled/running top-level turn without
+	// stopping the TUI bridges or closing the session.
+	turnCancel context.CancelFunc
+	stopping   bool
 
 	width  int
 	height int

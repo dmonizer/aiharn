@@ -93,7 +93,7 @@ type Spec struct {
 	TranscriptItems int           // retained completed transcript items (0 = unlimited)
 	TranscriptBytes int64         // retained completed transcript content bytes (0 = unlimited)
 	Observer        HistoryObserver
-	Cleanup         func()        // invoked once at close (e.g. release the session)
+	Cleanup         func() // invoked once at close (e.g. release the session)
 }
 
 const (
@@ -136,6 +136,9 @@ type Agent struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	// turnCancel cancels only the currently executing turn. Unlike cancel, it
+	// leaves the agent lifecycle and its execution session open for later work.
+	turnCancel context.CancelFunc
 
 	// cleanup is invoked exactly once when the agent is closed; the app layer
 	// uses it to release the agent's execution session.
@@ -319,23 +322,30 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 	}
 	a.active.Add(1)
 	lifecycle := a.ctx
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	a.turnCancel = turnCancel
 	a.mu.Unlock()
-	defer a.active.Done()
+	var stopLifecycle func() bool
+	if lifecycle != nil {
+		stopLifecycle = context.AfterFunc(lifecycle, turnCancel)
+	}
+	defer func() {
+		if stopLifecycle != nil {
+			stopLifecycle()
+		}
+		turnCancel()
+		a.mu.Lock()
+		a.turnCancel = nil
+		a.mu.Unlock()
+		a.active.Done()
+	}()
 	if drainInbox {
 		for _, m := range a.drainInbox() {
 			a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: m})
 		}
 	}
 
-	if lifecycle != nil {
-		turnCtx, cancel := context.WithCancel(ctx)
-		stop := context.AfterFunc(lifecycle, cancel)
-		defer func() {
-			stop()
-			cancel()
-		}()
-		ctx = turnCtx
-	}
+	ctx = turnCtx
 
 	a.setState(StateRunning)
 	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input})
@@ -411,6 +421,11 @@ func (a *Agent) run(ctx context.Context) {
 		select {
 		case task := <-a.inbox:
 			if err := a.turn(ctx, task); err != nil {
+				// A user interrupt cancels one task, not the reusable subagent's
+				// lifecycle. Keep its run loop alive for future messages.
+				if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+					continue
+				}
 				// A cancellation is a normal shutdown, not a task failure.
 				if ctx.Err() == nil && a.onComplete != nil {
 					a.onComplete("error: " + err.Error())
@@ -424,6 +439,33 @@ func (a *Agent) run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// cancelWork cancels the current turn and optionally discards queued inbox
+// work. It leaves the agent open and returns whether anything was affected.
+func (a *Agent) cancelWork(discardInbox bool) bool {
+	a.mu.Lock()
+	cancel := a.turnCancel
+	affected := cancel != nil
+	if discardInbox {
+		for {
+			select {
+			case <-a.inbox:
+				affected = true
+			default:
+				a.mu.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+				return affected
+			}
+		}
+	}
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return affected
 }
 
 // Close terminates the agent: it marks it closed, cancels its lifecycle context,

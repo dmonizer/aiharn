@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -37,6 +39,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitAgentEventContext(m.ctx, m.agent)
 
 	case approvalReqMsg:
+		if _, cancelled := m.cancelledApprovals[msg.req.ID]; cancelled {
+			delete(m.cancelledApprovals, msg.req.ID)
+			return m, waitApprovalContext(m.ctx, m.gate)
+		}
 		if m.pending == nil {
 			m.pending = &msg.req
 		} else {
@@ -54,7 +60,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case turnDoneMsg:
 		m.flushText()
 		m.running = false
-		if msg.err != nil {
+		if m.turnCancel != nil {
+			m.turnCancel()
+			m.turnCancel = nil
+		}
+		expectedCancel := m.stopping && errors.Is(msg.err, context.Canceled)
+		m.stopping = false
+		if msg.err != nil && !expectedCancel {
 			m.appendLine(kindError, "error: "+msg.err.Error())
 		}
 		m.refreshSubagents()
@@ -70,6 +82,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		m.cancel()
 		return m, tea.Quit
+	}
+
+	// Terminals encode Ctrl+Esc identically to Esc. While work is active, that
+	// key therefore means "stop everything"; while idle, Esc retains its
+	// existing double-press-to-clear behavior.
+	if msg.String() == "esc" && m.stopAllRequests() {
+		return m, nil
 	}
 
 	if m.pending != nil {
@@ -162,6 +181,42 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// stopAllRequests cancels the top-level turn, all active agent turns, queued
+// top-level prompts, queued subagent tasks, and approval UI state. It returns
+// false when there was no work, allowing Esc to keep its input-clearing role.
+func (m *Model) stopAllRequests() bool {
+	hadWork := m.running || len(m.queue) > 0 || m.pending != nil || len(m.approvals) > 0
+	if m.turnCancel != nil {
+		m.turnCancel()
+	}
+	if m.manager != nil {
+		if n, err := m.manager.CancelAll(); err == nil && n > 0 {
+			hadWork = true
+		}
+	}
+	if m.gate != nil {
+		pending := m.gate.PendingRequests()
+		if len(pending) > 0 && m.cancelledApprovals == nil {
+			m.cancelledApprovals = make(map[string]struct{}, len(pending))
+		}
+		for _, req := range pending {
+			hadWork = true
+			m.cancelledApprovals[req.ID] = struct{}{}
+			_ = m.gate.Decide(req.ID, approval.DecisionDenied)
+		}
+	}
+	if !hadWork {
+		return false
+	}
+	m.queue = nil
+	m.pending = nil
+	m.approvals = nil
+	m.lastEsc = time.Time{}
+	m.stopping = m.running
+	m.appendLine(kindPlain, "stopping all active requests")
+	return true
+}
+
 // submitInput sends the current input to the agent and clears the box. A
 // single-line input starting with "/" is treated as a slash command.
 func (m *Model) submitInput() tea.Cmd {
@@ -220,7 +275,9 @@ func (m *Model) nextTurn() tea.Cmd {
 	m.queue = m.queue[1:]
 	m.running = true
 	m.appendLine(kindUser, "> "+input)
-	return runTurn(m.agent, m.ctx, input)
+	turnCtx, cancel := context.WithCancel(m.ctx)
+	m.turnCancel = cancel
+	return runTurn(m.agent, turnCtx, input)
 }
 
 func (m *Model) appendEvent(ev agent.Event) {

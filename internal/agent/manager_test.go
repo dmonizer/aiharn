@@ -460,6 +460,62 @@ func TestRosterNotifiesOnStateChange(t *testing.T) {
 	}
 }
 
+func TestCancelAllKeepsAgentsReusableAndDropsQueuedSubagentWork(t *testing.T) {
+	top := agent.New(agent.Spec{
+		ID: "main", Type: "main", AllowSubagents: true, Client: blockingClient{},
+	})
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderBlocking()})
+	defer mgr.Shutdown()
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+
+	subID, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topDone := make(chan error, 1)
+	go func() { topDone <- top.Turn(context.Background(), "top") }()
+	waitFor(t, 2*time.Second, "top and subagent to start", func() bool {
+		return top.State() == agent.StateRunning && mgr.Agent(subID).State() == agent.StateRunning
+	})
+	if !mgr.Agent(subID).Send("queued") {
+		t.Fatal("failed to queue second subagent task")
+	}
+
+	n, err := mgr.CancelAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("cancelled agents = %d, want 2", n)
+	}
+	if err := <-topDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("top turn error = %v, want cancellation", err)
+	}
+	waitFor(t, 2*time.Second, "subagent to return idle", func() bool {
+		return mgr.Agent(subID).State() == agent.StateIdle
+	})
+	if top.State() == agent.StateClosed || mgr.Agent(subID).State() == agent.StateClosed {
+		t.Fatal("CancelAll closed an agent")
+	}
+
+	// The queued task was discarded, but a task sent after the interrupt runs.
+	time.Sleep(20 * time.Millisecond)
+	if got := mgr.Agent(subID).State(); got != agent.StateIdle {
+		t.Fatalf("queued task survived cancellation: state = %v", got)
+	}
+	if !mgr.Agent(subID).Send("after") {
+		t.Fatal("subagent was not reusable after cancellation")
+	}
+	waitFor(t, 2*time.Second, "reused subagent to start", func() bool {
+		return mgr.Agent(subID).State() == agent.StateRunning
+	})
+	if n, err := mgr.CancelAll(); err != nil || n != 1 {
+		t.Fatalf("second CancelAll = (%d, %v), want (1, nil)", n, err)
+	}
+}
+
 func TestShutdownIdempotentNoLeaks(t *testing.T) {
 	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 16, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
 	if err := mgr.RegisterTop(newTop(t, true)); err != nil {

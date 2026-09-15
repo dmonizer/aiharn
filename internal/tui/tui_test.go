@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -124,6 +126,77 @@ func TestInputQueuedAtTurnBoundary(t *testing.T) {
 	m, cmd = upd(t, m, turnDoneMsg{})
 	if m.running || cmd != nil {
 		t.Fatalf("expected idle: running=%v cmd=%v", m.running, cmd != nil)
+	}
+}
+
+func TestEscStopsCurrentAndQueuedRequests(t *testing.T) {
+	m := newTestModel(t)
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("first")})
+	m, turnCmd := upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("second")})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if len(m.queue) != 1 {
+		t.Fatalf("queue before stop = %v", m.queue)
+	}
+
+	m, stopCmd := upd(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if stopCmd != nil {
+		t.Fatal("stop key unexpectedly returned a command")
+	}
+	if len(m.queue) != 0 {
+		t.Fatalf("queue after stop = %v", m.queue)
+	}
+	if !m.stopping {
+		t.Fatal("top-level turn was not marked as stopping")
+	}
+
+	msg := runCmd(turnCmd)
+	done, ok := msg.(turnDoneMsg)
+	if !ok || !errors.Is(done.err, context.Canceled) {
+		t.Fatalf("turn result = %v, want context cancellation", msg)
+	}
+	m, next := upd(t, m, done)
+	if m.running || next != nil {
+		t.Fatalf("stopped turn restarted work: running=%v cmd=%v", m.running, next != nil)
+	}
+	for _, line := range m.lines {
+		if strings.Contains(line.text, "error: context canceled") {
+			t.Fatalf("expected user cancellation to be non-error: %q", line.text)
+		}
+	}
+}
+
+func TestEscDismissesPendingApproval(t *testing.T) {
+	m := newTestModel(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.gate.Check(context.Background(), approval.Request{Command: "sleep 10"})
+		done <- err
+	}()
+
+	var req approval.Request
+	select {
+	case req = <-m.gate.Pending():
+	case <-time.After(time.Second):
+		t.Fatal("approval was not registered")
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.pending != nil || len(m.approvals) != 0 {
+		t.Fatalf("approval UI survived stop: pending=%+v queued=%+v", m.pending, m.approvals)
+	}
+
+	// A notification already in Bubble Tea's queue must not resurrect it.
+	m, _ = upd(t, m, approvalReqMsg{req: req})
+	if m.pending != nil {
+		t.Fatalf("late canceled approval reappeared: %+v", m.pending)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("approval cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval check did not unblock")
 	}
 }
 

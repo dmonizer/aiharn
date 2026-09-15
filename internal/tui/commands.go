@@ -25,6 +25,7 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 		m.appendLine(kindPlain, "  /quit - quit")
 		m.appendLine(kindPlain, "keys:")
 		m.appendLine(kindPlain, "  up/down - previous prompts")
+		m.appendLine(kindPlain, "  esc (including ctrl+esc) - stop all requests while active; double esc clears input while idle")
 		m.appendLine(kindPlain, "  ctrl+s - toggle shell view (closed/open/maximized)")
 		m.appendLine(kindPlain, "  click a command - open shell view focused on it")
 	default:
