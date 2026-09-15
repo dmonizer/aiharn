@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Remote console for active Aiharn sessions">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src http: https:; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <title>Aiharn Remote</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">A</div>
+        <div><strong>aiharn</strong><span>remote console</span></div>
+      </div>
+      <div class="side-heading"><span>APIs</span><button id="add-api" class="icon-button" title="Add API" aria-label="Add API">+</button></div>
+      <nav id="api-list" class="api-list" aria-label="Configured Aiharn APIs"></nav>
+      <div class="sidebar-foot">
+        <button id="manage-api" class="quiet-button">Configure APIs</button>
+        <p>Tokens live only in this browser tab.</p>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open API list">☰</button>
+        <div class="session-title">
+          <div class="eyebrow" id="endpoint-label">No API selected</div>
+          <h1 id="agent-title">Current session</h1>
+        </div>
+        <div class="session-meta" id="session-meta"></div>
+        <button id="set-token" class="quiet-button">Access token</button>
+      </header>
+
+      <div id="connection-state" class="connection-state hidden" role="status"></div>
+      <section id="approvals" class="approvals" aria-label="Permission requests"></section>
+      <main id="transcript" class="transcript" aria-live="polite">
+        <div class="empty-state">
+          <div class="empty-glyph">⌁</div>
+          <h2>Connect an Aiharn API</h2>
+          <p>Add one or more active instances, then switch between them from the sidebar.</p>
+          <button class="primary-button add-api-cta">Add API</button>
+        </div>
+      </main>
+
+      <form id="composer" class="composer">
+        <textarea id="message" rows="1" maxlength="65536" placeholder="Message Aiharn…" aria-label="Message Aiharn" disabled></textarea>
+        <button id="send" type="submit" class="send-button" disabled aria-label="Send message">↑</button>
+        <div class="composer-hint"><span id="queue-state"></span><span>Enter to send · Shift Enter for newline</span></div>
+      </form>
+    </section>
+  </div>
+
+  <dialog id="api-dialog">
+    <form id="api-form" method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><span class="eyebrow">Connection</span><h2>Add an Aiharn API</h2></div><button type="button" class="icon-button close-dialog" aria-label="Close">×</button></div>
+      <label>Name<input id="api-name" name="name" autocomplete="off" placeholder="Production agent" required></label>
+      <label>API base URL<input id="api-url" name="url" type="url" autocomplete="url" placeholder="https://agent.example.com" required></label>
+      <p class="field-help">Use the server origin, without <code>/api/v1</code>.</p>
+      <label>Bearer token<input id="api-token" name="token" type="password" autocomplete="off" placeholder="Required for remote listeners"></label>
+      <div class="dialog-actions"><button type="button" class="quiet-button close-dialog">Cancel</button><button type="submit" class="primary-button">Save API</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="token-dialog">
+    <form id="token-form" method="dialog" class="dialog-card compact">
+      <div class="dialog-head"><div><span class="eyebrow">Authentication</span><h2>Access token</h2></div><button type="button" class="icon-button close-token-dialog" aria-label="Close">×</button></div>
+      <p id="token-api-label" class="field-help"></p>
+      <label>Bearer token<input id="token-value" type="password" autocomplete="off"></label>
+      <div class="dialog-actions"><button type="button" id="forget-token" class="danger-button">Forget token</button><button type="submit" class="primary-button">Connect</button></div>
+    </form>
+  </dialog>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

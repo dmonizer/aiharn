@@ -138,7 +138,7 @@ func TestVerticalSlice(t *testing.T) {
 			config.ProviderOpenAIResponses:       true,
 			config.ProviderOpenAIChatCompletions: true,
 		},
-		KnownChannelTypes: map[string]bool{config.ChannelTypeSSH: true},
+		KnownChannelTypes: map[string]bool{config.ChannelTypeSSH: true, config.ChannelTypeLocal: true},
 		KnownTools:        map[string]bool{"execute_command": true, "set_approval": true},
 	}); err != nil {
 		t.Fatalf("Validate: %v", err)

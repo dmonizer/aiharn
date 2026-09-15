@@ -44,8 +44,16 @@ remote_command = "/bin/bash"    # optional: run this command instead of default_
                            # e.g. to force a clean shell and bypass login shell/screen/tmux
 working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"   # remote template
 
+# A local channel runs commands on this machine. It needs no remote host,
+# user, key_file, password, or known_hosts. Point an agent at it with
+# `channel = "local"` (or pass --channel local).
+[[channels]]
+name = "local"
+type = "local"
+default_shell = "/bin/bash"
+
 [agents.main]
-model = "deepseek_flash"     # required; validated at startup
+model = "zai_glm"     # required; validated at startup
 system_prompt = "prompts/main_pentester.md"
 channel = "sf"            # optional; default = first channel
 tools = "all"                 # "none" | "all" | ["execute_command", "set_approval"]
@@ -79,3 +87,12 @@ transcript_max_bytes = 1048576 # retained conversation content bytes (0 = defaul
 
 [approval]
 mode = "ask"                   # "ask" | "allow-all"   (future: "approve-for-me")
+
+# Optional current-session HTTP API. Every value can be overridden with the
+# matching --api-* flag. AIHARN_API_TOKEN overrides token; prefer interpolation
+# or the environment variable instead of committing a literal secret.
+[api]
+# listen = "127.0.0.1:7331"
+# token = "${AIHARN_API_TOKEN}"
+# allow_origins = ["https://aiharn.example.com"]
+# only = false                    # true: run without the terminal UI

@@ -48,6 +48,7 @@ type Config struct {
 	Agents   map[string]AgentConfig
 	Limits   LimitsConfig
 	Approval ApprovalConfig
+	API      APIConfig
 }
 
 // ModelConfig is a named model/API configuration referenced by agents.
@@ -126,11 +127,21 @@ type ApprovalConfig struct {
 	Mode string `toml:"mode"`
 }
 
+// APIConfig controls the optional current-session HTTP API. Zero values leave
+// the API disabled and keep the terminal UI enabled.
+type APIConfig struct {
+	Listen       string   `toml:"listen"`
+	Token        string   `toml:"token"`
+	AllowOrigins []string `toml:"allow_origins"`
+	Only         bool     `toml:"only"`
+}
+
 // Known tool-set names and provider/channel types used as defaults in Validate.
 const (
 	ProviderOpenAIResponses       = "openai_responses"
 	ProviderOpenAIChatCompletions = "openai_chat_completions"
 	ChannelTypeSSH                = "ssh"
+	ChannelTypeLocal              = "local"
 
 	ToolModeNone = "none"
 	ToolModeAll  = "all"

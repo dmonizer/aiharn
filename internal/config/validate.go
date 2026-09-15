@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -32,7 +33,7 @@ func (o ValidateOptions) channelTypes() map[string]bool {
 	if o.KnownChannelTypes != nil {
 		return o.KnownChannelTypes
 	}
-	return map[string]bool{defaultChannelType: true}
+	return map[string]bool{ChannelTypeSSH: true, ChannelTypeLocal: true}
 }
 
 // Validate performs semantic validation. All errors are returned together where
@@ -78,34 +79,41 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		if !channelTypes[c.Type] {
 			errs = append(errs, fmt.Sprintf("channels[%q].type %q is unsupported", c.Name, c.Type))
 		}
-		if c.Host == "" {
-			errs = append(errs, fmt.Sprintf("channels[%q].host is required", c.Name))
-		}
-		if c.Port < 1 || c.Port > 65535 {
-			errs = append(errs, fmt.Sprintf("channels[%q].port must be between 1 and 65535", c.Name))
-		}
-		// An SSH alias (name + host only) resolves user/auth/known_hosts from
-		// ~/.ssh/config at runtime, so those fields are not required here.
-		if c.Type == ChannelTypeSSH && c.IsSSHConfigAlias() {
+		switch c.Type {
+		case ChannelTypeLocal:
+			// A local channel runs commands on this machine; it needs no host,
+			// port, user, auth, or host-key verification.
 			continue
-		}
-		if c.User == "" {
-			errs = append(errs, fmt.Sprintf("channels[%q].user is required", c.Name))
-		}
-		if c.Auth.KeyFile == "" && c.Auth.Password == "" {
-			errs = append(errs, fmt.Sprintf("channels[%q].auth: one of key_file or password is required", c.Name))
-		}
-		if c.Auth.KeyFile != "" && c.Auth.Password != "" {
-			errs = append(errs, fmt.Sprintf("channels[%q].auth: key_file and password are mutually exclusive", c.Name))
-		}
-		if c.Auth.KeyFile != "" {
-			validateRegularFile(&errs, fmt.Sprintf("channels[%q].auth.key_file", c.Name), c.Auth.KeyFile)
-		}
-		if !c.Insecure && c.KnownHosts == "" {
-			errs = append(errs, fmt.Sprintf("channels[%q].known_hosts is required unless insecure=true", c.Name))
-		}
-		if c.KnownHosts != "" {
-			validateRegularFile(&errs, fmt.Sprintf("channels[%q].known_hosts", c.Name), c.KnownHosts)
+		case ChannelTypeSSH:
+			if c.Host == "" {
+				errs = append(errs, fmt.Sprintf("channels[%q].host is required", c.Name))
+			}
+			if c.Port < 1 || c.Port > 65535 {
+				errs = append(errs, fmt.Sprintf("channels[%q].port must be between 1 and 65535", c.Name))
+			}
+			// An SSH alias (name + host only) resolves user/auth/known_hosts from
+			// ~/.ssh/config at runtime, so those fields are not required here.
+			if c.IsSSHConfigAlias() {
+				continue
+			}
+			if c.User == "" {
+				errs = append(errs, fmt.Sprintf("channels[%q].user is required", c.Name))
+			}
+			if c.Auth.KeyFile == "" && c.Auth.Password == "" {
+				errs = append(errs, fmt.Sprintf("channels[%q].auth: one of key_file or password is required", c.Name))
+			}
+			if c.Auth.KeyFile != "" && c.Auth.Password != "" {
+				errs = append(errs, fmt.Sprintf("channels[%q].auth: key_file and password are mutually exclusive", c.Name))
+			}
+			if c.Auth.KeyFile != "" {
+				validateRegularFile(&errs, fmt.Sprintf("channels[%q].auth.key_file", c.Name), c.Auth.KeyFile)
+			}
+			if !c.Insecure && c.KnownHosts == "" {
+				errs = append(errs, fmt.Sprintf("channels[%q].known_hosts is required unless insecure=true", c.Name))
+			}
+			if c.KnownHosts != "" {
+				validateRegularFile(&errs, fmt.Sprintf("channels[%q].known_hosts", c.Name), c.KnownHosts)
+			}
 		}
 	}
 
@@ -192,6 +200,8 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		errs = append(errs, fmt.Sprintf("approval.mode %q is invalid (want %q or %q)", cfg.Approval.Mode, ApprovalModeAsk, ApprovalModeAllowAll))
 	}
 
+	validateAPI(&errs, cfg.API)
+
 	if len(errs) > 0 {
 		return fmt.Errorf("config: validation failed:\n  - %s", joinErrs(errs))
 	}
@@ -204,6 +214,40 @@ func joinErrs(errs []string) string {
 		out += "\n  - " + e
 	}
 	return out
+}
+
+func validateAPI(errs *[]string, api APIConfig) {
+	if api.Only && api.Listen == "" {
+		*errs = append(*errs, "api.only requires api.listen")
+	}
+	if api.Listen != "" {
+		host, port, err := net.SplitHostPort(api.Listen)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("api.listen %q is not a valid host:port address", api.Listen))
+		} else {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				*errs = append(*errs, "api.listen port must be between 1 and 65535")
+			}
+			if !isLoopbackHost(host) && api.Token == "" {
+				*errs = append(*errs, "api.token is required when api.listen binds beyond loopback")
+			}
+		}
+	}
+	for i, origin := range api.AllowOrigins {
+		if origin == "*" {
+			continue
+		}
+		parsed, err := url.Parse(origin)
+		invalid := err != nil ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Host == "" || parsed.User != nil || parsed.Path != "" ||
+			parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != ""
+		if invalid {
+			*errs = append(*errs, fmt.Sprintf(
+				"api.allow_origins[%d] must be an HTTP(S) origin without credentials, path, query, or fragment", i))
+		}
+	}
 }
 
 func validateRegularFile(errs *[]string, field, path string) {

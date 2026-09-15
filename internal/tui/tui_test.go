@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -128,16 +129,131 @@ func TestKeyHandling(t *testing.T) {
 
 	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ab")})
 	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
-	if m.input != "a" {
-		t.Fatalf("backspace: input = %q", m.input)
+	if got := m.textarea.Value(); got != "a" {
+		t.Fatalf("backspace: value = %q, want a", got)
 	}
+	// A single ESC arms the clear but leaves the input untouched.
 	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEsc})
-	if m.input != "" {
-		t.Fatalf("esc: input = %q", m.input)
+	if got := m.textarea.Value(); got != "a" {
+		t.Fatalf("single esc: value = %q, want unchanged", got)
 	}
-	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeySpace})
-	if m.input != " " {
-		t.Fatalf("space: input = %q", m.input)
+	// A second ESC within the window clears.
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if got := m.textarea.Value(); got != "" {
+		t.Fatalf("double esc: value = %q, want cleared", got)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+	if got := m.textarea.Value(); got != " " {
+		t.Fatalf("space: value = %q, want space", got)
+	}
+}
+
+func TestPasteMultilineInput(t *testing.T) {
+	m := newTestModel(t)
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune("one\ntwo\nthree")})
+	if got := m.textarea.Value(); got != "one\ntwo\nthree" {
+		t.Fatalf("value = %q", got)
+	}
+	// Submitting sends the whole block verbatim to the agent.
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if len(m.queue) != 0 {
+		t.Fatalf("expected immediate turn, queue = %v", m.queue)
+	}
+	if !m.running {
+		t.Fatal("expected running after submit")
+	}
+}
+
+func TestCtrlJInsertsNewline(t *testing.T) {
+	m := newTestModel(t)
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ab")})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlJ})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("cd")})
+	if got := m.textarea.Value(); got != "ab\ncd" {
+		t.Fatalf("value = %q, want ab\\ncd", got)
+	}
+	// Enter still submits rather than inserting a newline.
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.running {
+		t.Fatal("enter should submit, not insert a newline")
+	}
+	if got := m.textarea.Value(); got != "" {
+		t.Fatalf("value after submit = %q, want empty", got)
+	}
+}
+
+func TestMultilinePasteStartingWithSlashIsNotACommand(t *testing.T) {
+	m := newTestModel(t)
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune("/home/user\nls -la")})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.running {
+		t.Fatal("multi-line input starting with / must reach the agent, not be treated as a command")
+	}
+	if len(m.queue) != 0 {
+		t.Fatalf("queue = %v", m.queue)
+	}
+}
+
+func TestInputBoxHeightCappedAtQuarter(t *testing.T) {
+	m := newTestModel(t)
+	m.height = 20
+	lines := make([]string, 20)
+	for i := range lines {
+		lines[i] = "x"
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune(strings.Join(lines, "\n"))})
+
+	if got := m.maxInputHeight(); got != 5 {
+		t.Fatalf("maxInputHeight = %d, want 5", got)
+	}
+	if got := m.inputBoxHeight(); got != 5 {
+		t.Fatalf("inputBoxHeight = %d, want 5", got)
+	}
+}
+
+func TestInputAutoScrollsToBottom(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 120
+	m.height = 16 // maxInputHeight = 4
+	m.resizeInput()
+
+	lines := make([]string, 20)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("L%02d", i)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune(strings.Join(lines, "\n"))})
+
+	view := m.textarea.View()
+	if !strings.Contains(view, "L19") {
+		t.Fatalf("input box is not scrolled to the newest line; got:\n%s", view)
+	}
+	if strings.Contains(view, "L00") {
+		t.Fatalf("input box should be scrolled to the bottom, not showing the first line; got:\n%s", view)
+	}
+}
+
+func TestInputCappedAndScrollable(t *testing.T) {
+	m := newTestModel(t)
+	m.height = 16 // maxInputHeight = 4
+	lines := make([]string, 10)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line%d", i)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune(strings.Join(lines, "\n"))})
+
+	// The box is capped at a quarter of the screen but the value is intact.
+	if got := m.inputBoxHeight(); got != 4 {
+		t.Fatalf("inputBoxHeight = %d, want 4", got)
+	}
+	if got := m.textarea.Value(); got != strings.Join(lines, "\n") {
+		t.Fatalf("value = %q", got)
+	}
+	// Up/down move the cursor within the textarea (which scrolls its own
+	// viewport) without altering the value.
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if got := m.textarea.Value(); got != strings.Join(lines, "\n") {
+		t.Fatalf("value after cursor moves = %q", got)
 	}
 }
 
@@ -277,11 +393,12 @@ func TestInputPinnedToBottom(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 120
 	m.height = 10
+	m.resizeInput()
 	lines := strings.Split(m.View(), "\n")
 	if len(lines) != 10 {
 		t.Fatalf("view has %d lines, want 10", len(lines))
 	}
-	if lines[len(lines)-1] != "> " {
+	if !strings.Contains(lines[len(lines)-1], "> ") {
 		t.Fatalf("last line = %q, want input prompt", lines[len(lines)-1])
 	}
 }

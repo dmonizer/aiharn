@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"aiharn/internal/execution"
+	"aiharn/internal/execution/shell"
 	"aiharn/internal/logging"
 )
 
@@ -183,12 +184,12 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 		return execution.Result{}, err
 	}
 
-	m, err := newMarkers()
+	m, err := shell.NewMarkers()
 	if err != nil {
 		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
 		return execution.Result{}, err
 	}
-	script := buildWrapperScript(m, opts.Cwd, cmd)
+	script := shell.BuildWrapperScript(m, opts.Cwd, cmd)
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -217,7 +218,7 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	}
 	beginDone := make(chan beginResult, 1)
 	go func() {
-		pid, err := readBegin(s.reader, m)
+		pid, err := shell.ReadBegin(s.reader, m)
 		beginDone <- beginResult{pid: pid, err: err}
 	}()
 	var pid int
@@ -242,12 +243,12 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	}
 
 	type bodyResult struct {
-		f   execFrame
+		f   shell.Frame
 		err error
 	}
 	ch := make(chan bodyResult, 1)
 	go func() {
-		f, err := readBody(s.reader, m, opts.MaxOutputBytes, opts.Stream)
+		f, err := shell.ReadBody(s.reader, m, opts.MaxOutputBytes, opts.Stream)
 		ch <- bodyResult{f, err}
 	}()
 
@@ -311,11 +312,11 @@ func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, 
 	logging.Debug("ssh: Exec finish", attrs...)
 }
 
-func (s *Session) finishBody(f execFrame, err error) (execution.Result, error) {
+func (s *Session) finishBody(f shell.Frame, err error) (execution.Result, error) {
 	if errors.Is(err, execution.ErrSessionReset) {
 		s.closeDead()
 	} else if err != nil {
-		var streamErr *streamWriteError
+		var streamErr *shell.StreamWriteError
 		if !errors.As(err, &streamErr) {
 			s.Close()
 		}
@@ -323,15 +324,15 @@ func (s *Session) finishBody(f execFrame, err error) (execution.Result, error) {
 	return s.toResult(f, err)
 }
 
-func (s *Session) toResult(f execFrame, err error) (execution.Result, error) {
+func (s *Session) toResult(f shell.Frame, err error) (execution.Result, error) {
 	if err != nil {
 		return execution.Result{}, err
 	}
 	return execution.Result{
-		Stdout:    string(f.stdout),
-		Stderr:    string(f.stderr),
-		ExitCode:  f.exitCode,
-		Truncated: f.truncated,
+		Stdout:    string(f.Stdout),
+		Stderr:    string(f.Stderr),
+		ExitCode:  f.ExitCode,
+		Truncated: f.Truncated,
 	}, nil
 }
 
@@ -390,19 +391,5 @@ func interpreterCommand(opts Options) string {
 	if opts.RemoteCommand != "" {
 		return opts.RemoteCommand
 	}
-	return shellCommand(opts.DefaultShell)
-}
-
-// shellCommand builds the remote command that starts the persistent shell. The
-// shell reads commands from stdin and never exits until the channel closes.
-func shellCommand(shell string) string {
-	quoted := shellQuote(shell)
-	if strings.HasSuffix(shell, "bash") {
-		return quoted + " --noprofile --norc -s"
-	}
-	return quoted + " -s"
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	return shell.ShellCommand(opts.DefaultShell)
 }

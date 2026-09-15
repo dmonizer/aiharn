@@ -38,5 +38,8 @@ func (c *Config) Redacted() *Config {
 		out.Agents[name] = a
 	}
 
+	out.API.Token = redactedValue(c.API.Token)
+	out.API.AllowOrigins = append([]string(nil), c.API.AllowOrigins...)
+
 	return &out
 }

@@ -165,6 +165,83 @@ func TestDecideIsOneShot(t *testing.T) {
 	}
 }
 
+func TestPendingRequestsIsNonDestructive(t *testing.T) {
+	g := NewGate(ModeAsk)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = g.Check(context.Background(), Request{ToolName: "execute_command", Command: "ls"})
+	}()
+
+	req := <-g.Pending()
+	snapshot := g.PendingRequests()
+	if len(snapshot) != 1 || snapshot[0] != req {
+		t.Fatalf("PendingRequests() = %#v, want %#v", snapshot, req)
+	}
+	if err := g.Decide(req.ID, DecisionDenied); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if got := g.PendingRequests(); len(got) != 0 {
+		t.Fatalf("PendingRequests() after decision = %#v", got)
+	}
+}
+
+func TestApproveAllRequiresPendingRequest(t *testing.T) {
+	g := NewGate(ModeAsk)
+	if err := g.ApproveAll("missing"); err == nil {
+		t.Fatal("expected unknown request error")
+	}
+	if g.Mode() != ModeAsk {
+		t.Fatal("unknown request loosened approval mode")
+	}
+
+	done := make(chan Decision, 1)
+	go func() {
+		d, _ := g.Check(context.Background(), Request{ToolName: "execute_command", Command: "ls"})
+		done <- d
+	}()
+	req := <-g.Pending()
+	if err := g.ApproveAll(req.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-done; got != DecisionApproved {
+		t.Fatalf("decision = %v", got)
+	}
+	if g.Mode() != ModeAllowAll {
+		t.Fatal("mode was not changed to allow-all")
+	}
+}
+
+func TestHeadlessApprovalsDoNotFillNotificationChannel(t *testing.T) {
+	g := NewGate(ModeAsk)
+	defer g.Close()
+
+	for i := 0; i < 24; i++ {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = g.Check(context.Background(), Request{ToolName: "execute_command", Command: "true"})
+		}()
+
+		deadline := time.Now().Add(time.Second)
+		var requests []Request
+		for len(requests) == 0 && time.Now().Before(deadline) {
+			requests = g.PendingRequests()
+			if len(requests) == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		if len(requests) != 1 {
+			t.Fatalf("iteration %d: pending = %#v", i, requests)
+		}
+		if err := g.Decide(requests[0].ID, DecisionApproved); err != nil {
+			t.Fatal(err)
+		}
+		<-done
+	}
+}
+
 func TestCloseUnblocksPending(t *testing.T) {
 	g := NewGate(ModeAsk)
 	done := make(chan struct{})

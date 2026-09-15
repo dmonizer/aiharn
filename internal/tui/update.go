@@ -3,7 +3,9 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"aiharn/internal/agent"
@@ -17,10 +19,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.resizeInput()
 		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case cursor.BlinkMsg:
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		return m, cmd
 
 	case agentEventMsg:
 		m.appendEvent(msg.ev)
@@ -67,33 +75,49 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.handleApprovalKey(msg)
 	}
 
+	// Any key other than ESC disarms a pending double-ESC clear.
+	if msg.String() != "esc" {
+		m.lastEsc = time.Time{}
+	}
+
 	switch msg.String() {
 	case "enter":
-		line := strings.TrimSpace(m.input)
-		m.input = ""
-		if line == "" {
-			return m, nil
-		}
-		if strings.HasPrefix(line, "/") {
-			return m, m.handleCommand(line)
-		}
-		m.queue = append(m.queue, line)
-		return m, m.nextTurn()
-
-	case "backspace":
-		m.input = truncateLastRune(m.input)
-		return m, nil
+		return m, m.submitInput()
 
 	case "esc":
-		m.input = ""
-		return m, nil
-
-	default:
-		if isPrintable(msg) {
-			m.input += msg.String()
-		}
+		m.pressEsc(time.Now())
 		return m, nil
 	}
+
+	// Everything else is editing input: printable runes (typing or bracketed
+	// paste, newlines preserved) and the cursor/edit/scroll keys all go to the
+	// textarea, which soft-wraps, grows to fit, and keeps the cursor visible.
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	m.resizeInput()
+	// The textarea repositions its viewport inside Update, but its line buffer is
+	// only rebuilt in View, so a big paste lands with a stale (empty) buffer and
+	// scroll clamps to the top. Refresh the buffer and run a no-op Update so the
+	// reposition pass scrolls to the cursor immediately.
+	m.textarea.View()
+	m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyRunes})
+	return m, cmd
+}
+
+// submitInput sends the current input to the agent and clears the box. A
+// single-line input starting with "/" is treated as a slash command.
+func (m *Model) submitInput() tea.Cmd {
+	line := strings.TrimSpace(m.textarea.Value())
+	m.textarea.Reset()
+	m.resizeInput()
+	if line == "" {
+		return nil
+	}
+	if !strings.Contains(line, "\n") && strings.HasPrefix(line, "/") {
+		return m.handleCommand(line)
+	}
+	m.queue = append(m.queue, line)
+	return m.nextTurn()
 }
 
 func (m *Model) handleApprovalKey(msg tea.KeyMsg) tea.Cmd {

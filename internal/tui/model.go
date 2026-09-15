@@ -9,8 +9,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"aiharn/internal/agent"
@@ -53,9 +55,11 @@ type Model struct {
 
 	lines   []line   // flushed transcript lines, oldest first
 	curText []byte   // streamed text not yet flushed to a line
-	input   string   // current input buffer
+	textarea textarea.Model
 	queue   []string // inputs waiting for the agent to become idle
 	running bool
+
+	lastEsc time.Time // when a first ESC press armed the clear, zero if none
 
 	subagents []tools.SubagentStatus // current roster snapshot
 
@@ -81,6 +85,9 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 		ctx:     ctx,
 		cancel:  cancel,
 	}
+	m.textarea = newTextarea()
+	m.textarea.Focus()
+	m.resizeInput()
 	m.appendLine(kindPlain, fmt.Sprintf("aiharn: agent %s · model %s · channel %s · approval %s",
 		status.AgentType, status.Model, status.Channel, status.Approval))
 	m.refreshSubagents()
@@ -89,7 +96,7 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 
 // Init starts the agent-event, approval, and roster bridges.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager))
+	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager), m.textarea.Focus())
 }
 
 // refreshSubagents re-reads the subagent roster from the manager.

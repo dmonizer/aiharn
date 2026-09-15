@@ -1,4 +1,7 @@
-package ssh
+// Package shell implements the persistent-shell framing protocol shared by the
+// ssh and local transports: it wraps each command in a marker-delimited script
+// so stdout, stderr, and the exit code can be separated without shell quoting.
+package shell
 
 import (
 	"bufio"
@@ -26,37 +29,38 @@ const (
 	errPrefix   = "AIHARN-ERR-"
 )
 
-// markers are the unique delimiters for one Exec.
-type markers struct {
-	begin string
-	end   string
-	err   string
+// Markers are the unique delimiters for one Exec.
+type Markers struct {
+	Begin string
+	End   string
+	Err   string
 }
 
-func newMarkers() (markers, error) {
+// NewMarkers returns a fresh set of markers with a unique random nonce.
+func NewMarkers() (Markers, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return markers{}, err
+		return Markers{}, err
 	}
 	n := hex.EncodeToString(b[:])
-	logging.Debug("ssh: newMarkers", slog.String("component", "ssh"), slog.String("nonce_prefix", n[:8]))
-	return markers{
-		begin: beginPrefix + n,
-		end:   endPrefix + n,
-		err:   errPrefix + n,
+	logging.Debug("shell: newMarkers", slog.String("component", "shell"), slog.String("nonce_prefix", n[:8]))
+	return Markers{
+		Begin: beginPrefix + n,
+		End:   endPrefix + n,
+		Err:   errPrefix + n,
 	}, nil
 }
 
-// buildWrapperScript returns the shell script that runs cmd (with optional cwd)
+// BuildWrapperScript returns the shell script that runs cmd (with optional cwd)
 // inside the persistent shell, framing stdout, stderr, and the exit code with
-// the given markers. The command is base64-encoded on the client and decoded
-// remotely, so its contents never pass through shell quoting.
+// the given markers. The command is base64-encoded on the client and decoded by
+// the shell, so its contents never pass through shell quoting.
 //
 // Framing: the command runs in a setsid'd subshell so it owns its process
-// group; the client can then kill just the command (kill -TERM -- -pid) without
+// group; the caller can then kill just the command (kill -TERM -- -pid) without
 // harming the persistent shell. Command stderr is captured to a temp file and
 // re-emitted between two err markers, keeping stdout and stderr un-interleaved.
-func buildWrapperScript(m markers, cwd, cmd string) string {
+func BuildWrapperScript(m Markers, cwd, cmd string) string {
 	cmdB64 := base64.StdEncoding.EncodeToString([]byte(cmd))
 	cwdB64 := base64.StdEncoding.EncodeToString([]byte(cwd))
 
@@ -66,35 +70,37 @@ func buildWrapperScript(m markers, cwd, cmd string) string {
 	b.WriteString(`__a_cmd="$(printf '%s' '` + cmdB64 + `' | base64 -d 2>/dev/null)"` + "\n")
 	b.WriteString(`setsid bash -c 'if [ -n "$1" ]; then cd -- "$1" 2>/dev/null || exit 1; fi; eval "$2"' _ "$__a_cd" "$__a_cmd" 0</dev/null 2>"$__a_f" &` + "\n")
 	b.WriteString(`__a_pid=$!` + "\n")
-	b.WriteString(`printf '%s pid=%d\n' '` + m.begin + `' "$__a_pid"` + "\n")
+	b.WriteString(`printf '%s pid=%d\n' '` + m.Begin + `' "$__a_pid"` + "\n")
 	b.WriteString(`wait $__a_pid` + "\n")
 	b.WriteString(`__a_rc=$?` + "\n")
-	b.WriteString(`printf '%s rc=%d\n' '` + m.end + `' "$__a_rc"` + "\n")
-	b.WriteString(`printf '%s\n' '` + m.err + `'` + "\n")
+	b.WriteString(`printf '%s rc=%d\n' '` + m.End + `' "$__a_rc"` + "\n")
+	b.WriteString(`printf '%s\n' '` + m.Err + `'` + "\n")
 	b.WriteString(`cat "$__a_f"` + "\n")
-	b.WriteString(`printf '%s\n' '` + m.err + `'` + "\n")
+	b.WriteString(`printf '%s\n' '` + m.Err + `'` + "\n")
 	b.WriteString(`rm -f "$__a_f"` + "\n")
 	return b.String()
 }
 
-// execFrame is the decoded result of one Exec's framed output.
-type execFrame struct {
-	stdout    []byte
-	stderr    []byte
-	exitCode  int
-	truncated bool
+// Frame is the decoded result of one Exec's framed output.
+type Frame struct {
+	Stdout    []byte
+	Stderr    []byte
+	ExitCode  int
+	Truncated bool
 }
 
-type streamWriteError struct{ err error }
+// StreamWriteError wraps an error from the streaming sink so callers can tell a
+// failed sink from a failed session.
+type StreamWriteError struct{ Err error }
 
-func (e *streamWriteError) Error() string { return "ssh: stream writer: " + e.err.Error() }
-func (e *streamWriteError) Unwrap() error { return e.err }
+func (e *StreamWriteError) Error() string { return "shell: stream writer: " + e.Err.Error() }
+func (e *StreamWriteError) Unwrap() error { return e.Err }
 
-// readBegin consumes the begin marker and returns the remote process-group id of
-// the running command. It is called synchronously (before the command can
-// block) so the caller can kill the command on cancellation.
-func readBegin(r *bufio.Reader, m markers) (int, error) {
-	if _, err := readToMarker(r, m.begin, nil, nil, -1); err != nil {
+// ReadBegin consumes the begin marker and returns the process-group id of the
+// running command. It is called synchronously (before the command can block) so
+// the caller can kill the command on cancellation.
+func ReadBegin(r *bufio.Reader, m Markers) (int, error) {
+	if _, err := readToMarker(r, m.Begin, nil, nil, -1); err != nil {
 		return 0, wrapFrameErr(err)
 	}
 	line, err := readLine(r)
@@ -106,33 +112,33 @@ func readBegin(r *bufio.Reader, m markers) (int, error) {
 		return 0, err
 	}
 	if pid <= 0 {
-		return 0, fmt.Errorf("ssh framing: invalid process-group id %d", pid)
+		return 0, fmt.Errorf("shell framing: invalid process-group id %d", pid)
 	}
-	logging.Debug("ssh: readBegin", slog.String("component", "ssh"), slog.Int("pid", pid), slog.Int("pgid", pid))
+	logging.Debug("shell: ReadBegin", slog.String("component", "shell"), slog.Int("pid", pid), slog.Int("pgid", pid))
 	return pid, nil
 }
 
-// readBody consumes the remainder of one Exec's framed output: stdout until the
+// ReadBody consumes the remainder of one Exec's framed output: stdout until the
 // end marker, then stderr until the closing err marker. maxBytes (0 = unlimited)
 // caps the retained stdout+stderr combined; bytes beyond the cap are still
 // consumed (to keep framing aligned) but dropped. sink, if non-nil, receives
 // retained stdout bytes as they are read.
-func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execFrame, error) {
-	var f execFrame
+func ReadBody(r *bufio.Reader, m Markers, maxBytes int64, sink io.Writer) (Frame, error) {
+	var f Frame
 	var out bytes.Buffer
 	outputCap := maxBytes
 	if outputCap == 0 {
 		outputCap = -1
 	}
-	truncOut, err := readToMarker(r, m.end, &out, sink, outputCap)
+	truncOut, err := readToMarker(r, m.End, &out, sink, outputCap)
 	if err != nil {
-		var sinkErr *streamWriteError
+		var sinkErr *StreamWriteError
 		if !errors.As(err, &sinkErr) {
 			return f, wrapFrameErr(err)
 		}
 	}
 	streamErr := err
-	f.stdout = out.Bytes()
+	f.Stdout = out.Bytes()
 
 	line, err := readLine(r)
 	if err != nil {
@@ -142,9 +148,9 @@ func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execF
 	if err != nil {
 		return f, err
 	}
-	f.exitCode = rc
+	f.ExitCode = rc
 
-	if _, err := readToMarker(r, m.err, nil, nil, -1); err != nil {
+	if _, err := readToMarker(r, m.Err, nil, nil, -1); err != nil {
 		return f, wrapFrameErr(err)
 	}
 	// The first err marker is a complete line ("<marker>\n"); consume its
@@ -158,26 +164,26 @@ func readBody(r *bufio.Reader, m markers, maxBytes int64, sink io.Writer) (execF
 	if maxBytes > 0 {
 		remaining = maxBytes - int64(out.Len())
 	}
-	truncErr, err := readToMarker(r, m.err, &errb, nil, remaining)
+	truncErr, err := readToMarker(r, m.Err, &errb, nil, remaining)
 	if err != nil {
 		return f, wrapFrameErr(err)
 	}
-	f.stderr = errb.Bytes()
-	f.truncated = truncOut || truncErr
-	logging.Debug("ssh: readBody",
-		slog.String("component", "ssh"),
-		slog.Int("exit_code", f.exitCode),
-		slog.Int("stdout_bytes", len(f.stdout)),
-		slog.Int("stderr_bytes", len(f.stderr)),
-		slog.Bool("truncated", f.truncated),
+	f.Stderr = errb.Bytes()
+	f.Truncated = truncOut || truncErr
+	logging.Debug("shell: ReadBody",
+		slog.String("component", "shell"),
+		slog.Int("exit_code", f.ExitCode),
+		slog.Int("stdout_bytes", len(f.Stdout)),
+		slog.Int("stderr_bytes", len(f.Stderr)),
+		slog.Bool("truncated", f.Truncated),
 	)
 	return f, streamErr
 }
 
 func wrapFrameErr(err error) error {
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		logging.Debug("ssh: shell stream ended before marker",
-			slog.String("component", "ssh"),
+		logging.Debug("shell: shell stream ended before marker",
+			slog.String("component", "shell"),
 			slog.Any("err", err),
 		)
 		return fmt.Errorf("%w: shell stream ended before marker", execution.ErrSessionReset)
@@ -241,14 +247,14 @@ func readToMarker(r *bufio.Reader, marker string, out *bytes.Buffer, sink io.Wri
 			if len(carry) > 0 {
 				commit(carry)
 			}
-			logging.Debug("ssh: readToMarker error", slog.String("component", "ssh"), slog.Any("err", err))
+			logging.Debug("shell: readToMarker error", slog.String("component", "shell"), slog.Any("err", err))
 			return truncated, err
 		}
 		carry = append(carry, c)
 		if bytes.HasSuffix(carry, m) {
 			commit(carry[:len(carry)-len(m)])
 			if writeErr != nil {
-				return truncated, &streamWriteError{err: writeErr}
+				return truncated, &StreamWriteError{Err: writeErr}
 			}
 			return truncated, nil
 		}
@@ -269,11 +275,11 @@ func parseField(line, key string) (int, error) {
 	line = strings.TrimSpace(line)
 	prefix := key + "="
 	if !strings.HasPrefix(line, prefix) {
-		return 0, fmt.Errorf("ssh framing: unexpected marker payload %q", line)
+		return 0, fmt.Errorf("shell framing: unexpected marker payload %q", line)
 	}
 	n, err := strconv.Atoi(strings.TrimPrefix(line, prefix))
 	if err != nil {
-		return 0, fmt.Errorf("ssh framing: bad %s in %q: %w", key, line, err)
+		return 0, fmt.Errorf("shell framing: bad %s in %q: %w", key, line, err)
 	}
 	return n, nil
 }

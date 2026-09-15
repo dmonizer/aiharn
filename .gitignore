@@ -5,6 +5,10 @@
 *.test
 *.out
 
+# Local runtime/session output can contain commands, targets, and host details.
+/aiharn.log.jsonl
+/debug*.log
+
 # Config with real credentials. The committed config.toml is an example that
 # only references environment variables (no secrets); keep local overrides in
 # *.local.toml.

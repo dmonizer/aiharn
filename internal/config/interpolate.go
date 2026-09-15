@@ -73,5 +73,23 @@ func interpolate(cfg *Config) error {
 			*f.value = v
 		}
 	}
+
+	if v, err := interpolateEnv(cfg.API.Listen, lookup); err != nil {
+		return fmt.Errorf("api.listen: %w", err)
+	} else {
+		cfg.API.Listen = v
+	}
+	if v, err := interpolateEnv(cfg.API.Token, lookup); err != nil {
+		return fmt.Errorf("api.token: %w", err)
+	} else {
+		cfg.API.Token = v
+	}
+	for i, origin := range cfg.API.AllowOrigins {
+		v, err := interpolateEnv(origin, lookup)
+		if err != nil {
+			return fmt.Errorf("api.allow_origins[%d]: %w", i, err)
+		}
+		cfg.API.AllowOrigins[i] = v
+	}
 	return nil
 }

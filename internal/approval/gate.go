@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 )
@@ -62,7 +63,12 @@ type Gate struct {
 	closed  bool
 	seq     int
 	pending chan Request
-	byID    map[string]chan Decision
+	byID    map[string]pendingRequest
+}
+
+type pendingRequest struct {
+	request  Request
+	decision chan Decision
 }
 
 // NewGate returns a Gate in the given mode.
@@ -70,7 +76,7 @@ func NewGate(mode Mode) *Gate {
 	return &Gate{
 		mode:    mode,
 		pending: make(chan Request, 16),
-		byID:    make(map[string]chan Decision),
+		byID:    make(map[string]pendingRequest),
 	}
 }
 
@@ -97,14 +103,15 @@ func (g *Gate) Check(ctx context.Context, req Request) (Decision, error) {
 	g.seq++
 	req.ID = strconv.Itoa(g.seq)
 	ch := make(chan Decision, 1)
-	g.byID[req.ID] = ch
+	g.byID[req.ID] = pendingRequest{request: req, decision: ch}
 	g.mu.Unlock()
 
+	// Pending is a UI wake-up hint, while byID is the canonical queue. Never
+	// block a headless/API-only session merely because no channel consumer is
+	// attached (or a UI is temporarily behind).
 	select {
 	case g.pending <- req:
-	case <-ctx.Done():
-		g.unregister(req.ID)
-		return DecisionDenied, ctx.Err()
+	default:
 	}
 
 	select {
@@ -116,14 +123,33 @@ func (g *Gate) Check(ctx context.Context, req Request) (Decision, error) {
 	}
 }
 
-// Pending delivers requests that are awaiting a decision, for the UI.
+// Pending delivers best-effort notifications for the UI. PendingRequests is
+// the canonical, non-consuming view of requests awaiting a decision.
 func (g *Gate) Pending() <-chan Request { return g.pending }
+
+// PendingRequests returns a stable snapshot of every request still awaiting a
+// decision. Unlike Pending, it does not consume notifications, so multiple
+// user interfaces can inspect the same approval queue safely.
+func (g *Gate) PendingRequests() []Request {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	requests := make([]Request, 0, len(g.byID))
+	for _, pending := range g.byID {
+		requests = append(requests, pending.request)
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		left, _ := strconv.Atoi(requests[i].ID)
+		right, _ := strconv.Atoi(requests[j].ID)
+		return left < right
+	})
+	return requests
+}
 
 // Decide resolves a pending request by ID. It returns an error if no such
 // request is pending.
 func (g *Gate) Decide(id string, d Decision) error {
 	g.mu.Lock()
-	ch, ok := g.byID[id]
+	pending, ok := g.byID[id]
 	if !ok {
 		g.mu.Unlock()
 		return fmt.Errorf("approval: no pending request %q", id)
@@ -132,7 +158,23 @@ func (g *Gate) Decide(id string, d Decision) error {
 	// prevents completed requests from accumulating in byID for the lifetime of
 	// the process.
 	delete(g.byID, id)
-	ch <- d
+	pending.decision <- d
+	g.mu.Unlock()
+	return nil
+}
+
+// ApproveAll approves id and switches future checks to allow-all as one
+// operation. An unknown or already-resolved id leaves the mode unchanged.
+func (g *Gate) ApproveAll(id string) error {
+	g.mu.Lock()
+	pending, ok := g.byID[id]
+	if !ok {
+		g.mu.Unlock()
+		return fmt.Errorf("approval: no pending request %q", id)
+	}
+	delete(g.byID, id)
+	g.mode = ModeAllowAll
+	pending.decision <- DecisionApproved
 	g.mu.Unlock()
 	return nil
 }
@@ -168,9 +210,9 @@ func (g *Gate) Close() error {
 		return nil
 	}
 	g.closed = true
-	for id, ch := range g.byID {
+	for id, pending := range g.byID {
 		select {
-		case ch <- DecisionDenied:
+		case pending.decision <- DecisionDenied:
 		default:
 		}
 		delete(g.byID, id)

@@ -17,6 +17,7 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/execution"
+	execlocal "aiharn/internal/execution/local"
 	execssh "aiharn/internal/execution/ssh"
 	"aiharn/internal/llm"
 	"aiharn/internal/llm/chatcompletions"
@@ -141,7 +142,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		},
 	})
 
-	fmt.Fprintf(os.Stderr, "aiharn: connecting to channel %q (host %q)...\n", channelCfg.Name, channelCfg.Host)
+	fmt.Fprintf(os.Stderr, "aiharn: connecting to channel %q (%s)...\n", channelCfg.Name, channelTarget(channelCfg))
 
 	top, err := buildAgent(ctx, cfg, tc, mgr, gate, agent.SpawnSpec{
 		ID:            agentType,
@@ -214,7 +215,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	}
 	session, err := transport.NewSession(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("app: open channel %q session (host %q): %w", channelCfg.Name, channelCfg.Host, err)
+		return nil, fmt.Errorf("app: open channel %q session (%s): %w", channelCfg.Name, channelTarget(channelCfg), err)
 	}
 
 	system, err := readSystemPrompt(agentCfg.SystemPrompt, o.PromptFile)
@@ -392,23 +393,39 @@ func selectChannel(cfg *config.Config, agentChannel, override string) (config.Ch
 	return config.ChannelConfig{}, fmt.Errorf("app: channel %q is not defined", name)
 }
 
+// channelTarget is the human-readable connection target for a channel: the
+// remote host for SSH, or "local" for a local channel.
+func channelTarget(c config.ChannelConfig) string {
+	if c.Type == config.ChannelTypeLocal {
+		return "local"
+	}
+	return c.Host
+}
+
 func buildTransport(c config.ChannelConfig) (execution.Transport, error) {
-	if c.Type != config.ChannelTypeSSH {
+	switch c.Type {
+	case config.ChannelTypeSSH:
+		return execssh.NewTransport(execssh.Options{
+			Host:           c.Host,
+			Port:           c.Port,
+			User:           c.User,
+			KeyFile:        c.Auth.KeyFile,
+			Password:       c.Auth.Password,
+			KnownHosts:     c.KnownHosts,
+			Insecure:       c.Insecure,
+			KeepAlive:      c.KeepAliveEnabled(),
+			DefaultShell:   c.DefaultShell,
+			RemoteCommand:  c.RemoteCommand,
+			SSHConfigAlias: c.IsSSHConfigAlias(),
+		})
+	case config.ChannelTypeLocal:
+		return execlocal.NewTransport(execlocal.Options{
+			DefaultShell:  c.DefaultShell,
+			RemoteCommand: c.RemoteCommand,
+		})
+	default:
 		return nil, fmt.Errorf("app: channel type %q is not implemented", c.Type)
 	}
-	return execssh.NewTransport(execssh.Options{
-		Host:           c.Host,
-		Port:           c.Port,
-		User:           c.User,
-		KeyFile:        c.Auth.KeyFile,
-		Password:       c.Auth.Password,
-		KnownHosts:     c.KnownHosts,
-		Insecure:       c.Insecure,
-		KeepAlive:      c.KeepAliveEnabled(),
-		DefaultShell:   c.DefaultShell,
-		RemoteCommand:  c.RemoteCommand,
-		SSHConfigAlias: c.IsSSHConfigAlias(),
-	})
 }
 
 func buildGate(mode string) (*approval.Gate, error) {

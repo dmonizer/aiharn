@@ -50,7 +50,7 @@ func (m *Model) View() string {
 			b.WriteString(fmt.Sprintf(" (%d queued)", len(m.approvals)))
 		}
 	} else {
-		b.WriteString("> " + sanitizeTerminalLine(m.input))
+		b.WriteString(m.textarea.View())
 	}
 	return b.String()
 }
@@ -77,12 +77,14 @@ func (m *Model) body() string {
 	return fill(lipgloss.JoinHorizontal(lipgloss.Top, l, r), rows)
 }
 
-// rows is the number of body rows available, or 0 when unknown.
+// rows is the number of body rows available, or 0 when unknown. The input box
+// can grow to a quarter of the screen, so the body shrinks accordingly.
 func (m *Model) rows() int {
-	if m.height <= 2 {
+	h := m.height - 1 - m.inputBoxHeight()
+	if h < 0 {
 		return 0
 	}
-	return m.height - 2
+	return h
 }
 
 // fill pads s to exactly n lines (truncating or appending blank lines) so the

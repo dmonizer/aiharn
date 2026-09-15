@@ -120,6 +120,39 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestLoadAPIConfig(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "model-secret")
+	t.Setenv("TEST_API_LISTEN", "127.0.0.1:7331")
+	t.Setenv("TEST_API_TOKEN", "remote-secret")
+	t.Setenv("TEST_API_ORIGIN", "https://console.example")
+	path := setup(t, validConfig+`
+
+[api]
+listen = "${TEST_API_LISTEN}"
+token = "${TEST_API_TOKEN}"
+allow_origins = ["${TEST_API_ORIGIN}", "https://backup.example"]
+only = true
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.API.Listen != "127.0.0.1:7331" {
+		t.Fatalf("API.Listen = %q", cfg.API.Listen)
+	}
+	if cfg.API.Token != "remote-secret" {
+		t.Fatalf("API.Token was not interpolated")
+	}
+	if len(cfg.API.AllowOrigins) != 2 ||
+		cfg.API.AllowOrigins[0] != "https://console.example" {
+		t.Fatalf("API.AllowOrigins = %#v", cfg.API.AllowOrigins)
+	}
+	if !cfg.API.Only {
+		t.Fatal("API.Only = false, want true")
+	}
+}
+
 func TestLoadMissingEnvVar(t *testing.T) {
 	path := setup(t, validConfig)
 	// TEST_API_KEY intentionally unset.
@@ -233,6 +266,59 @@ func TestValidateReferences(t *testing.T) {
 			}
 			err = Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}})
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAPIConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		api     APIConfig
+		wantErr string
+	}{
+		{
+			name: "loopback",
+			api: APIConfig{
+				Listen:       "127.0.0.1:7331",
+				AllowOrigins: []string{"https://console.example"},
+			},
+		},
+		{
+			name:    "only without listen",
+			api:     APIConfig{Only: true},
+			wantErr: "api.only requires api.listen",
+		},
+		{
+			name:    "invalid listen",
+			api:     APIConfig{Listen: "not-an-address"},
+			wantErr: "api.listen",
+		},
+		{
+			name:    "remote without token",
+			api:     APIConfig{Listen: "0.0.0.0:7331"},
+			wantErr: "api.token is required",
+		},
+		{
+			name:    "invalid origin",
+			api:     APIConfig{Listen: "127.0.0.1:7331", AllowOrigins: []string{"https://console.example/path"}},
+			wantErr: "api.allow_origins[0]",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_API_KEY", "x")
+			cfg, err := Load(setup(t, validConfig))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.API = tc.api
+			err = Validate(cfg, ValidateOptions{})
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
 				t.Fatalf("Validate error = %v, want %q", err, tc.wantErr)
 			}
 		})
@@ -424,18 +510,27 @@ func TestRedacted(t *testing.T) {
 	agentCfg := cfg.Agents["planner"]
 	agentCfg.WorkingDir = &wd
 	cfg.Agents["planner"] = agentCfg
+	cfg.API = APIConfig{
+		Token: "remote-secret", AllowOrigins: []string{"https://console.example"},
+	}
 	r := cfg.Redacted()
 	if got := r.Models["opus_via_openrouter"].APIKey; got == "supersecret" || got == "" {
 		t.Errorf("Redacted APIKey = %q, want masked marker", got)
 	}
+	if r.API.Token != "***" {
+		t.Errorf("Redacted API token = %q, want masked marker", r.API.Token)
+	}
 	if strings.Contains(strings.Join([]string{
 		r.Models["opus_via_openrouter"].APIKey,
-	}, ""), "supersecret") {
+		r.API.Token,
+	}, ""), "secret") {
 		t.Errorf("Redacted config still contains secret")
 	}
 	*r.Channels[0].KeepAlive = false
 	r.Agents["planner"].WorkingDir.Raw = "/changed"
-	if !*cfg.Channels[0].KeepAlive || cfg.Agents["planner"].WorkingDir.Raw != "/original" {
+	r.API.AllowOrigins[0] = "https://changed.example"
+	if !*cfg.Channels[0].KeepAlive || cfg.Agents["planner"].WorkingDir.Raw != "/original" ||
+		cfg.API.AllowOrigins[0] != "https://console.example" {
 		t.Fatal("Redacted returned shared mutable pointers")
 	}
 }
