@@ -6,8 +6,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/rivo/uniseg"
 
 	"aiharn/internal/llm"
 	"aiharn/internal/tools"
@@ -31,13 +32,27 @@ type shellCmd struct {
 	done    bool
 }
 
+// shellBtnAction identifies a shell header button.
+type shellBtnAction int
+
+const (
+	shellBtnClose shellBtnAction = iota
+	shellBtnMaximize
+)
+
+// shellButton is a clickable header button in screen coordinates.
+type shellButton struct {
+	x, y, w int
+	action  shellBtnAction
+}
+
 const commandPreviewLen = 80
 
 var (
-	styleCommand    = lipgloss.NewStyle().Foreground(lipgloss.Color("240")) // subdued gray chat command
-	styleShellCmd   = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
-	styleShellFocus = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4"))
-	styleShellHead  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleCommand     = lipgloss.NewStyle().Foreground(lipgloss.Color("240")) // subdued gray chat command
+	styleShellCmd    = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	styleShellFocus  = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4"))
+	styleShellBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
 )
 
 // appendToolCall records a tool call. execute_command becomes a clickable shell
@@ -49,6 +64,7 @@ func (m *Model) appendToolCall(call llm.Item) {
 		idx := len(m.shellCmds) - 1
 		m.appendCommandLine(idx, truncateCommand(cmd.command, commandPreviewLen))
 		m.rebuildShellFlat()
+		m.followShell()
 		return
 	}
 	m.appendLine(kindTool, fmt.Sprintf("[tool] %s %s", call.Name, call.Args))
@@ -61,15 +77,10 @@ func (m *Model) appendToolResult(call llm.Item, result string) {
 	}
 	for i := range m.shellCmds {
 		if m.shellCmds[i].id == call.CallID && !m.shellCmds[i].done {
-			follow := m.shellScroll >= m.shellMaxScroll()
 			m.shellCmds[i].output = result
 			m.shellCmds[i].done = true
 			m.rebuildShellFlat()
-			if follow {
-				m.shellScroll = m.shellMaxScroll()
-			} else {
-				m.clampShellScroll()
-			}
+			m.followShell()
 			return
 		}
 	}
@@ -140,12 +151,18 @@ func (m *Model) shellVisibleRows() int {
 	}
 }
 
-func (m *Model) shellMaxScroll() int {
-	content := m.shellVisibleRows() - 1 // one row is the pane header
-	if content < 0 {
-		content = 0
+// shellContentRows is the number of scrollable output rows: the pane height
+// minus the border (2) and the header (1).
+func (m *Model) shellContentRows() int {
+	n := m.shellVisibleRows() - 3
+	if n < 0 {
+		return 0
 	}
-	max := len(m.shellFlat) - content
+	return n
+}
+
+func (m *Model) shellMaxScroll() int {
+	max := len(m.shellFlat) - m.shellContentRows()
 	if max < 0 {
 		max = 0
 	}
@@ -162,13 +179,30 @@ func (m *Model) clampShellScroll() {
 	}
 }
 
-func (m *Model) scrollShell(delta int) {
-	m.shellScroll += delta
+// setShellScroll sets the scroll offset, re-arming autoscroll when pinned to the
+// bottom and disabling it otherwise.
+func (m *Model) setShellScroll(n int) {
+	m.shellScroll = n
 	m.clampShellScroll()
+	m.shellFollow = m.shellScroll >= m.shellMaxScroll()
+}
+
+func (m *Model) scrollShell(delta int) {
+	m.setShellScroll(m.shellScroll + delta)
+}
+
+// followShell keeps the view pinned to the newest output while the user has not
+// scrolled away.
+func (m *Model) followShell() {
+	if m.shellFollow {
+		m.shellScroll = m.shellMaxScroll()
+	} else {
+		m.clampShellScroll()
+	}
 }
 
 func (m *Model) shellPageSize() int {
-	n := m.shellVisibleRows() - 1
+	n := m.shellContentRows()
 	if n < 1 {
 		n = 1
 	}
@@ -188,10 +222,14 @@ func (m *Model) openShellFocus(idx int) {
 		m.shellScroll = m.shellStart[idx]
 	}
 	m.clampShellScroll()
+	m.shellFollow = false
 }
 
 // clickTranscript maps a mouse click to a transcript command and opens it.
 func (m *Model) clickTranscript(x, y int) {
+	if m.shellMode == shellMaximized {
+		return
+	}
 	r := y - 1 // body starts below the status line
 	if r < 0 || r >= len(m.clickRows) {
 		return
@@ -202,6 +240,27 @@ func (m *Model) clickTranscript(x, y int) {
 	if idx := m.clickRows[r]; idx >= 0 {
 		m.openShellFocus(idx)
 	}
+}
+
+// clickShellButton dispatches a click on a shell header button.
+func (m *Model) clickShellButton(x, y int) bool {
+	for _, b := range m.shellButtons {
+		if y == b.y && x >= b.x && x < b.x+b.w {
+			switch b.action {
+			case shellBtnClose:
+				m.shellMode = shellClosed
+			case shellBtnMaximize:
+				if m.shellMode == shellMaximized {
+					m.shellMode = shellOpen
+				} else {
+					m.shellMode = shellMaximized
+				}
+			}
+			m.clampShellScroll()
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
@@ -216,33 +275,81 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	case tea.MouseButtonLeft:
 		if msg.Action == tea.MouseActionPress {
+			if m.clickShellButton(msg.X, msg.Y) {
+				return nil
+			}
 			m.clickTranscript(msg.X, msg.Y)
 		}
 	}
 	return nil
 }
 
-// shellPane renders the shell session pane: a header plus a scrollable, live view
-// of every command and its output.
-func (m *Model) shellPane(rows int) string {
+// shellPane renders the bordered shell session pane: a header with close and
+// maximize buttons plus a scrollable, live view of every command and its output.
+func (m *Model) shellPane(rows int, topY int) string {
 	if rows <= 0 {
 		return ""
 	}
 	m.clampShellScroll()
-	lines := []string{styleShellHead.Render(fmt.Sprintf("shell (%d commands)", len(m.shellCmds)))}
-	content := rows - 1
-	end := m.shellScroll + content
+
+	innerH := rows - 2
+	if innerH < 0 {
+		innerH = 0
+	}
+	innerW := m.width - 2
+	if innerW < 1 {
+		innerW = 1
+	}
+
+	lines := []string{m.shellHeader(innerW, topY)}
+
+	contentRows := innerH - 1
+	if contentRows < 0 {
+		contentRows = 0
+	}
+	end := m.shellScroll + contentRows
 	if end > len(m.shellFlat) {
 		end = len(m.shellFlat)
 	}
 	for i := m.shellScroll; i < end; i++ {
-		lines = append(lines, m.shellLineStyle(i))
+		raw := truncateToColumns(m.shellFlat[i], innerW)
+		lines = append(lines, m.shellLineStyle(i, raw))
 	}
-	return fill(strings.Join(lines, "\n"), rows)
+	return styleShellBorder.Render(fill(strings.Join(lines, "\n"), innerH))
 }
 
-func (m *Model) shellLineStyle(i int) string {
-	text := m.shellFlat[i]
+// shellHeader builds the pane header (title left, buttons right) and records the
+// button positions for mouse handling. topY is the screen row of the border top.
+func (m *Model) shellHeader(innerW, topY int) string {
+	title := fmt.Sprintf("shell (%d)", len(m.shellCmds))
+	closeLabel := "x"
+	maxLabel := "[]"
+	group := closeLabel + " " + maxLabel
+
+	pad := innerW - len(title) - len(group)
+	if pad < 1 {
+		avail := innerW - len(group) - 1
+		if avail < 1 {
+			avail = 1
+		}
+		title = truncateToColumns(title, avail)
+		pad = innerW - len(title) - len(group)
+		if pad < 1 {
+			pad = 1
+		}
+	}
+	header := title + strings.Repeat(" ", pad) + group
+
+	y := topY + 1 // first row inside the top border
+	groupStart := innerW - len(group) + 1
+	m.shellButtons = append(m.shellButtons,
+		shellButton{x: groupStart, y: y, w: 1, action: shellBtnClose},
+		shellButton{x: groupStart + 2, y: y, w: 2, action: shellBtnMaximize},
+	)
+	return header
+}
+
+func (m *Model) shellLineStyle(i int, text string) string {
 	if cmd := m.shellRowCmd[i]; cmd >= 0 {
 		if cmd == m.shellFocus {
 			return styleShellFocus.Render(text)
@@ -279,4 +386,25 @@ func truncateCommand(s string, max int) string {
 		cut--
 	}
 	return s[:cut] + "…"
+}
+
+// truncateToColumns cuts s to at most max grapheme columns, appending an
+// ellipsis when truncated.
+func truncateToColumns(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	w := 0
+	gr := uniseg.NewGraphemes(s)
+	for gr.Next() {
+		g := gr.Str()
+		gw := uniseg.StringWidth(g)
+		if w+gw > max {
+			return b.String() + "…"
+		}
+		b.WriteString(g)
+		w += gw
+	}
+	return b.String()
 }

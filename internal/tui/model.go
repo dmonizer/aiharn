@@ -69,13 +69,15 @@ type Model struct {
 	approvals []approval.Request // additional requests waiting behind the modal
 
 	// shell session view
-	shellCmds   []shellCmd
-	shellFlat   []string // flattened display rows (header + output)
-	shellStart  []int    // per command, index of its header row in shellFlat
-	shellRowCmd []int    // per shellFlat row, owning command index or -1
-	shellMode   shellViewMode
-	shellScroll int
-	shellFocus  int // index into shellCmds, -1 = none
+	shellCmds     []shellCmd
+	shellFlat     []string // flattened display rows (header + output)
+	shellStart    []int    // per command, index of its header row in shellFlat
+	shellRowCmd   []int    // per shellFlat row, owning command index or -1
+	shellMode     shellViewMode
+	shellScroll   int
+	shellFocus    int  // index into shellCmds, -1 = none
+	shellFollow   bool // autoscroll to newest output while pinned to the bottom
+	shellButtons  []shellButton
 
 	// click hit-testing (computed in View, consumed by mouse handling)
 	clickRows  []int // per transcript row: shellCmds index or -1
@@ -109,6 +111,7 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 	m.textarea.Focus()
 	m.resizeInput()
 	m.shellFocus = -1
+	m.shellFollow = true
 	m.histIdx = -1
 	m.appendLine(kindPlain, fmt.Sprintf("aiharn: agent %s · model %s · channel %s · approval %s",
 		status.AgentType, status.Model, status.Channel, status.Approval))

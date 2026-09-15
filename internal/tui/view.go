@@ -38,12 +38,13 @@ func styleLine(kind lineKind, s string) string {
 // View renders the status bar, the transcript (and, when open, the shell pane),
 // and either the input line or an approval prompt.
 func (m *Model) View() string {
+	m.shellButtons = m.shellButtons[:0]
 	var b strings.Builder
 	b.WriteString(sanitizeTerminalLine(m.statusLine()))
 	b.WriteString("\n")
 
 	if m.shellMode == shellMaximized {
-		b.WriteString(m.shellPane(m.height - 1))
+		b.WriteString(m.shellPane(m.height-1, 1))
 		return b.String()
 	}
 
@@ -70,7 +71,7 @@ func (m *Model) body() string {
 		if transRows < 0 {
 			transRows = 0
 		}
-		return m.transcriptAndSubagents(transRows) + "\n" + m.shellPane(shellRows)
+		return m.transcriptAndSubagents(transRows) + "\n" + m.shellPane(shellRows, 1+transRows)
 	}
 	return m.transcriptAndSubagents(m.rows())
 }

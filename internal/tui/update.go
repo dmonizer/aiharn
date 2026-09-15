@@ -92,10 +92,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "pgdn":
 			m.scrollShell(m.shellPageSize())
 		case "home":
-			m.shellScroll = 0
-			m.clampShellScroll()
+			m.setShellScroll(0)
 		case "end":
-			m.shellScroll = m.shellMaxScroll()
+			m.setShellScroll(m.shellMaxScroll())
 		}
 		return m, nil
 	}
@@ -131,10 +130,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "pgdn":
 				m.scrollShell(m.shellPageSize())
 			case "home":
-				m.shellScroll = 0
-				m.clampShellScroll()
+				m.setShellScroll(0)
 			case "end":
-				m.shellScroll = m.shellMaxScroll()
+				m.setShellScroll(m.shellMaxScroll())
 			}
 			return m, nil
 		}
