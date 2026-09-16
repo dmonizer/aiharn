@@ -9,6 +9,8 @@ provider = "openai_responses"          # protocol the adapter speaks; no silent 
 base_url = "https://api.deepseek.com"
 api_key  = "${DEEPSEEK_API_KEY}"
 model    = "deepseek-v4-flash"
+# reasoning_effort = "high"    # optional; model-dependent; use "none" to disable when supported
+# reasoning_summary = "auto"   # Responses API only: auto|concise|detailed; enables streamed summaries
 
 [models.zai_glm]
 provider = "openai_chat_completions"

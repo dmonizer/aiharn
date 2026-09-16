@@ -9,9 +9,10 @@
 /aiharn.log.jsonl
 /debug*.log
 
-# Config with real credentials. The committed config.toml is an example that
-# only references environment variables (no secrets); keep local overrides in
-# *.local.toml.
+# Local config may contain credentials and environment-specific paths. Start
+# from config.toml.example; neither config.toml nor *.local.toml is committed.
+/config.toml
+/.token
 *.local.toml
 
 # Editor/OS

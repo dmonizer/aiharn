@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOKEN_FILE=".token"
+
+if [[ -f "$TOKEN_FILE" ]]; then
+    source "$TOKEN_FILE"
+else
+    AIHARN_API_TOKEN="$(openssl rand -hex 32)"
+    printf 'AIHARN_API_TOKEN=%q\n' "$AIHARN_API_TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+fi
+
+export AIHARN_API_TOKEN
+
+echo "$AIHARN_API_TOKEN"
+
+exec ./aiharn "$@"
