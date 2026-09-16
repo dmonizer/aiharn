@@ -43,10 +43,12 @@ const (
 
 // Request describes a gated action awaiting approval.
 type Request struct {
-	ID       string
-	ToolName string
-	Command  string
-	Args     string
+	ID        string
+	AgentID   string
+	AgentType string
+	ToolName  string
+	Command   string
+	Args      string
 }
 
 var (

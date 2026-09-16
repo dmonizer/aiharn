@@ -234,7 +234,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	}
 
 	reg, err := buildRegistry(session, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
-		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, spec.ID)
+		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, spec.ID, spec.Type)
 	if err != nil {
 		session.Close()
 		return nil, err
@@ -448,13 +448,13 @@ func buildGate(mode string) (*approval.Gate, error) {
 // The session and gate are shared by all built-ins; backend (the Manager) and
 // callerID wire the subagent tools to the runtime. defaultCwd is the directory
 // execute_command falls back to when the model omits one.
-func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID string) (*tools.Registry, error) {
+func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID, callerType string) (*tools.Registry, error) {
 	reg := tools.New()
 	spawnToolEnabled := sel.Mode == config.ToolModeAll || (sel.Mode == config.ToolModeList && slices.Contains(sel.Names, tools.NameSpawnSubagent))
 	all := map[string]tools.Tool{
-		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd, commandTimeout),
+		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd, commandTimeout, callerID, callerType),
 		tools.NameListSubagentTypes:   tools.ListSubagentTypes(backend, callerID, spawnToolEnabled),
-		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID),
+		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID, callerType),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),
 		tools.NameCheckSubagent:       tools.CheckSubagent(backend, callerID),
 		tools.NameListSubagents:       tools.ListSubagents(backend, callerID),

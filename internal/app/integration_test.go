@@ -174,6 +174,9 @@ func TestVerticalSlice(t *testing.T) {
 	if req.ToolName != "execute_command" || req.Command != `printf 'hello-from-shell'` {
 		t.Fatalf("approval request = %+v", req)
 	}
+	if req.AgentID != rt.Agent.ID() || req.AgentType != rt.Agent.Type() {
+		t.Fatalf("approval agent = %+v", req)
+	}
 	if err := rt.Gate.Decide(req.ID, approval.DecisionApproved); err != nil {
 		t.Fatalf("Decide: %v", err)
 	}

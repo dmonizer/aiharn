@@ -171,7 +171,7 @@ func TestTurnToolCall(t *testing.T) {
 	})
 	gate := approval.NewGate(approval.ModeAllowAll)
 	reg := tools.New()
-	if err := reg.Register(tools.ExecuteCommand(ex, gate, 0, "", 0)); err != nil {
+	if err := reg.Register(tools.ExecuteCommand(ex, gate, 0, "", 0, "main", "main")); err != nil {
 		t.Fatal(err)
 	}
 

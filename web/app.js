@@ -8,6 +8,7 @@
 
   const elements = {
     apiList: document.querySelector("#api-list"),
+    agentList: document.querySelector("#agent-list"),
     transcript: document.querySelector("#transcript"),
     approvals: document.querySelector("#approvals"),
     connection: document.querySelector("#connection-state"),
@@ -33,6 +34,8 @@
     endpoints: loadEndpoints(),
     activeId: localStorage.getItem(ACTIVE_KEY),
     snapshots: new Map(),
+    selectedAgents: new Map(),
+    drafts: new Map(),
     health: new Map(),
     request: null,
     timer: null,
@@ -117,6 +120,14 @@
     return state.endpoints.find((endpoint) => endpoint.id === state.activeId);
   }
 
+  function selectedAgentID() {
+    return state.selectedAgents.get(state.activeId) || "";
+  }
+
+  function draftKey(endpointID = state.activeId, agentID = selectedAgentID()) {
+    return endpointID + ":" + agentID;
+  }
+
   function tokenFor(endpoint) {
     return endpoint ? sessionStorage.getItem(TOKEN_PREFIX + endpoint.id) || "" : "";
   }
@@ -190,12 +201,58 @@
     }
   }
 
+  function renderAgentList(agents, selectedID) {
+    elements.agentList.replaceChildren();
+    for (const agent of agents) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "agent-item depth-" + Math.min(agent.depth || 0, 3) +
+        (agent.id === selectedID ? " active" : "");
+      item.setAttribute("aria-current", agent.id === selectedID ? "true" : "false");
+      item.addEventListener("click", () => selectAgent(agent.id));
+      const status = agent.paused ? "paused" : agent.state;
+      const dot = document.createElement("span");
+      dot.className = "agent-dot " + status;
+      const copy = document.createElement("span");
+      copy.className = "agent-copy";
+      const name = document.createElement("strong");
+      name.textContent = agent.depth ? agent.type : "Main · " + agent.type;
+      const id = document.createElement("span");
+      id.textContent = agent.id;
+      copy.append(name, id);
+      const state = document.createElement("span");
+      state.className = "agent-state " + status;
+      state.textContent = status;
+      item.append(dot, copy, state);
+      elements.agentList.append(item);
+    }
+  }
+
+  function selectAgent(id) {
+    const endpoint = activeEndpoint();
+    if (!endpoint || selectedAgentID() === id) return;
+    state.drafts.set(draftKey(), elements.message.value);
+    state.selectedAgents.set(endpoint.id, id);
+    elements.message.value = state.drafts.get(draftKey()) || "";
+    state.fingerprint = "";
+    state.request?.abort();
+    renderAgentList(state.snapshots.get(endpoint.id)?.agents || [], id);
+    elements.agentTitle.textContent = id;
+    elements.message.disabled = true;
+    elements.send.disabled = true;
+    elements.transcript.replaceChildren(emptyState("Loading agent…", id));
+    poll();
+    document.body.classList.remove("menu-open");
+  }
+
   function selectEndpoint(id) {
     if (state.activeId === id) {
       document.body.classList.remove("menu-open");
       return;
     }
+    state.drafts.set(draftKey(), elements.message.value);
     state.activeId = id;
+    elements.message.value = state.drafts.get(draftKey()) || "";
     localStorage.setItem(ACTIVE_KEY, id);
     state.fingerprint = "";
     state.connected = false;
@@ -238,6 +295,7 @@
     elements.endpointLabel.textContent = endpoint?.name || "No API selected";
     elements.agentTitle.textContent = endpoint ? "Connecting…" : "Current session";
     elements.sessionMeta.replaceChildren();
+    elements.agentList.replaceChildren();
     elements.approvals.replaceChildren();
     elements.message.disabled = true;
     elements.send.disabled = true;
@@ -280,19 +338,31 @@
   function renderSnapshot(snapshot) {
     const endpoint = activeEndpoint();
     const session = snapshot.session || {};
+    if (endpoint && !state.selectedAgents.has(endpoint.id)) {
+      state.selectedAgents.set(endpoint.id, session.agent_id);
+    }
     elements.endpointLabel.textContent = endpoint?.name || "Aiharn";
-    elements.agentTitle.textContent = session.agent_id || "Current session";
+    elements.agentTitle.textContent = session.agent_id
+      ? (session.agent_type && session.agent_type !== session.agent_id
+        ? session.agent_type + " · " + session.agent_id : session.agent_id)
+      : "Current session";
+    elements.message.placeholder = "Message " + (session.agent_id || "Aiharn") + "…";
+    renderAgentList(snapshot.agents?.length ? snapshot.agents : [{
+      id: session.agent_id, type: session.agent_type,
+      state: session.state, depth: 0, paused: false
+    }], session.agent_id);
     elements.sessionMeta.replaceChildren(
-      chip(session.model || "model"),
-      chip(session.channel || "channel"),
+      ...(session.model ? [chip(session.model)] : []),
+      ...(session.channel ? [chip(session.channel)] : []),
       chip(session.approval_mode || "ask"),
       chip(session.state || "unknown", "state-" + (session.state || "unknown"))
     );
     elements.queue.textContent = snapshot.queued_messages
       ? snapshot.queued_messages + " queued"
       : "";
-    elements.message.disabled = session.state === "closed";
-    elements.send.disabled = session.state === "closed" || !elements.message.value.trim();
+    const unavailable = session.state === "closed" || session.state === "errored";
+    elements.message.disabled = unavailable;
+    elements.send.disabled = unavailable || !elements.message.value.trim();
     renderApprovals(snapshot.pending_approvals || []);
     renderMessages(snapshot.messages || []);
     if (snapshot.last_error) showConnection(snapshot.last_error);
@@ -301,15 +371,21 @@
   }
 
   function renderMessages(messages) {
-    const nearBottom = elements.transcript.scrollHeight - elements.transcript.scrollTop -
+    const previousTop = elements.transcript.scrollTop;
+    const nearBottom = elements.transcript.scrollHeight - previousTop -
       elements.transcript.clientHeight < 100;
+    const expandedTools = new Set(Array.from(
+      elements.transcript.querySelectorAll(".tool-block[open]"),
+      (block) => block.dataset.toolKey
+    ));
     elements.transcript.replaceChildren();
     if (!messages.length) {
       elements.transcript.append(emptyState("Session is ready", "Send a message to begin."));
       return;
     }
 
-    for (const message of messages) {
+    for (const entry of groupMessages(messages)) {
+      const message = entry.message;
       if (message.type === "message") {
         const row = document.createElement("div");
         row.className = "message-row " + (message.role || "");
@@ -325,20 +401,78 @@
         row.append(body);
         elements.transcript.append(row);
       } else {
-        const details = document.createElement("details");
-        details.className = "tool-block";
-        const summary = document.createElement("summary");
-        summary.textContent = message.type === "tool_call"
-          ? "tool · " + (message.name || "unknown")
-          : "tool result · " + (message.call_id || "");
-        const pre = document.createElement("pre");
-        const value = message.type === "tool_call" ? message.arguments : message.content;
-        pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-        details.append(summary, pre);
-        elements.transcript.append(details);
+        elements.transcript.append(renderToolBlock(entry, expandedTools));
       }
     }
-    if (nearBottom) elements.transcript.scrollTop = elements.transcript.scrollHeight;
+    elements.transcript.scrollTop = nearBottom
+      ? elements.transcript.scrollHeight
+      : previousTop;
+  }
+
+  function groupMessages(messages) {
+    const entries = [];
+    const pending = new Map();
+    const callCounts = new Map();
+    for (const [index, message] of messages.entries()) {
+      if (message.type === "tool_call") {
+        const callID = message.call_id || "";
+        const count = callCounts.get(callID) || 0;
+        callCounts.set(callID, count + 1);
+        const entry = { message, result: null, key: "call:" + callID + ":" + count };
+        entries.push(entry);
+        if (!pending.has(callID)) pending.set(callID, []);
+        pending.get(callID).push(entry);
+      } else if (message.type === "tool_result") {
+        const callID = message.call_id || "";
+        const waiting = pending.get(callID);
+        if (waiting?.length) waiting.shift().result = message;
+        else entries.push({ message, result: null, key: "result:" + callID + ":" + index });
+      } else {
+        entries.push({ message });
+      }
+    }
+    return entries;
+  }
+
+  function renderToolBlock(entry, expandedTools) {
+    const call = entry.message.type === "tool_call" ? entry.message : null;
+    const result = entry.result || (call ? null : entry.message);
+    const resultText = result?.content || "";
+    const status = !result ? "pending" : resultText.trim().toLowerCase() === "denied by user"
+      ? "denied" : resultText.startsWith("error:") ? "error" : "executed";
+    const details = document.createElement("details");
+    details.className = "tool-block " + status;
+    details.dataset.toolKey = entry.key;
+    details.open = expandedTools.has(entry.key);
+
+    const summary = document.createElement("summary");
+    summary.setAttribute("aria-label", status + " · " + (call?.name || "tool result"));
+    const icon = document.createElement("span");
+    icon.className = "tool-status-icon " + status;
+    icon.textContent = { pending: "…", denied: "🛑", error: "!", executed: "✓" }[status];
+    icon.title = status;
+    icon.setAttribute("aria-hidden", "true");
+    const title = document.createElement("span");
+    title.textContent = call ? "tool · " + (call.name || "unknown") :
+      "tool result · " + (result.call_id || "unknown");
+    summary.append(icon, title);
+    details.append(summary);
+
+    if (call) appendToolSection(details, "Call", call.arguments);
+    if (result) appendToolSection(details, "Result", result.content);
+    return details;
+  }
+
+  function appendToolSection(details, label, value) {
+    const section = document.createElement("div");
+    section.className = "tool-section";
+    const heading = document.createElement("div");
+    heading.className = "tool-section-label";
+    heading.textContent = label;
+    const pre = document.createElement("pre");
+    pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    section.append(heading, pre);
+    details.append(section);
   }
 
   function renderApprovals(approvals) {
@@ -347,12 +481,23 @@
       const card = document.createElement("article");
       card.className = "approval-card";
       const content = document.createElement("div");
+      const heading = document.createElement("div");
+      heading.className = "approval-heading";
       const label = document.createElement("div");
       label.className = "approval-label";
       label.textContent = "Permission required · " + approval.tool_name;
+      const agent = document.createElement("div");
+      agent.className = "approval-agent";
+      const agentType = document.createElement("span");
+      agentType.textContent = "Agent: " + (approval.agent_type || "unknown");
+      const agentID = document.createElement("span");
+      agentID.className = "approval-agent-id";
+      agentID.textContent = "ID: " + (approval.agent_id || "unknown");
+      agent.append(agentType, agentID);
+      heading.append(label, agent);
       const command = document.createElement("pre");
       command.textContent = approval.command || JSON.stringify(approval.arguments, null, 2);
-      content.append(label, command);
+      content.append(heading, command);
 
       const actions = document.createElement("div");
       actions.className = "approval-actions";
@@ -399,8 +544,11 @@
     const request = new AbortController();
     state.request = request;
     try {
-      const snapshot = await apiCall(endpoint, "/session", { signal: request.signal });
+      const agentID = selectedAgentID();
+      const path = "/session" + (agentID ? "?agent_id=" + encodeURIComponent(agentID) : "");
+      const snapshot = await apiCall(endpoint, path, { signal: request.signal });
       if (endpoint.id !== state.activeId) return;
+      if (agentID !== selectedAgentID()) return;
       state.health.set(endpoint.id, "online");
       const fingerprint = JSON.stringify(snapshot);
       if (fingerprint !== state.fingerprint) {
@@ -411,6 +559,15 @@
       renderEndpointList();
     } catch (error) {
       if (error.name === "AbortError") return;
+      if (error.status === 404 && selectedAgentID()) {
+        state.selectedAgents.delete(endpoint.id);
+        state.fingerprint = "";
+        state.connected = false;
+        elements.message.disabled = true;
+        elements.send.disabled = true;
+        showConnection("Selected agent is no longer available; returning to main.");
+        return;
+      }
       state.health.set(endpoint.id, "error");
       state.fingerprint = "";
       state.connected = false;
@@ -430,21 +587,31 @@
   async function sendMessage(event) {
     event?.preventDefault();
     const endpoint = activeEndpoint();
+    const agentID = selectedAgentID();
+    const snapshot = endpoint && state.snapshots.get(endpoint.id);
+    const rootID = snapshot?.agents?.[0]?.id || snapshot?.session?.agent_id || "";
     const content = elements.message.value;
-    if (!endpoint || !state.connected || !content.trim()) return;
+    if (!endpoint || !state.connected || elements.message.disabled || !content.trim()) return;
     elements.send.disabled = true;
     try {
       await apiCall(endpoint, "/messages", {
-        method: "POST", body: JSON.stringify({ content })
+        method: "POST", body: JSON.stringify(messagePayload(content, agentID, rootID))
       });
-      elements.message.value = "";
-      updateComposer();
+      state.drafts.delete(draftKey(endpoint.id, agentID));
+      if (endpoint.id === state.activeId && agentID === selectedAgentID() && elements.message.value === content) {
+        elements.message.value = "";
+        updateComposer();
+      }
       await poll(true);
     } catch (error) {
       showConnection(error.message);
     } finally {
-      elements.send.disabled = !state.connected || !elements.message.value.trim();
+      elements.send.disabled = !state.connected || elements.message.disabled || !elements.message.value.trim();
     }
+  }
+
+  function messagePayload(content, agentID, rootID) {
+    return agentID && agentID !== rootID ? { content, agent_id: agentID } : { content };
   }
 
   function openAPIDialog() {
@@ -463,7 +630,7 @@
   }
 
   function updateComposer() {
-    elements.send.disabled = !state.connected || !elements.message.value.trim();
+    elements.send.disabled = !state.connected || elements.message.disabled || !elements.message.value.trim();
   }
 
   document.querySelectorAll("#add-api, #manage-api, .add-api-cta").forEach((button) => {
@@ -541,9 +708,12 @@
   });
   composerResize.addEventListener("pointermove", (event) => {
     if (!resizeStart) return;
+    const nearBottom = elements.transcript.scrollHeight - elements.transcript.scrollTop -
+      elements.transcript.clientHeight < 100;
     const max = Math.round(window.innerHeight * 0.4);
     const height = Math.min(Math.max(resizeStart.h + (resizeStart.y - event.clientY), 40), max);
     elements.message.style.height = height + "px";
+    if (nearBottom) elements.transcript.scrollTop = elements.transcript.scrollHeight;
   });
   const endResize = () => {
     resizeStart = null;

@@ -42,7 +42,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .shell {
   display: grid;
   grid-template-columns: 264px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
+  height: 100dvh;
+  min-height: 0;
 }
 
 .sidebar {
@@ -180,6 +183,42 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .api-item:hover .remove-api { visibility: visible; }
 .remove-api:hover { color: var(--danger); background: rgba(255, 107, 107, .08); }
 
+.agent-panel { display: flex; flex: 0 1 44%; flex-direction: column; min-height: 100px; padding-top: 15px; border-top: 1px solid var(--line); }
+.agent-list { display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow-y: auto; }
+.agent-item {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.agent-item.depth-1 { padding-left: 17px; }
+.agent-item.depth-2 { padding-left: 27px; }
+.agent-item.depth-3 { padding-left: 37px; }
+.agent-item:hover { color: var(--text); background: var(--panel-2); }
+.agent-item:hover .agent-copy strong { text-decoration: underline; }
+.agent-item.active { border-color: var(--line-bright); color: var(--text); background: #172025; }
+.agent-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.agent-dot.running { background: var(--accent); }
+.agent-dot.idle { background: #8bb6cd; }
+.agent-dot.paused { background: var(--warn); }
+.agent-dot.errored { background: var(--danger); }
+.agent-copy { min-width: 0; }
+.agent-copy strong, .agent-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-copy strong { font-size: 12px; }
+.agent-copy span { margin-top: 2px; color: var(--faint); font: 10px ui-monospace, "SFMono-Regular", Consolas, monospace; }
+.agent-state { color: var(--faint); font-size: 10px; }
+.agent-state.running { color: var(--accent); }
+.agent-state.paused { color: var(--warn); }
+.agent-state.errored { color: var(--danger); }
+
 .sidebar-foot {
   padding: 15px 7px 0;
   border-top: 1px solid var(--line);
@@ -199,14 +238,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .danger-button:hover { background: rgba(255, 107, 107, .08); }
 
 .workspace {
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  min-height: 0;
   height: 100%;
+  overflow: hidden;
 }
 
 .topbar {
   display: flex;
+  flex: none;
   align-items: center;
   min-height: 76px;
   gap: 22px;
@@ -242,6 +284,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .meta-chip.state-errored { border-color: #773d3d; color: var(--danger); }
 
 .connection-state {
+  flex: none;
   padding: 9px 28px;
   border-bottom: 1px solid #513636;
   color: #ffaaaa;
@@ -252,8 +295,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 
 .approvals {
   display: flex;
+  flex: 0 1 auto;
   flex-direction: column;
   gap: 9px;
+  min-height: 0;
   max-height: 42vh;
   padding: 0 28px;
   overflow-y: auto;
@@ -270,7 +315,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   border-radius: 11px;
   background: #18160f;
 }
+.approval-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px; }
 .approval-label { color: var(--warn); font-size: 10px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
+.approval-agent {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px 11px;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid #5b7381;
+  border-radius: 6px;
+  color: #d4e9f4;
+  background: #17252d;
+  font-size: 11px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.approval-agent-id { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }
 .approval-card pre { margin: 6px 0 0; overflow: auto; color: #f3ead4; font: 12px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
 .approval-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .approval-actions button { padding: 7px 10px; border: 1px solid var(--line-bright); border-radius: 8px; background: var(--panel-2); font-size: 11px; cursor: pointer; }
@@ -278,10 +339,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .approval-actions .deny { color: #ffaaaa; }
 
 .transcript {
+  flex: 1 1 0;
   min-height: 0;
   padding: 26px max(28px, calc((100% - 920px) / 2));
   overflow-y: auto;
-  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--line-bright) transparent;
+  scrollbar-width: thin;
 }
 
 .empty-state {
@@ -321,16 +385,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   border-radius: 10px;
   background: #0d1012;
 }
+.tool-block.denied { border-color: #713b3b; }
 .tool-block summary {
   padding: 9px 12px;
   color: var(--muted);
   font: 11px ui-monospace, "SFMono-Regular", Consolas, monospace;
   cursor: pointer;
 }
-.tool-block pre { max-height: 330px; margin: 0; padding: 11px 12px; overflow: auto; border-top: 1px solid var(--line); color: #aeb8bf; font: 11px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
+.tool-status-icon { display: inline-block; min-width: 1.5em; margin-left: 7px; font-size: 14px; vertical-align: middle; }
+.tool-status-icon.executed { color: var(--accent); }
+.tool-status-icon.denied { color: var(--danger); }
+.tool-status-icon.error { color: var(--warn); }
+.tool-section { border-top: 1px solid var(--line); }
+.tool-section-label { padding: 9px 12px 0; color: var(--faint); font: 10px ui-monospace, "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
+.tool-section pre { max-height: 330px; margin: 0; padding: 7px 12px 11px; overflow: auto; color: #aeb8bf; font: 11px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
 
 .composer {
   display: grid;
+  flex: none;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 9px;
   margin: 0 max(28px, calc((100% - 920px) / 2)) 22px;

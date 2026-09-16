@@ -100,7 +100,7 @@ func (f *fakeBackend) lastSpawn() spawnCall {
 func TestSpawnSubagentAllowAll(t *testing.T) {
 	backend := &fakeBackend{spawnID: "coder-1"}
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1"))
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
 
 	out, err := r.Run(context.Background(), tools.NameSpawnSubagent, json.RawMessage(`{"agent_type":"coder","prompt":"build it"}`))
 	if err != nil {
@@ -118,7 +118,7 @@ func TestSpawnSubagentAllowAll(t *testing.T) {
 func TestSpawnSubagentAskApproved(t *testing.T) {
 	backend := &fakeBackend{spawnID: "coder-9"}
 	gate := approval.NewGate(approval.ModeAsk)
-	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1"))
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
 
 	done := make(chan string, 1)
 	go func() {
@@ -134,6 +134,9 @@ func TestSpawnSubagentAskApproved(t *testing.T) {
 	}
 	if req.ToolName != tools.NameSpawnSubagent || req.Command != "coder" {
 		t.Fatalf("request = %+v", req)
+	}
+	if req.AgentID != "caller-1" || req.AgentType != "coder" {
+		t.Fatalf("request agent = %+v", req)
 	}
 	if err := gate.Decide(req.ID, approval.DecisionApproved); err != nil {
 		t.Fatal(err)
@@ -155,7 +158,7 @@ func TestSpawnSubagentAskApproved(t *testing.T) {
 func TestSpawnSubagentAskDenied(t *testing.T) {
 	backend := &fakeBackend{spawnID: "coder-9"}
 	gate := approval.NewGate(approval.ModeAsk)
-	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1"))
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
 
 	done := make(chan string, 1)
 	go func() {
@@ -271,7 +274,7 @@ func TestListSubagentTypesReportsDisabledSpawnTool(t *testing.T) {
 func TestSubagentToolsPropagateErrors(t *testing.T) {
 	backend := &fakeBackend{spawnErr: errors.New("spawn failed")}
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1"))
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
 
 	_, err := r.Run(context.Background(), tools.NameSpawnSubagent, json.RawMessage(`{"agent_type":"coder","prompt":"x"}`))
 	if err == nil || !strings.Contains(err.Error(), "spawn failed") {
@@ -282,7 +285,7 @@ func TestSubagentToolsPropagateErrors(t *testing.T) {
 func TestSubagentToolInvalidArgs(t *testing.T) {
 	backend := &fakeBackend{}
 	gate := approval.NewGate(approval.ModeAllowAll)
-	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1"))
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
 
 	_, err := r.Run(context.Background(), tools.NameSpawnSubagent, json.RawMessage(`{"prompt":"missing agent_type"}`))
 	if err == nil || !strings.Contains(err.Error(), "invalid arguments") {

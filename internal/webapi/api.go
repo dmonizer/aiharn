@@ -51,6 +51,7 @@ type Config struct {
 	AllowedOrigins []string
 	QueueSize      int
 	Agent          Agent
+	Manager        *agent.Manager
 	Gate           *approval.Gate
 	Session        SessionInfo
 }
@@ -177,10 +178,19 @@ func (s *Server) Close() error {
 type sessionResponse struct {
 	APIVersion       int               `json:"api_version"`
 	Session          session           `json:"session"`
+	Agents           []agentSummary    `json:"agents"`
 	Messages         []message         `json:"messages"`
 	PendingApprovals []approvalRequest `json:"pending_approvals"`
 	QueuedMessages   int               `json:"queued_messages"`
 	LastError        string            `json:"last_error,omitempty"`
+}
+
+type agentSummary struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	State  string `json:"state"`
+	Depth  int    `json:"depth"`
+	Paused bool   `json:"paused"`
 }
 
 type session struct {
@@ -202,10 +212,12 @@ type message struct {
 }
 
 type approvalRequest struct {
-	ID       string `json:"id"`
-	ToolName string `json:"tool_name"`
-	Command  string `json:"command,omitempty"`
-	Args     any    `json:"arguments,omitempty"`
+	ID        string `json:"id"`
+	AgentID   string `json:"agent_id"`
+	AgentType string `json:"agent_type"`
+	ToolName  string `json:"tool_name"`
+	Command   string `json:"command,omitempty"`
+	Args      any    `json:"arguments,omitempty"`
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -213,17 +225,61 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
+	agents := []agentSummary{{
+		ID: s.cfg.Agent.ID(), Type: s.cfg.Agent.Type(),
+		State: s.cfg.Agent.State().String(),
+	}}
+	if s.cfg.Manager != nil {
+		subs, err := s.cfg.Manager.ListSubagents(r.Context(), s.cfg.Agent.ID())
+		if err != nil {
+			writeError(w, http.StatusConflict, "cannot list subagents")
+			return
+		}
+		for _, sub := range subs {
+			agents = append(agents, agentSummary{
+				ID: sub.ID, Type: sub.Type, State: sub.State,
+				Depth: sub.Depth, Paused: sub.Paused,
+			})
+		}
+	}
+	selected := s.cfg.Agent
+	selectedID := r.URL.Query().Get("agent_id")
+	if selectedID != "" && selectedID != selected.ID() {
+		found := false
+		for _, entry := range agents[1:] {
+			if entry.ID == selectedID {
+				found = true
+				break
+			}
+		}
+		if !found || s.cfg.Manager == nil {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		sub := s.cfg.Manager.Agent(selectedID)
+		if sub == nil {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		selected = sub
+	}
+	model, channel, queued, lastError := "", "", 0, ""
+	if selected.ID() == s.cfg.Agent.ID() {
+		model, channel = s.cfg.Session.Model, s.cfg.Session.Channel
+		queued, lastError = len(s.queue), s.getLastError()
+	}
 	writeJSON(w, http.StatusOK, sessionResponse{
 		APIVersion: 1,
 		Session: session{
-			AgentID: s.cfg.Agent.ID(), AgentType: s.cfg.Agent.Type(),
-			Model: s.cfg.Session.Model, Channel: s.cfg.Session.Channel,
-			State:        s.cfg.Agent.State().String(),
+			AgentID: selected.ID(), AgentType: selected.Type(),
+			Model: model, Channel: channel,
+			State:        selected.State().String(),
 			ApprovalMode: s.cfg.Gate.Mode().String(),
 		},
-		Messages:         messagesFromHistory(s.cfg.Agent.History()),
+		Agents:           agents,
+		Messages:         messagesFromHistory(selected.History()),
 		PendingApprovals: approvalsFromGate(s.cfg.Gate.PendingRequests()),
-		QueuedMessages:   len(s.queue), LastError: s.getLastError(),
+		QueuedMessages:   queued, LastError: lastError,
 	})
 }
 
@@ -234,6 +290,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Content string `json:"content"`
+		AgentID string `json:"agent_id"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		return
@@ -244,6 +301,22 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(body.Content) > maxMessageBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "content exceeds 65536 bytes")
+		return
+	}
+	if body.AgentID != "" && body.AgentID != s.cfg.Agent.ID() {
+		if s.cfg.Manager == nil {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		err := s.cfg.Manager.SendSubagentMessage(r.Context(), s.cfg.Agent.ID(), body.AgentID, body.Content)
+		switch {
+		case errors.Is(err, agent.ErrSubagentNotFound), errors.Is(err, agent.ErrSubagentNotOwned):
+			writeError(w, http.StatusNotFound, "agent not found")
+		case err != nil:
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "queued_messages": 0})
+		}
 		return
 	}
 	if s.cfg.Agent.State() == agent.StateClosed {
@@ -332,7 +405,8 @@ func approvalsFromGate(requests []approval.Request) []approvalRequest {
 	result := make([]approvalRequest, 0, len(requests))
 	for _, request := range requests {
 		result = append(result, approvalRequest{
-			ID: request.ID, ToolName: request.ToolName, Command: request.Command,
+			ID: request.ID, AgentID: request.AgentID, AgentType: request.AgentType,
+			ToolName: request.ToolName, Command: request.Command,
 			Args: parseJSON(request.Args),
 		})
 	}

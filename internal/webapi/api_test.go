@@ -13,6 +13,8 @@ import (
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
 	"aiharn/internal/llm"
+	testllm "aiharn/internal/testutil/llm"
+	"aiharn/internal/tools"
 )
 
 type fakeAgent struct {
@@ -119,11 +121,111 @@ func TestMessageIsQueuedAndRun(t *testing.T) {
 	}
 }
 
+func TestSubagentSessionAndMessage(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{
+		SubagentTypes: []tools.SubagentType{{Name: "coder"}},
+		Builder: func(_ context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
+			return agent.New(agent.Spec{
+				ID: spec.ID, Type: spec.Type, Depth: spec.Depth, CallerID: spec.CallerID,
+				Client: &testllm.FakeClient{Script: [][]llm.Event{
+					{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "first reply"}}}},
+					{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "second reply"}}}},
+				}},
+			}), nil
+		},
+	})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	top := agent.New(agent.Spec{ID: "main", Type: "main", AllowSubagents: true})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	subID, err := mgr.SpawnSubagent(context.Background(), top.ID(), "coder", "initial task")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate := approval.NewGate(approval.ModeAsk)
+	s, err := New(Config{
+		Listen: "127.0.0.1:0", Agent: top, Manager: mgr, Gate: gate,
+		Session: SessionInfo{Model: "main-model", Channel: "local"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close(); _ = gate.Close() })
+
+	mainResponse := request(t, s, http.MethodGet, "/api/v1/session", "", nil)
+	var mainSnapshot sessionResponse
+	if err := json.Unmarshal(mainResponse.Body.Bytes(), &mainSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(mainSnapshot.Agents) != 2 || mainSnapshot.Agents[1].ID != subID ||
+		mainSnapshot.Agents[1].Type != "coder" || mainSnapshot.Agents[1].State == "" ||
+		mainSnapshot.Session.AgentID != "main" {
+		t.Fatalf("main snapshot = %+v", mainSnapshot)
+	}
+	if len(mainSnapshot.Messages) != 0 {
+		t.Fatalf("main history contains subagent activity: %+v", mainSnapshot.Messages)
+	}
+
+	url := "/api/v1/session?agent_id=" + subID
+	waitForSubagent := func(want string) sessionResponse {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			w := request(t, s, http.MethodGet, url, "", nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("subagent status = %d: %s", w.Code, w.Body.String())
+			}
+			var snapshot sessionResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			for _, message := range snapshot.Messages {
+				if message.Content == want {
+					return snapshot
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("subagent history never contained %q", want)
+		return sessionResponse{}
+	}
+	initial := waitForSubagent("first reply")
+	if initial.Session.AgentID != subID || initial.Session.AgentType != "coder" {
+		t.Fatalf("selected session = %+v", initial.Session)
+	}
+
+	w := request(t, s, http.MethodPost, "/api/v1/messages", "", map[string]string{
+		"agent_id": subID, "content": "from web",
+	})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("message status = %d: %s", w.Code, w.Body.String())
+	}
+	_ = waitForSubagent("second reply")
+	mainResponse = request(t, s, http.MethodGet, "/api/v1/session", "", nil)
+	if err := json.Unmarshal(mainResponse.Body.Bytes(), &mainSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(mainSnapshot.Messages) != 0 {
+		t.Fatalf("main history contains subagent activity: %+v", mainSnapshot.Messages)
+	}
+	if got := request(t, s, http.MethodGet, "/api/v1/session?agent_id=missing", "", nil); got.Code != http.StatusNotFound {
+		t.Fatalf("unknown session status = %d", got.Code)
+	}
+	if got := request(t, s, http.MethodPost, "/api/v1/messages", "", map[string]string{
+		"agent_id": "missing", "content": "no",
+	}); got.Code != http.StatusNotFound {
+		t.Fatalf("unknown message status = %d", got.Code)
+	}
+}
+
 func TestApprovalCanBeResolvedRemotely(t *testing.T) {
 	s, _, g := testServer(t, "")
 	decision := make(chan approval.Decision, 1)
 	go func() {
 		d, _ := g.Check(context.Background(), approval.Request{
+			AgentID: "coder-7", AgentType: "coder",
 			ToolName: "execute_command", Command: "whoami", Args: `{"command":"whoami"}`,
 		})
 		decision <- d
@@ -135,6 +237,9 @@ func TestApprovalCanBeResolvedRemotely(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &snapshot)
 	if len(snapshot.PendingApprovals) != 1 || snapshot.PendingApprovals[0].ID != req.ID {
 		t.Fatalf("approvals = %#v", snapshot.PendingApprovals)
+	}
+	if got := snapshot.PendingApprovals[0]; got.AgentID != "coder-7" || got.AgentType != "coder" {
+		t.Fatalf("approval agent = %+v", got)
 	}
 
 	w = request(t, s, http.MethodPost, "/api/v1/approvals/"+req.ID, "", map[string]string{"decision": "approve"})

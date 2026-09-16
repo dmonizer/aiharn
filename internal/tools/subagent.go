@@ -114,14 +114,15 @@ func (t *listSubagentTypes) Run(ctx context.Context, args json.RawMessage) (stri
 
 // SpawnSubagent returns the tool that creates a subagent of a given type. It is
 // gated by approval; the tool is bound to the caller that owns it.
-func SpawnSubagent(backend SubagentBackend, gate *approval.Gate, callerID string) Tool {
-	return &spawnSubagent{backend: backend, gate: gate, callerID: callerID}
+func SpawnSubagent(backend SubagentBackend, gate *approval.Gate, callerID, callerType string) Tool {
+	return &spawnSubagent{backend: backend, gate: gate, callerID: callerID, callerType: callerType}
 }
 
 type spawnSubagent struct {
-	backend  SubagentBackend
-	gate     *approval.Gate
-	callerID string
+	backend    SubagentBackend
+	gate       *approval.Gate
+	callerID   string
+	callerType string
 }
 
 func (t *spawnSubagent) Definition() llm.ToolDefinition {
@@ -157,9 +158,11 @@ func (t *spawnSubagent) Run(ctx context.Context, args json.RawMessage) (string, 
 	)
 
 	d, err := t.gate.Check(ctx, approval.Request{
-		ToolName: NameSpawnSubagent,
-		Command:  p.AgentType,
-		Args:     string(args),
+		AgentID:   t.callerID,
+		AgentType: t.callerType,
+		ToolName:  NameSpawnSubagent,
+		Command:   p.AgentType,
+		Args:      string(args),
 	})
 	if err != nil {
 		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))

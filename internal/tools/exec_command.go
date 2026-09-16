@@ -25,8 +25,9 @@ var _ Executor = (execution.Session)(nil)
 // executor, gated by the approval Gate. maxOutput caps retained stdout+stderr
 // (0 = unlimited), and defaultCwd applies when the model omits cwd. The timeout
 // starts after approval so user decision time does not consume command runtime.
-func ExecuteCommand(ex Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, timeout time.Duration) Tool {
-	return &execCommand{ex: ex, gate: gate, maxOutput: maxOutput, defaultCwd: defaultCwd, timeout: timeout}
+// agentID and agentType identify the requester in the approval prompt.
+func ExecuteCommand(ex Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, timeout time.Duration, agentID, agentType string) Tool {
+	return &execCommand{ex: ex, gate: gate, maxOutput: maxOutput, defaultCwd: defaultCwd, timeout: timeout, agentID: agentID, agentType: agentType}
 }
 
 type execCommand struct {
@@ -35,6 +36,8 @@ type execCommand struct {
 	maxOutput  int64
 	defaultCwd string
 	timeout    time.Duration
+	agentID    string
+	agentType  string
 }
 
 func (t *execCommand) Definition() llm.ToolDefinition {
@@ -70,9 +73,11 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 	)
 
 	d, err := t.gate.Check(ctx, approval.Request{
-		ToolName: NameExecuteCommand,
-		Command:  p.Command,
-		Args:     string(args),
+		AgentID:   t.agentID,
+		AgentType: t.agentType,
+		ToolName:  NameExecuteCommand,
+		Command:   p.Command,
+		Args:      string(args),
 	})
 	if err != nil {
 		logging.Debug("tool: execute_command result",

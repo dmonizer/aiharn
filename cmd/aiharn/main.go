@@ -146,7 +146,7 @@ func run(args []string) int {
 		api, err = webapi.New(webapi.Config{
 			Listen: apiCfg.Listen, Token: apiCfg.Token,
 			AllowedOrigins: apiCfg.AllowOrigins,
-			Agent:          rt.Agent, Gate: rt.Gate,
+			Agent:          rt.Agent, Manager: rt.Manager, Gate: rt.Gate,
 			Session: webapi.SessionInfo{Model: rt.Summary.Model, Channel: rt.Summary.Channel},
 		})
 		if err != nil {
