@@ -136,6 +136,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.Approval.Mode == "" {
 		cfg.Approval.Mode = defaultApprovalMode
 	}
+	cfg.Shortcuts = cfg.Shortcuts.WithDefaults()
 }
 
 // formatKeys renders []toml.Key as "a.b.c" for error messages.

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -46,7 +45,7 @@ type shellButton struct {
 	action  shellBtnAction
 }
 
-const commandPreviewLen = 80
+const commandPreviewLen = 70
 
 var (
 	styleCommand     = lipgloss.NewStyle().Foreground(lipgloss.Color("240")) // subdued gray chat command
@@ -63,7 +62,11 @@ func (m *Model) appendToolCall(call llm.Item) {
 		cmd := shellCmd{id: call.CallID, command: normalizeCommand(extractCommand(call.Args))}
 		m.shellCmds = append(m.shellCmds, cmd)
 		idx := len(m.shellCmds) - 1
-		m.appendCommandLine(idx, truncateCommand(cmd.command, commandPreviewLen))
+		preview, truncated := previewCommand(cmd.command, commandPreviewLen)
+		if truncated {
+			preview += "..."
+		}
+		m.appendCommandLine(idx, preview)
 		m.rebuildShellFlat()
 		m.followShell()
 		return
@@ -239,11 +242,11 @@ func (m *Model) clickTranscript(x, y int) {
 	if m.shellMode == shellMaximized {
 		return
 	}
-	r := y - 1 // body starts below the status line
+	r := y // body starts at the top; status is below the input
 	if r < 0 || r >= len(m.clickRows) {
 		return
 	}
-	if m.clickWidth > 0 && x >= m.clickWidth {
+	if m.clickWidth > 0 && (x <= 0 || x >= m.clickWidth-1) {
 		return
 	}
 	if idx := m.clickRows[r]; idx >= 0 {
@@ -279,7 +282,7 @@ func (m *Model) clickShellScrollbar(x, y int) bool {
 	if m.shellMode == shellClosed || contentRows <= 0 || len(m.shellFlat) <= contentRows || m.width <= 3 || x != m.width-2 {
 		return false
 	}
-	topY := 1
+	topY := 0
 	if m.shellMode == shellOpen {
 		topY += m.rows() - m.shellOpenRows()
 	}
@@ -296,6 +299,23 @@ func (m *Model) clickShellScrollbar(x, y int) bool {
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if m.pending == nil {
+		m.approvalPopover = false
+	}
+	if m.approvalPopover {
+		m.hoverX, m.hoverY = msg.X, msg.Y
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scrollApproval(-3)
+		case tea.MouseButtonWheelDown:
+			m.scrollApproval(3)
+		case tea.MouseButtonLeft:
+			if msg.Action == tea.MouseActionPress && m.approvalCloseHit.contains(msg.X, msg.Y) {
+				m.approvalPopover = false
+			}
+		}
+		return nil
+	}
 	if msg.Action == tea.MouseActionMotion {
 		m.hoverX, m.hoverY = msg.X, msg.Y
 		if msg.Button == tea.MouseButtonLeft {
@@ -305,7 +325,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
-		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= 1+m.rows() {
+		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
 			m.scrollInput(-3)
 			return nil
 		}
@@ -313,7 +333,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			m.scrollShell(-3)
 		}
 	case tea.MouseButtonWheelDown:
-		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= 1+m.rows() {
+		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
 			m.scrollInput(3)
 			return nil
 		}
@@ -322,6 +342,11 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	case tea.MouseButtonLeft:
 		if msg.Action == tea.MouseActionPress {
+			if m.pending != nil && m.approvalLinkHit.contains(msg.X, msg.Y) {
+				m.approvalPopover = true
+				m.approvalScroll = 0
+				return nil
+			}
 			if m.clickShellScrollbar(msg.X, msg.Y) {
 				return nil
 			}
@@ -465,18 +490,6 @@ func extractCommand(args string) string {
 // normalizeCommand collapses whitespace (including newlines) to single spaces.
 func normalizeCommand(s string) string {
 	return strings.Join(strings.Fields(sanitizeTerminalText(s)), " ")
-}
-
-// truncateCommand shortens s to at most max bytes on a UTF-8 boundary.
-func truncateCommand(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	cut := max
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + "…"
 }
 
 // truncateToColumns cuts s to at most max grapheme columns, appending an

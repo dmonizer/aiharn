@@ -47,6 +47,7 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 	if cfg.AiharnHome == "" || !filepath.IsAbs(cfg.AiharnHome) {
 		errs = append(errs, "aiharn_home must resolve to an absolute local directory")
 	}
+	validateShortcuts(&errs, cfg.Shortcuts)
 	providers := opts.providers()
 	channelTypes := opts.channelTypes()
 

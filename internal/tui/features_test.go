@@ -151,10 +151,10 @@ func TestShellCommandTruncatesPreview(t *testing.T) {
 		t.Fatalf("full command should be preserved in the shell view")
 	}
 	got := m.lines[len(m.lines)-1].text
-	if !strings.HasPrefix(got, strings.Repeat("x", commandPreviewLen)) {
-		t.Fatalf("preview should keep the first %d chars, got %q", commandPreviewLen, got)
+	if !strings.HasPrefix(got, strings.Repeat("x", commandPreviewLen-3)) || len(got) != commandPreviewLen {
+		t.Fatalf("preview should be at most %d chars including ellipsis, got %q", commandPreviewLen, got)
 	}
-	if !strings.HasSuffix(got, "…") {
+	if !strings.HasSuffix(got, "...") {
 		t.Fatalf("preview should end with an ellipsis, got %q", got)
 	}
 }
@@ -244,7 +244,7 @@ func TestShellScrollbarClickAndDrag(t *testing.T) {
 		t.Fatal("test setup did not overflow pane")
 	}
 	x := m.width - 2
-	first := 3 // maximized shell: top border y=1, header y=2
+	first := 2 // maximized shell: top border y=0, header y=1
 	m, _ = upd(t, m, tea.MouseMsg{X: x, Y: first, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 	if m.shellScroll != 0 {
 		t.Fatalf("track top scroll=%d, want 0", m.shellScroll)
@@ -263,7 +263,7 @@ func TestClickOpensShellFocused(t *testing.T) {
 
 	m.clickRows = []int{0, 1}
 	m.clickWidth = 80
-	m.clickTranscript(5, 2) // body row 1 → command 1
+	m.clickTranscript(5, 1) // body row 1 → command 1
 
 	if m.shellMode != shellOpen {
 		t.Fatalf("shellMode = %v, want open", m.shellMode)

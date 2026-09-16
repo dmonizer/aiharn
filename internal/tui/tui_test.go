@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+	"github.com/rivo/uniseg"
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
@@ -375,7 +376,7 @@ func TestInputScrollsWithPageKeysAndMouseWheel(t *testing.T) {
 		t.Fatalf("line after pgdn = %d, want after %d", got, pageUp)
 	}
 
-	inputY := 1 + m.rows()
+	inputY := m.rows()
 	m, _ = upd(t, m, tea.MouseMsg{Y: inputY, Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
 	wheelUp := m.textarea.Line()
 	if wheelUp >= bottom {
@@ -533,8 +534,47 @@ func TestApprovalAcceptAndAllowAll(t *testing.T) {
 	if m.pending != nil {
 		t.Fatal("expected approval cleared")
 	}
-	if !strings.Contains(m.statusLine(), "allow-all") {
+	if !strings.Contains(m.statusLine(), "actions allowed all") {
 		t.Fatalf("status line = %q", m.statusLine())
+	}
+}
+
+func TestF9TogglesActionsAllowed(t *testing.T) {
+	m := newTestModel(t)
+	if !strings.Contains(m.statusLine(), "actions allowed ask") {
+		t.Fatalf("initial status = %q", m.statusLine())
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyF9})
+	if m.gate.Mode() != approval.ModeAllowAll || !strings.Contains(m.statusLine(), "actions allowed all") {
+		t.Fatalf("after first F9: mode=%v status=%q", m.gate.Mode(), m.statusLine())
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyF9})
+	if m.gate.Mode() != approval.ModeAsk || !strings.Contains(m.statusLine(), "actions allowed ask") {
+		t.Fatalf("after second F9: mode=%v status=%q", m.gate.Mode(), m.statusLine())
+	}
+}
+
+func TestF9LeavesExistingApprovalPending(t *testing.T) {
+	m := newTestModel(t)
+	req := approval.Request{ID: "1", ToolName: "execute_command", Command: "ls"}
+	m, _ = upd(t, m, approvalReqMsg{req: req})
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyF9})
+	if m.gate.Mode() != approval.ModeAllowAll || m.pending == nil || m.pending.ID != req.ID {
+		t.Fatalf("mode=%v pending=%+v", m.gate.Mode(), m.pending)
+	}
+}
+
+func TestStatusBarItemsFitWidth(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 80
+	line := m.statusLine()
+	if !strings.Contains(line, "actions allowed ask │ thinking hidden") || uniseg.StringWidth(line) > m.width {
+		t.Fatalf("status line = %q", line)
+	}
+	m.width = 10
+	line = m.statusLine()
+	if uniseg.StringWidth(line) > m.width || line == "" {
+		t.Fatalf("narrow status line = %q", line)
 	}
 }
 
@@ -566,8 +606,8 @@ func TestInputPinnedToBottom(t *testing.T) {
 	if len(lines) != 10 {
 		t.Fatalf("view has %d lines, want 10", len(lines))
 	}
-	if !strings.Contains(lines[len(lines)-1], "> ") {
-		t.Fatalf("last line = %q, want input prompt", lines[len(lines)-1])
+	if !strings.Contains(lines[len(lines)-2], "> ") || !strings.Contains(lines[len(lines)-1], "actions allowed ask") {
+		t.Fatalf("bottom rows = %q, %q; want input then status", lines[len(lines)-2], lines[len(lines)-1])
 	}
 }
 

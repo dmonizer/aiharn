@@ -8,6 +8,8 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/rivo/uniseg"
+
+	"aiharn/internal/config"
 )
 
 // escClearWindow is the longest gap between the two presses of a "double ESC"
@@ -22,8 +24,8 @@ const (
 )
 
 // newTextarea builds the multi-line input widget. Enter is reserved for
-// submitting to the agent, so a literal newline is inserted with Ctrl+J.
-func newTextarea() textarea.Model {
+// submitting to the agent, so a literal newline uses its configured binding.
+func newTextarea(shortcuts config.ShortcutsConfig) textarea.Model {
 	ta := textarea.New()
 	ta.Prompt = "> "
 	ta.Placeholder = ""
@@ -33,8 +35,8 @@ func newTextarea() textarea.Model {
 	ta.MaxHeight = 0 // no line/height cap: display height is set via SetHeight
 	ta.EndOfBufferCharacter = ' '
 	ta.KeyMap.InsertNewline = key.NewBinding(
-		key.WithKeys("ctrl+j"),
-		key.WithHelp("ctrl+j", "insert newline"),
+		key.WithKeys(shortcuts.InsertNewline),
+		key.WithHelp(shortcuts.InsertNewline, "insert newline"),
 	)
 	return ta
 }

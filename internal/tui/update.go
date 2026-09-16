@@ -121,6 +121,28 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cancel()
 		return m, tea.Quit
 	}
+	if m.approvalPopover && m.pending == nil {
+		m.approvalPopover = false
+	}
+	if m.approvalPopover {
+		switch msg.String() {
+		case "esc", "enter":
+			m.approvalPopover = false
+		case "up":
+			m.scrollApproval(-1)
+		case "down":
+			m.scrollApproval(1)
+		case "pgup":
+			m.scrollApproval(-m.approvalPageSize())
+		case "pgdown":
+			m.scrollApproval(m.approvalPageSize())
+		case "home":
+			m.approvalScroll = 0
+		case "end":
+			m.scrollApproval(m.approvalMaxScroll())
+		}
+		return m, nil
+	}
 
 	// Terminals encode Ctrl+Esc identically to Esc. While work is active, that
 	// key therefore means "stop everything"; while idle, Esc retains its
@@ -129,8 +151,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if msg.String() == "f10" {
+	if msg.String() == m.shortcuts.ToggleThinking {
 		m.showReasoning = !m.showReasoning
+		return m, nil
+	}
+	if msg.String() == m.shortcuts.ToggleActions && m.gate != nil {
+		if m.gate.Mode() == approval.ModeAsk {
+			m.gate.SetMode(approval.ModeAllowAll)
+		} else {
+			m.gate.SetMode(approval.ModeAsk)
+		}
 		return m, nil
 	}
 
@@ -138,16 +168,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.handleApprovalKey(msg)
 	}
 
-	if msg.String() == "ctrl+s" {
+	if msg.String() == m.shortcuts.CycleShell {
 		m.cycleShell()
 		return m, nil
 	}
 
 	switch msg.String() {
-	case "ctrl+up":
+	case m.shortcuts.GrowInput:
 		m.resizeInputBy(1)
 		return m, nil
-	case "ctrl+down":
+	case m.shortcuts.ShrinkInput:
 		m.resizeInputBy(-1)
 		return m, nil
 	}
@@ -262,6 +292,7 @@ func (m *Model) stopAllRequests() bool {
 	m.queue = nil
 	m.pending = nil
 	m.approvals = nil
+	m.approvalPopover = false
 	m.lastEsc = time.Time{}
 	m.stopping = m.running
 	m.appendLine(kindPlain, "stopping all active requests")
@@ -314,6 +345,7 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) tea.Cmd {
 	if err != nil {
 		m.appendLine(kindError, "approval error: "+err.Error())
 	}
+	m.approvalPopover = false
 	if len(m.approvals) == 0 {
 		m.pending = nil
 	} else {

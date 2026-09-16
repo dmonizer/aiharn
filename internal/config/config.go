@@ -50,6 +50,7 @@ type Config struct {
 	Limits     LimitsConfig
 	Approval   ApprovalConfig
 	API        APIConfig
+	Shortcuts  ShortcutsConfig
 }
 
 // ModelConfig is a named model/API configuration referenced by agents.

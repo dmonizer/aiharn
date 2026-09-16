@@ -31,20 +31,20 @@ func (m *Model) rosterText(id, label string, x, y int, action rosterAction) stri
 	return label
 }
 
-func (m *Model) renderRoster(rows, x, width int) string {
+func (m *Model) renderRoster(rows, x, width, topY int) string {
 	if rows <= 0 {
 		return ""
 	}
 	lines := []string{fmt.Sprintf("subagents (%d)", len(m.subagents))}
 	if m.agent != nil && rows > 1 {
 		root := truncateToColumns(m.agent.ID(), width)
-		lines = append(lines, m.rosterText(m.agent.ID(), root, x, 2, rosterFocus))
+		lines = append(lines, m.rosterText(m.agent.ID(), root, x, topY+1, rosterFocus))
 	}
 	for _, sub := range m.subagents {
 		if len(lines) >= rows {
 			break
 		}
-		y := 1 + len(lines)
+		y := topY + len(lines)
 		state := sub.State
 		if sub.Paused {
 			state = "paused"

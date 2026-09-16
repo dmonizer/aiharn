@@ -17,6 +17,7 @@ import (
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
+	"aiharn/internal/config"
 	"aiharn/internal/tools"
 )
 
@@ -26,6 +27,7 @@ type Status struct {
 	AgentType string
 	Channel   string
 	Approval  string // initial approval mode
+	Shortcuts config.ShortcutsConfig
 }
 
 // lineKind discriminates a transcript line for color styling.
@@ -52,10 +54,11 @@ type line struct {
 
 // Model is the Bubbletea root model.
 type Model struct {
-	manager *agent.Manager
-	agent   *agent.Agent // top-level agent; focusedID selects the displayed context
-	gate    *approval.Gate
-	status  Status
+	manager   *agent.Manager
+	agent     *agent.Agent // top-level agent; focusedID selects the displayed context
+	gate      *approval.Gate
+	status    Status
+	shortcuts config.ShortcutsConfig
 
 	lines    []line // flushed transcript lines, oldest first
 	curText  []byte // streamed text not yet flushed to a line
@@ -78,6 +81,10 @@ type Model struct {
 	pending            *approval.Request   // active approval modal, nil when none
 	approvals          []approval.Request  // additional requests waiting behind the modal
 	cancelledApprovals map[string]struct{} // stopped requests whose notifications may still arrive
+	approvalPopover    bool
+	approvalScroll     int
+	approvalLinkHit    approvalHit
+	approvalCloseHit   approvalHit
 
 	// shell session view
 	shellCmds    []shellCmd
@@ -119,22 +126,23 @@ type Model struct {
 func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Model{
-		manager:  mgr,
-		agent:    top,
-		gate:     g,
-		status:   status,
-		ctx:      ctx,
-		cancel:   cancel,
-		inputMax: defaultInputHeight,
-		views:    make(map[string]agentView),
-		bridged:  make(map[string]bool),
-		hoverX:   -1,
-		hoverY:   -1,
+		manager:   mgr,
+		agent:     top,
+		gate:      g,
+		status:    status,
+		shortcuts: status.Shortcuts.WithDefaults(),
+		ctx:       ctx,
+		cancel:    cancel,
+		inputMax:  defaultInputHeight,
+		views:     make(map[string]agentView),
+		bridged:   make(map[string]bool),
+		hoverX:    -1,
+		hoverY:    -1,
 	}
 	if top != nil {
 		m.focusedID = top.ID()
 	}
-	m.textarea = newTextarea()
+	m.textarea = newTextarea(m.shortcuts)
 	m.textarea.Focus()
 	m.resizeInput()
 	m.shellFocus = -1

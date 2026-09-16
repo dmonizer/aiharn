@@ -43,6 +43,24 @@ func interpolate(cfg *Config) error {
 	} else {
 		cfg.AiharnHome = v
 	}
+	shortcutFields := []struct {
+		name  string
+		value *string
+	}{
+		{"toggle_actions", &cfg.Shortcuts.ToggleActions},
+		{"toggle_thinking", &cfg.Shortcuts.ToggleThinking},
+		{"cycle_shell", &cfg.Shortcuts.CycleShell},
+		{"grow_input", &cfg.Shortcuts.GrowInput},
+		{"shrink_input", &cfg.Shortcuts.ShrinkInput},
+		{"insert_newline", &cfg.Shortcuts.InsertNewline},
+	}
+	for _, field := range shortcutFields {
+		v, err := interpolateEnv(*field.value, lookup)
+		if err != nil {
+			return fmt.Errorf("shortcuts.%s: %w", field.name, err)
+		}
+		*field.value = v
+	}
 
 	for name, m := range cfg.Models {
 		if v, err := interpolateEnv(m.BaseURL, lookup); err != nil {

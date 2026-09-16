@@ -64,7 +64,7 @@ func (m *Model) focusAgent(id string) {
 	if v, ok := m.views[id]; ok {
 		m.loadView(v)
 	} else {
-		m.loadView(agentView{textarea: newTextarea(), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true})
+		m.loadView(agentView{textarea: newTextarea(m.shortcuts), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true})
 		m.textarea.Focus()
 		m.appendLine(kindPlain, fmt.Sprintf("agent %s (%s)", id, m.manager.Agent(id).Type()))
 	}
@@ -84,7 +84,7 @@ func (m *Model) appendAgentEvent(ev agent.Event) {
 	if v, ok := m.views[ev.AgentID]; ok {
 		m.loadView(v)
 	} else {
-		m.loadView(agentView{textarea: newTextarea(), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true})
+		m.loadView(agentView{textarea: newTextarea(m.shortcuts), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true})
 		m.appendLine(kindPlain, fmt.Sprintf("agent %s (%s)", ev.AgentID, m.manager.Agent(ev.AgentID).Type()))
 	}
 	m.appendEvent(ev)

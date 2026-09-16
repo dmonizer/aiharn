@@ -173,6 +173,7 @@ func run(args []string) int {
 		AgentType: rt.Summary.AgentType,
 		Channel:   rt.Summary.Channel,
 		Approval:  rt.Summary.Approval,
+		Shortcuts: cfg.Shortcuts,
 	}), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)

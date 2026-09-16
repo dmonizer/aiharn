@@ -4,16 +4,27 @@
 # for LOCAL paths. Secret-bearing fields (api_key, password) are redacted from
 # all error/log output.
 
-# Local data directory for session transcripts. Defaults to the user's home directory.
-# aiharn_home = "~/.local/share/aiharn"
+# Default: the user's home directory (~). Transcripts go under ~/transcripts/.
+# aiharn_home = "~"
+# Example override: aiharn_home = "~/.local/share/aiharn"
+
+# TUI shortcut defaults. Change any value to remap that action.
+# Keys: f1-f12, ctrl+letter, alt+letter, or ctrl+arrow. Ctrl+C is reserved.
+[shortcuts]
+toggle_actions = "f9"       # ask/all; for example, change to "ctrl+a"
+toggle_thinking = "f10"
+cycle_shell = "ctrl+s"
+grow_input = "ctrl+up"
+shrink_input = "ctrl+down"
+insert_newline = "ctrl+j"
 
 [models.deepseek_flash]
-provider = "openai_responses"          # protocol the adapter speaks; no silent fallback
-base_url = "https://api.deepseek.com"
-api_key  = "${DEEPSEEK_API_KEY}"
-model    = "deepseek-v4-flash"
-# reasoning_effort = "high"    # optional; model-dependent; use "none" to disable when supported
-# reasoning_summary = "auto"   # Responses API only: auto|concise|detailed; enables streamed summaries
+provider = "openai_responses"          # required; no default or silent fallback
+base_url = "https://api.deepseek.com" # required; no default
+api_key  = "${DEEPSEEK_API_KEY}"       # required; no default; keep secrets out of this file
+model    = "deepseek-v4-flash"         # required; no default
+reasoning_effort = ""                 # default: provider/model decides; "none" requests off when supported
+reasoning_summary = ""                # default: no summary; Responses API: auto|concise|detailed
 
 [models.zai_glm]
 provider = "openai_chat_completions"
@@ -30,24 +41,26 @@ model    = "glm-5.3-flash"
 
 # Execution channels. The first one is the default; overridable via --channel.
 #
-# When user, auth, and known_hosts are ALL omitted, `host` is treated as an
+# When user, auth, and known_hosts are ALL unset/empty, `host` is treated as an
 # OpenSSH ~/.ssh/config alias: HostName, Port, User, and IdentityFile are
 # resolved from that file (IdentityFile is optional — if omitted, auth falls
 # back to the SSH agent), and known_hosts defaults to ~/.ssh/known_hosts.
 [[channels]]
-name = "sf"
-type = "ssh"
-host = "sf"
-port = 22
-#user = "ubuntu"
-#auth = { key_file = "~/.ssh/id_ed25519" }   # local path; tilde expanded locally
-#known_hosts = "~/.ssh/known_hosts"          # host-key verification (required)
-# insecure = false                            # explicit, warned opt-out only
-keep_alive = true          # true: sessions share one client; false: one client per session
-default_shell = "/bin/bash"
-remote_command = "/bin/bash"    # optional: run this command instead of default_shell,
-                           # e.g. to force a clean shell and bypass login shell/screen/tmux
-working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"   # remote template
+name = "sf"                 # required; no default
+type = "ssh"               # default
+host = "sf"                # required for SSH; no default
+port = 22                  # default
+user = ""                  # default: unset; SSH alias resolves it
+auth = { key_file = "", password = "" } # default: neither set; SSH alias resolves auth
+known_hosts = ""           # default: unset; SSH alias resolves ~/.ssh/known_hosts
+insecure = false           # default; true explicitly skips host-key verification
+keep_alive = true          # default; false creates one connection per session
+default_shell = "/bin/bash" # default
+remote_command = ""        # default: use default_shell; e.g. "/bin/bash" overrides it
+# working_dir is unset by default (no directory override).
+# working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}" # optional remote template
+# To configure SSH without an alias, set user, one auth value, and known_hosts.
+# Example: auth = { key_file = "~/.ssh/id_ed25519" } (local path; tilde expands)
 
 # A local channel runs commands on this machine. It needs no remote host,
 # user, key_file, password, or known_hosts. Point an agent at it with
@@ -59,10 +72,16 @@ default_shell = "/bin/bash"
 
 [agents.main]
 model = "zai_glm"     # required; validated at startup
-description = "General coordinator; delegates planning and operator tasks" # optional; shown by list_subagent_types
+# description = "" # default: empty; shown by list_subagent_types when provided
+description = "General coordinator; delegates planning and operator tasks"
 system_prompt = "prompts/main_pentester.md"
-channel = "sf"            # optional; default = first channel
-tools = "all"                 # "none" | "all" | ["list_subagent_types", "spawn_subagent", ...]
+# channel = "" # default: first channel; explicit "sf" is equivalent here
+channel = "sf"
+# working_dir is unset by default; an agent override takes precedence over its channel's.
+# working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"
+# tools = "none" # default; also accepts "all" or a tool-name list
+tools = "all"
+# allow_subagents = false # default
 allow_subagents = true
 
 [agents.planner]
@@ -81,10 +100,10 @@ channel = "sf"
 tools = ["execute_command"]
 allow_subagents = false
 
-[limits]
+[limits] # All values below are defaults.
 max_agent_depth = 2            # top-level = depth 0
 max_open_agents = 8            # counts every non-closed agent, including idle
-command_timeout = "120s"
+command_timeout = "30s"        # execution command timeout
 command_output_bytes = 262144  # raw stdout+stderr cap per command (bytes)
 tool_result_bytes = 65536      # max model-visible tool result (bytes)
 inbox_depth = 32               # per-agent interim-message queue
@@ -94,13 +113,14 @@ transcript_max_items = 200     # retained conversation items (0 = default)
 transcript_max_bytes = 1048576 # retained conversation content bytes (0 = default)
 
 [approval]
-mode = "ask"                   # "ask" | "allow-all"   (future: "approve-for-me")
+mode = "ask"                   # default; alternative: "allow-all"
 
-# Optional current-session HTTP API. Every value can be overridden with the
+# Optional current-session HTTP API. The values below are all defaults, so the
+# API stays disabled. Every value can be overridden with the
 # matching --api-* flag. AIHARN_API_TOKEN overrides token; prefer interpolation
 # or the environment variable instead of committing a literal secret.
 [api]
-# listen = "127.0.0.1:7331"
-# token = "${AIHARN_API_TOKEN}"
-# allow_origins = ["https://aiharn.example.com"]
-# only = false                    # true: run without the terminal UI
+listen = ""               # default: disabled; e.g. "127.0.0.1:7331"
+token = ""                # default; set a secret for non-loopback listening
+allow_origins = []        # default: no cross-origin frontend access
+only = false             # default: run the terminal UI; true requires listen
