@@ -13,12 +13,16 @@ import (
 // Message types bridging agent/gate/manager activity into the Bubbletea event
 // loop. They are unexported; Update switches on them.
 type (
-	agentEventMsg    struct{ ev agent.Event }
-	approvalReqMsg   struct{ req approval.Request }
-	turnDoneMsg      struct{ err error }
-	rosterMsg        struct{}
-	bridgeStoppedMsg struct{}
-	thinkingTickMsg  struct{}
+	agentEventMsg     struct{ ev agent.Event }
+	approvalReqMsg    struct{ req approval.Request }
+	turnDoneMsg       struct{ err error }
+	rosterMsg         struct{}
+	bridgeStoppedMsg  struct{}
+	thinkingTickMsg   struct{}
+	subagentClosedMsg struct {
+		id  string
+		err error
+	}
 )
 
 func tickThinking() tea.Cmd {

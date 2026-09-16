@@ -44,6 +44,7 @@ func styleLine(kind lineKind, s string) string {
 // and either the input line or an approval prompt.
 func (m *Model) View() string {
 	m.shellButtons = m.shellButtons[:0]
+	m.rosterHits = m.rosterHits[:0]
 	var b strings.Builder
 	b.WriteString(sanitizeTerminalLine(m.statusLine()))
 	b.WriteString("\n")
@@ -93,17 +94,38 @@ func (m *Model) transcriptAndSubagents(rows int) string {
 			tw = 20
 		}
 	}
-	left, click := m.transcriptRows(tw, rows)
+	rosterRows := rows
+	if !split && m.agent != nil {
+		rosterRows = 2 + len(m.subagents)
+		if rosterRows > rows {
+			rosterRows = rows
+		}
+	}
+	leftRows := rows
+	if !split {
+		leftRows -= rosterRows
+	}
+	left, click := m.transcriptRows(tw, leftRows)
 	m.clickRows = click
 	m.clickWidth = tw
 
-	right := m.subagentBlock(rows)
+	rosterX := 0
+	rosterWidth := tw
+	if split {
+		rosterX, rosterWidth = tw, subWidth
+	}
+	right := m.renderRoster(rosterRows, rosterX, rosterWidth)
 	if split {
 		l := lipgloss.NewStyle().Width(tw).Render(strings.Join(left, "\n"))
 		r := lipgloss.NewStyle().Width(subWidth).Render(right)
 		return fill(lipgloss.JoinHorizontal(lipgloss.Top, l, r), rows)
 	}
-	return fill(strings.Join(left, "\n")+"\n"+right, rows)
+	emptyClicks := make([]int, rosterRows)
+	for i := range emptyClicks {
+		emptyClicks[i] = -1
+	}
+	m.clickRows = append(emptyClicks, click...)
+	return fill(right+"\n"+strings.Join(left, "\n"), rows)
 }
 
 // transcriptRows returns the wrapped transcript as visual rows, bottom-pinned to
@@ -178,18 +200,6 @@ func fill(s string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// subagentBlock returns up to rows subagent status lines under a header.
-func (m *Model) subagentBlock(rows int) string {
-	lines := []string{fmt.Sprintf("subagents (%d)", len(m.subagents))}
-	for _, s := range m.subagents {
-		lines = append(lines, sanitizeTerminalLine(fmt.Sprintf("%s %s", s.ID, s.State)))
-	}
-	if rows > 0 && len(lines) > rows {
-		lines = lines[:rows]
-	}
-	return strings.Join(lines, "\n")
-}
-
 func (m *Model) statusLine() string {
 	approval := m.status.Approval
 	if m.gate != nil {
@@ -199,8 +209,9 @@ func (m *Model) statusLine() string {
 	if m.showReasoning {
 		reasoningDisplay = "shown"
 	}
-	return fmt.Sprintf("model %s · agent %s · channel %s · approval %s · thinking %s",
-		m.status.Model, m.status.AgentType, m.status.Channel, approval, reasoningDisplay)
+	focus := m.focusedID
+	return fmt.Sprintf("model %s · agent %s · view %s · channel %s · approval %s · thinking %s",
+		m.status.Model, m.status.AgentType, focus, m.status.Channel, approval, reasoningDisplay)
 }
 
 // wrapLine hard-wraps s into visual rows no wider than width grapheme columns,

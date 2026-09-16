@@ -43,12 +43,13 @@ func (d *Duration) UnmarshalTOML(v interface{}) error {
 
 // Config is the fully materialized configuration.
 type Config struct {
-	Models   map[string]ModelConfig
-	Channels []ChannelConfig
-	Agents   map[string]AgentConfig
-	Limits   LimitsConfig
-	Approval ApprovalConfig
-	API      APIConfig
+	AiharnHome string `toml:"aiharn_home"` // local data directory; default is the user's home directory
+	Models     map[string]ModelConfig
+	Channels   []ChannelConfig
+	Agents     map[string]AgentConfig
+	Limits     LimitsConfig
+	Approval   ApprovalConfig
+	API        APIConfig
 }
 
 // ModelConfig is a named model/API configuration referenced by agents.
@@ -102,6 +103,7 @@ func (c ChannelConfig) IsSSHConfigAlias() bool {
 // AgentConfig is a configured agent type.
 type AgentConfig struct {
 	Model          string              `toml:"model"`
+	Description    string              `toml:"description"`
 	SystemPrompt   string              `toml:"system_prompt"`
 	Channel        string              `toml:"channel"` // "" = first channel
 	WorkingDir     *WorkingDirTemplate `toml:"working_dir"`

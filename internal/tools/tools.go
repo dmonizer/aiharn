@@ -26,6 +26,7 @@ const (
 func Names() []string {
 	return []string{
 		NameExecuteCommand,
+		NameListSubagentTypes,
 		NameSpawnSubagent,
 		NameSendSubagentMessage,
 		NameCheckSubagent,

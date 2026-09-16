@@ -53,7 +53,7 @@ type line struct {
 // Model is the Bubbletea root model.
 type Model struct {
 	manager *agent.Manager
-	agent   *agent.Agent // the focused (top-level) agent
+	agent   *agent.Agent // top-level agent; focusedID selects the displayed context
 	gate    *approval.Gate
 	status  Status
 
@@ -68,7 +68,12 @@ type Model struct {
 
 	lastEsc time.Time // when a first ESC press armed the clear, zero if none
 
-	subagents []tools.SubagentStatus // current roster snapshot
+	subagents      []tools.SubagentStatus // current roster snapshot
+	focusedID      string                 // root or the subagent currently shown in the chat/shell panes
+	views          map[string]agentView
+	bridged        map[string]bool
+	rosterHits     []rosterHit
+	hoverX, hoverY int
 
 	pending            *approval.Request   // active approval modal, nil when none
 	approvals          []approval.Request  // additional requests waiting behind the modal
@@ -121,6 +126,13 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 		ctx:      ctx,
 		cancel:   cancel,
 		inputMax: defaultInputHeight,
+		views:    make(map[string]agentView),
+		bridged:  make(map[string]bool),
+		hoverX:   -1,
+		hoverY:   -1,
+	}
+	if top != nil {
+		m.focusedID = top.ID()
 	}
 	m.textarea = newTextarea()
 	m.textarea.Focus()
@@ -136,7 +148,7 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 
 // Init starts the agent-event, approval, and roster bridges.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager), m.textarea.Focus())
+	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager), m.startSubagentBridges(), m.textarea.Focus())
 }
 
 // refreshSubagents re-reads the subagent roster from the manager.

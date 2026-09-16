@@ -105,6 +105,51 @@ func TestTurnForwardsReasoningConfigurationAndEvents(t *testing.T) {
 	}
 }
 
+type activitySpy struct {
+	mu     sync.Mutex
+	events []agent.Event
+}
+
+func (*activitySpy) ObserveHistory(string, string, []llm.Item) {}
+func (s *activitySpy) ObserveEvent(id, typ string, event agent.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id == "a1" && typ == "main" {
+		s.events = append(s.events, event)
+	}
+}
+
+func TestTurnRecordsLiveStreamEvenWithoutUIConsumer(t *testing.T) {
+	spy := &activitySpy{}
+	a := agent.New(agent.Spec{ID: "a1", Type: "main", Model: "m", Observer: spy,
+		Client: &testllm.FakeClient{Script: [][]llm.Event{{
+			{Type: llm.EventReasoningDelta, Text: "consider"},
+			{Type: llm.EventTextDelta, Text: "partial"},
+			{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "partial"}}},
+		}}},
+	})
+	if err := a.Turn(context.Background(), "question"); err != nil {
+		t.Fatal(err)
+	}
+	spy.mu.Lock()
+	defer spy.mu.Unlock()
+	var user, reasoning, text bool
+	for _, ev := range spy.events {
+		if ev.Type == agent.EventUser && ev.Text == "question" {
+			user = true
+		}
+		if ev.Type == agent.EventReasoningDelta && ev.Text == "consider" {
+			reasoning = true
+		}
+		if ev.Type == agent.EventText && ev.Text == "partial" {
+			text = true
+		}
+	}
+	if !user || !reasoning || !text {
+		t.Fatalf("observed events = %+v", spy.events)
+	}
+}
+
 func TestTurnToolCall(t *testing.T) {
 	client := &testllm.FakeClient{
 		Script: [][]llm.Event{

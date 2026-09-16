@@ -37,6 +37,13 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: resolve base dir: %w", err)
 	}
+	if cfg.AiharnHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("config: resolve user home directory for aiharn_home: %w", err)
+		}
+		cfg.AiharnHome = home
+	}
 	resolvePaths(&cfg, baseDir)
 	applyDefaults(&cfg)
 

@@ -15,12 +15,14 @@ import (
 
 // fakeBackend records subagent operations and returns configurable results.
 type fakeBackend struct {
-	spawnID string
-	spawnErr error
+	spawnID    string
+	spawnErr   error
+	catalog    tools.SubagentCatalog
+	catalogErr error
 
 	sendErr error
 
-	status tools.SubagentStatus
+	status   tools.SubagentStatus
 	checkErr error
 
 	list    []tools.SubagentStatus
@@ -28,17 +30,25 @@ type fakeBackend struct {
 
 	closeErr error
 
-	mu          sync.Mutex
-	spawnCall   []spawnCall
-	sendCalls   []sendCall
-	checkCalls  []checkCall
-	listCalls   int
-	closeCalls  []string
+	mu           sync.Mutex
+	spawnCall    []spawnCall
+	sendCalls    []sendCall
+	checkCalls   []checkCall
+	listCalls    int
+	closeCalls   []string
+	catalogCalls []string
 }
 
 type spawnCall struct{ callerID, agentType, prompt string }
 type sendCall struct{ callerID, subagentID, message string }
 type checkCall struct{ callerID, subagentID string }
+
+func (f *fakeBackend) ListSubagentTypes(ctx context.Context, callerID string) (tools.SubagentCatalog, error) {
+	f.mu.Lock()
+	f.catalogCalls = append(f.catalogCalls, callerID)
+	f.mu.Unlock()
+	return f.catalog, f.catalogErr
+}
 
 func (f *fakeBackend) SpawnSubagent(ctx context.Context, callerID, agentType, prompt string) (string, error) {
 	f.mu.Lock()
@@ -176,13 +186,14 @@ func TestSpawnSubagentAskDenied(t *testing.T) {
 	}
 }
 
-// TestSubagentToolsExemptFromApproval asserts that send/check/list/close never
+// TestSubagentToolsExemptFromApproval asserts that discovery/send/check/list/close never
 // consult the gate, even in Ask mode: they return synchronously with no pending
 // request.
 func TestSubagentToolsExemptFromApproval(t *testing.T) {
 	backend := &fakeBackend{
-		status: tools.SubagentStatus{ID: "coder-1", Type: "coder", State: "idle", Depth: 1, Tail: "done"},
-		list:   []tools.SubagentStatus{{ID: "coder-1", Type: "coder", State: "idle", Depth: 1}},
+		catalog: tools.SubagentCatalog{Types: []tools.SubagentType{{Name: "coder", Description: "Implement changes", Model: "gpt", Channel: "local"}}, CanSpawn: true, MaxDepth: 2, MaxOpenAgents: 8, ActiveAgents: 1},
+		status:  tools.SubagentStatus{ID: "coder-1", Type: "coder", State: "idle", Depth: 1, Tail: "done"},
+		list:    []tools.SubagentStatus{{ID: "coder-1", Type: "coder", State: "idle", Depth: 1}},
 	}
 	gate := approval.NewGate(approval.ModeAsk)
 
@@ -192,6 +203,7 @@ func TestSubagentToolsExemptFromApproval(t *testing.T) {
 		args string
 		want string
 	}{
+		{tools.NameListSubagentTypes, tools.ListSubagentTypes(backend, "caller-1", true), `{}`, "name=coder model=gpt channel=local allow_subagents=false description=Implement changes"},
 		{tools.NameSendSubagentMessage, tools.SendSubagentMessage(backend, "caller-1"), `{"subagent_id":"coder-1","message":"go"}`, "message sent to coder-1"},
 		{tools.NameCheckSubagent, tools.CheckSubagent(backend, "caller-1"), `{"subagent_id":"coder-1"}`, "id=coder-1 type=coder state=idle depth=1"},
 		{tools.NameListSubagents, tools.ListSubagents(backend, "caller-1"), `{}`, "- id=coder-1 type=coder state=idle depth=1"},
@@ -213,6 +225,46 @@ func TestSubagentToolsExemptFromApproval(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestListSubagentTypesReportsLiveConstraintsAndErrors(t *testing.T) {
+	backend := &fakeBackend{catalog: tools.SubagentCatalog{
+		Types:       []tools.SubagentType{{Name: "operator", Model: "m", Channel: "local", AllowSubagents: false}},
+		CallerDepth: 2, MaxDepth: 2, ActiveAgents: 8, MaxOpenAgents: 8,
+		BlockedReasons: []string{"maximum agent depth reached", "maximum open agents reached"},
+	}}
+	r := newRegistry(t, tools.ListSubagentTypes(backend, "planner-1", true))
+	out, err := r.Run(context.Background(), tools.NameListSubagentTypes, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"name=operator", "caller_depth=2 max_depth=2", "active_agents=8 max_open_agents=8 slots_remaining=0", "spawn_available=false", "maximum agent depth reached", "maximum open agents reached"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("catalog %q missing %q", out, want)
+		}
+	}
+	if len(backend.catalogCalls) != 1 || backend.catalogCalls[0] != "planner-1" {
+		t.Fatalf("catalog callers = %v", backend.catalogCalls)
+	}
+	if _, err := r.Run(context.Background(), tools.NameListSubagentTypes, json.RawMessage(`{"unexpected":true}`)); err == nil {
+		t.Fatal("unexpected argument should fail validation")
+	}
+	backend.catalogErr = errors.New("manager closed")
+	if _, err := r.Run(context.Background(), tools.NameListSubagentTypes, json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "manager closed") {
+		t.Fatalf("manager error = %v", err)
+	}
+}
+
+func TestListSubagentTypesReportsDisabledSpawnTool(t *testing.T) {
+	backend := &fakeBackend{catalog: tools.SubagentCatalog{
+		Types:    []tools.SubagentType{{Name: "coder", Model: "m", Channel: "local"}},
+		CanSpawn: true, MaxDepth: 2, MaxOpenAgents: 8, ActiveAgents: 1,
+	}}
+	r := newRegistry(t, tools.ListSubagentTypes(backend, "main", false))
+	out, err := r.Run(context.Background(), tools.NameListSubagentTypes, json.RawMessage(`{}`))
+	if err != nil || !strings.Contains(out, "spawn_available=false reason=spawn_subagent tool is not enabled for caller") {
+		t.Fatalf("catalog = %q, %v", out, err)
 	}
 }
 

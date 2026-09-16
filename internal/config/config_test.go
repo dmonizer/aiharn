@@ -71,6 +71,13 @@ func TestLoadValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := home; cfg.AiharnHome != want {
+		t.Fatalf("AiharnHome = %q, want default %q", cfg.AiharnHome, want)
+	}
 
 	// Env interpolation.
 	if got := cfg.Models["opus_via_openrouter"].APIKey; got != "sk-test-123" {
@@ -117,6 +124,55 @@ func TestLoadValid(t *testing.T) {
 
 	if err := Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}}); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestLoadAiharnHomeOverride(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	for _, tc := range []struct {
+		name, setting string
+		want          func(string) string
+	}{
+		{"relative", `aiharn_home = "state"`, func(path string) string { return filepath.Join(filepath.Dir(path), "state") }},
+		{"absolute from environment", `aiharn_home = "${AIHARN_TEST_HOME}"`, func(string) string { return filepath.Join(t.TempDir(), "absolute") }},
+		{"tilde", `aiharn_home = "~/.aiharn-test"`, func(string) string { home, _ := os.UserHomeDir(); return filepath.Join(home, ".aiharn-test") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.setting + "\n" + validConfig
+			path := setup(t, body)
+			want := tc.want(path)
+			if tc.name == "absolute from environment" {
+				t.Setenv("AIHARN_TEST_HOME", want)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AiharnHome != want {
+				t.Fatalf("AiharnHome = %q, want %q", cfg.AiharnHome, want)
+			}
+		})
+	}
+}
+
+func TestLoadAiharnHomeMissingEnvironmentVariable(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	path := setup(t, `aiharn_home = "${AIHARN_TEST_MISSING}"`+"\n"+validConfig)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "aiharn_home") || !strings.Contains(err.Error(), "AIHARN_TEST_MISSING") {
+		t.Fatalf("Load error = %v", err)
+	}
+}
+
+func TestLoadAgentDescription(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	body := strings.Replace(validConfig, "[agents.planner]\n", "[agents.planner]\ndescription = \"Plans and delegates scoped work\"\n", 1)
+	cfg, err := Load(setup(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Agents["planner"].Description; got != "Plans and delegates scoped work" {
+		t.Fatalf("description = %q", got)
 	}
 }
 

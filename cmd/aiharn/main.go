@@ -44,7 +44,7 @@ func run(args []string) int {
 		approval   = fs.String("approval", "", "override approval mode (ask | allow-all)")
 		showVer    = fs.Bool("version", false, "print version and exit")
 		debug      = fs.Bool("debug", false, "enable debug logging to stderr")
-		logPath    = fs.String("log", "aiharn.log.jsonl", "path to the conversation log (JSON Lines); empty disables logging")
+		logPath    = fs.String("log", "", "override the session transcript path (JSON Lines); empty disables logging")
 		apiListen  = fs.String("api-listen", "", "serve the current-session API on this address (for example 127.0.0.1:7331)")
 		apiToken   = fs.String("api-token", "", "API bearer token (prefer AIHARN_API_TOKEN)")
 		apiOrigins = fs.String("api-allow-origin", "", "comma-separated frontend origins allowed by CORS")
@@ -106,13 +106,12 @@ func run(args []string) int {
 		return 1
 	}
 
-	var rec *recorder.Recorder
-	if *logPath != "" {
-		rec, err = recorder.NewFile(*logPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "aiharn: open conversation log: %v\n", err)
-			return 1
-		}
+	rec, err := openRecorder(cfg.AiharnHome, *logPath, specified["log"])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aiharn: open session transcript: %v\n", err)
+		return 1
+	}
+	if rec != nil {
 		defer rec.Close()
 	}
 
@@ -180,6 +179,17 @@ func run(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func openRecorder(aiharnHome, logPath string, logOverridden bool) (*recorder.Recorder, error) {
+	if logOverridden {
+		if logPath == "" {
+			return nil, nil
+		}
+		return recorder.NewFile(logPath)
+	}
+	rec, _, err := recorder.NewSessionFile(aiharnHome)
+	return rec, err
 }
 
 func toolSet(names []string) map[string]bool {

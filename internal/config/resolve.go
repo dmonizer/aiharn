@@ -41,6 +41,7 @@ func resolveLocalPath(baseDir, p string) string {
 // resolvePaths rewrites local file paths in place so they are absolute and
 // independent of the process working directory.
 func resolvePaths(cfg *Config, baseDir string) {
+	cfg.AiharnHome = resolveLocalPath(baseDir, cfg.AiharnHome)
 	for i := range cfg.Channels {
 		c := &cfg.Channels[i]
 		c.Auth.KeyFile = resolveLocalPath(baseDir, c.Auth.KeyFile)

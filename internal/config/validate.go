@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -43,6 +44,9 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		return fmt.Errorf("config: validation failed:\n  - config is nil")
 	}
 	var errs []string
+	if cfg.AiharnHome == "" || !filepath.IsAbs(cfg.AiharnHome) {
+		errs = append(errs, "aiharn_home must resolve to an absolute local directory")
+	}
 	providers := opts.providers()
 	channelTypes := opts.channelTypes()
 

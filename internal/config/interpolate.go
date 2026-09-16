@@ -38,6 +38,11 @@ func interpolateEnv(s string, lookup func(string) (string, bool)) (string, error
 // templates are NOT interpolated here (their ${...} are runtime placeholders).
 func interpolate(cfg *Config) error {
 	lookup := func(name string) (string, bool) { return os.LookupEnv(name) }
+	if v, err := interpolateEnv(cfg.AiharnHome, lookup); err != nil {
+		return fmt.Errorf("aiharn_home: %w", err)
+	} else {
+		cfg.AiharnHome = v
+	}
 
 	for name, m := range cfg.Models {
 		if v, err := interpolateEnv(m.BaseURL, lookup); err != nil {

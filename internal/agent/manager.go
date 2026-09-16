@@ -32,6 +32,7 @@ type ManagerOptions struct {
 	MaxAgents     int
 	InboxCapacity int
 	EventCapacity int
+	SubagentTypes []tools.SubagentType
 	Builder       Builder
 }
 
@@ -54,16 +55,17 @@ var (
 // unique ids, enforces the spawn limits (allow_subagents, depth, open count),
 // routes messages, and provides idempotent shutdown.
 type Manager struct {
-	mu        sync.Mutex
-	agents    map[string]*Agent
-	seq       int
-	building  int // in-flight spawns, counted against the open limit
-	maxDepth  int
-	maxAgents int
-	inboxCap  int
-	eventCap  int
-	builder   Builder
-	closed    bool
+	mu         sync.Mutex
+	agents     map[string]*Agent
+	seq        int
+	building   int // in-flight spawns, counted against the open limit
+	maxDepth   int
+	maxAgents  int
+	inboxCap   int
+	eventCap   int
+	agentTypes []tools.SubagentType
+	builder    Builder
+	closed     bool
 
 	wg           sync.WaitGroup
 	shutdownOnce sync.Once
@@ -86,16 +88,63 @@ func NewManager(opts ManagerOptions) *Manager {
 	if opts.EventCapacity <= 0 {
 		opts.EventCapacity = 256
 	}
+	types := append([]tools.SubagentType(nil), opts.SubagentTypes...)
+	sort.Slice(types, func(i, j int) bool { return types[i].Name < types[j].Name })
 	return &Manager{
 		agents:       map[string]*Agent{},
 		maxDepth:     opts.MaxDepth,
 		maxAgents:    opts.MaxAgents,
 		inboxCap:     opts.InboxCapacity,
 		eventCap:     opts.EventCapacity,
+		agentTypes:   types,
 		builder:      opts.Builder,
 		shutdownDone: make(chan struct{}),
 		roster:       make(chan struct{}, 1),
 	}
+}
+
+// ListSubagentTypes implements tools.SubagentBackend. It returns the configured
+// spawn targets plus a live snapshot of the same constraints SpawnSubagent
+// enforces. The snapshot is advisory; SpawnSubagent rechecks under the lock.
+func (m *Manager) ListSubagentTypes(ctx context.Context, callerID string) (tools.SubagentCatalog, error) {
+	if err := ctx.Err(); err != nil {
+		return tools.SubagentCatalog{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return tools.SubagentCatalog{}, ErrClosed
+	}
+	caller := m.agents[callerID]
+	if caller == nil {
+		return tools.SubagentCatalog{}, ErrCallerNotFound
+	}
+	if !isOpen(caller) {
+		return tools.SubagentCatalog{}, ErrCallerUnavailable
+	}
+
+	active := m.openCountLocked() + m.building
+	catalog := tools.SubagentCatalog{
+		Types:         append([]tools.SubagentType(nil), m.agentTypes...),
+		CallerDepth:   caller.Depth(),
+		MaxDepth:      m.maxDepth,
+		ActiveAgents:  active,
+		MaxOpenAgents: m.maxAgents,
+	}
+	if !caller.AllowSubagents() {
+		catalog.BlockedReasons = append(catalog.BlockedReasons, "caller has allow_subagents=false")
+	}
+	if caller.Depth()+1 > m.maxDepth {
+		catalog.BlockedReasons = append(catalog.BlockedReasons, "maximum agent depth reached")
+	}
+	if active >= m.maxAgents {
+		catalog.BlockedReasons = append(catalog.BlockedReasons, "maximum open agents reached")
+	}
+	catalog.CanSpawn = len(catalog.Types) > 0 && len(catalog.BlockedReasons) == 0
+	if len(catalog.Types) == 0 {
+		catalog.BlockedReasons = append(catalog.BlockedReasons, "no subagent types are configured")
+	}
+	return catalog, nil
 }
 
 // RegisterTop registers the top-level agent (depth 0). It installs the agent's
@@ -258,7 +307,9 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, prompt
 	m.mu.Unlock()
 
 	m.notify()
-	sub.Send(prompt)
+	if sub.Send(prompt) {
+		sub.emit(Event{Type: EventTaskQueued, Text: prompt})
+	}
 	return id, nil
 }
 
@@ -303,6 +354,7 @@ func (m *Manager) SendSubagentMessage(ctx context.Context, callerID, subagentID,
 	if !sub.Send(message) {
 		return ErrInboxFull
 	}
+	sub.emit(Event{Type: EventTaskQueued, Text: message})
 	return nil
 }
 
@@ -499,11 +551,12 @@ func (m *Manager) descendantsLocked(rootID string) []*Agent {
 
 func statusOf(a *Agent) tools.SubagentStatus {
 	return tools.SubagentStatus{
-		ID:    a.ID(),
-		Type:  a.Type(),
-		State: a.State().String(),
-		Depth: a.Depth(),
-		Tail:  a.lastAssistant(),
+		ID:     a.ID(),
+		Type:   a.Type(),
+		State:  a.State().String(),
+		Depth:  a.Depth(),
+		Tail:   a.lastAssistant(),
+		Paused: a.Paused(),
 	}
 }
 

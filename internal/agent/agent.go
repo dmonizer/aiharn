@@ -52,8 +52,11 @@ type EventType int
 
 const (
 	EventText EventType = iota
+	EventUser
 	EventReasoningStart
 	EventReasoningDelta
+	EventTaskQueued
+	EventPause
 	EventToolCall
 	EventToolResult
 	EventState
@@ -74,6 +77,12 @@ type Event struct {
 // implements it to persist a full, untrimmed conversation.
 type HistoryObserver interface {
 	ObserveHistory(agentID, agentType string, items []llm.Item)
+}
+
+// ActivityObserver optionally records live events, including partial output
+// that may never reach completed history when a request is interrupted.
+type ActivityObserver interface {
+	ObserveEvent(agentID, agentType string, event Event)
 }
 
 // Spec is the resolved, immutable configuration for one agent instance.
@@ -139,6 +148,10 @@ type Agent struct {
 	events  chan Event
 
 	inbox chan string
+	// Pause holds queued tasks at turn boundaries. In-flight work is allowed to
+	// complete, avoiding duplicate commands or provider requests on resume.
+	paused bool
+	resume chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -357,6 +370,7 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 
 	a.setState(StateRunning)
 	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input})
+	a.emit(Event{Type: EventUser, Text: input})
 	a.trimHistory()
 
 	for round := 0; round < a.maxToolRounds; round++ {
@@ -429,8 +443,14 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 // caller decides when to close it.
 func (a *Agent) run(ctx context.Context) {
 	for {
+		if !a.waitUnpaused(ctx) {
+			return
+		}
 		select {
 		case task := <-a.inbox:
+			if !a.waitUnpaused(ctx) {
+				return
+			}
 			if err := a.turn(ctx, task); err != nil {
 				// A user interrupt cancels one task, not the reusable subagent's
 				// lifecycle. Keep its run loop alive for future messages.
@@ -450,6 +470,46 @@ func (a *Agent) run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (a *Agent) waitUnpaused(ctx context.Context) bool {
+	for {
+		a.mu.Lock()
+		paused, resume := a.paused, a.resume
+		a.mu.Unlock()
+		if !paused {
+			return ctx.Err() == nil
+		}
+		select {
+		case <-resume:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// setPaused controls scheduling of future subagent tasks. It deliberately does
+// not interrupt an in-flight turn, which might already have produced side effects.
+func (a *Agent) setPaused(paused bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.paused == paused {
+		return
+	}
+	a.paused = paused
+	if paused {
+		a.resume = make(chan struct{})
+	} else {
+		close(a.resume)
+		a.resume = nil
+	}
+}
+
+// Paused reports whether new subagent tasks are held at a turn boundary.
+func (a *Agent) Paused() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.paused
 }
 
 // cancelWork cancels the current turn and optionally discards queued inbox
@@ -774,6 +834,9 @@ func (a *Agent) setState(s State) {
 
 func (a *Agent) emit(e Event) {
 	e.AgentID = a.id
+	if observer, ok := a.observer.(ActivityObserver); ok {
+		observer.ObserveEvent(a.id, a.typ, e)
+	}
 	select {
 	case a.events <- e:
 	default:

@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"aiharn/internal/agent"
 	"aiharn/internal/llm"
 )
 
@@ -23,8 +25,8 @@ type Meta struct {
 	Approval  string
 }
 
-// Entry is one NDJSON line. Type discriminates the record kind:
-// "session", "user", "assistant", "system", "tool_call", or "tool_result".
+// Entry is one NDJSON line. Type discriminates completed history items from
+// streamed deltas, full tool output and agent lifecycle/task events.
 type Entry struct {
 	Time      time.Time       `json:"time"`
 	Type      string          `json:"type"`
@@ -67,6 +69,25 @@ func NewFile(path string) (*Recorder, error) {
 	return r, nil
 }
 
+// NewSessionFile creates a new, private transcript below
+// <aiharn_home>/transcripts. UTC nanoseconds in the filename and O_EXCL prevent
+// a new session from overwriting an earlier transcript.
+func NewSessionFile(aiharnHome string) (*Recorder, string, error) {
+	dir := filepath.Join(aiharnHome, "transcripts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, "", err
+	}
+	name := time.Now().UTC().Format("2006-01-02T15-04-05.000000000Z") + ".jsonl"
+	path := filepath.Join(dir, name)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, "", err
+	}
+	r := New(f)
+	r.closer = f
+	return r, path, nil
+}
+
 // SetSession records the session description used in the header line. Call it
 // before the first ObserveHistory so the header includes the metadata.
 func (r *Recorder) SetSession(m Meta) {
@@ -83,6 +104,35 @@ func (r *Recorder) ObserveHistory(agentID, agentType string, items []llm.Item) {
 	for _, it := range items {
 		r.enc.Encode(entryFromItem(agentID, agentType, it))
 	}
+}
+
+// ObserveEvent records streaming activity independently of the completed
+// history. In particular, tool_output_full is the actual UI-visible result,
+// even when the result subsequently passed to the model is truncated.
+func (r *Recorder) ObserveEvent(agentID, agentType string, event agent.Event) {
+	e := Entry{Time: time.Now(), AgentID: agentID, AgentType: agentType}
+	switch event.Type {
+	case agent.EventText:
+		e.Type, e.Content = "text_delta", event.Text
+	case agent.EventReasoningStart:
+		e.Type = "reasoning_start"
+	case agent.EventReasoningDelta:
+		e.Type, e.Content = "reasoning_delta", event.Text
+	case agent.EventTaskQueued:
+		e.Type, e.Content = "task_queued", event.Text
+	case agent.EventPause:
+		e.Type, e.Content = "pause", event.Text
+	case agent.EventToolResult:
+		e.Type, e.Content, e.CallID, e.Name = "tool_output_full", event.Text, event.Call.CallID, event.Call.Name
+	case agent.EventState:
+		e.Type, e.Content = "state", event.State.String()
+	default:
+		return // user messages and tool calls are already in completed history
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ensureHeaderLocked()
+	r.enc.Encode(e)
 }
 
 // Close closes the underlying file, if any. It is idempotent.

@@ -3,9 +3,13 @@ package recorder
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"aiharn/internal/agent"
 	"aiharn/internal/llm"
 )
 
@@ -102,6 +106,32 @@ func TestRecorderTagsAgent(t *testing.T) {
 	}
 }
 
+func TestRecorderSeparatesSubagentStreamAndFullToolOutput(t *testing.T) {
+	var buf bytes.Buffer
+	r := New(&buf)
+	r.ObserveHistory("main", "main", []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "start"}})
+	r.ObserveEvent("coder-1", "coder", agent.Event{Type: agent.EventTaskQueued, Text: "task"})
+	r.ObserveEvent("coder-1", "coder", agent.Event{Type: agent.EventPause, Text: "paused"})
+	r.ObserveHistory("coder-1", "coder", []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "task"}})
+	r.ObserveEvent("coder-1", "coder", agent.Event{Type: agent.EventReasoningDelta, Text: "considering"})
+	r.ObserveEvent("coder-1", "coder", agent.Event{Type: agent.EventText, Text: "partial answer"})
+	r.ObserveEvent("coder-1", "coder", agent.Event{Type: agent.EventToolResult, Text: "the complete output", Call: llm.Item{CallID: "c1", Name: "execute_command"}})
+	r.ObserveHistory("coder-1", "coder", []llm.Item{{Type: llm.ItemFunctionCallOutput, CallID: "c1", Content: "the complete [truncated]"}})
+	lines := decodeLines(t, buf.Bytes())
+	if len(lines) != 9 {
+		t.Fatalf("entries = %+v", lines)
+	}
+	for i, typ := range []string{"task_queued", "pause", "user", "reasoning_delta", "text_delta", "tool_output_full", "tool_result"} {
+		entry := lines[i+2]
+		if entry["agent_id"] != "coder-1" || entry["agent_type"] != "coder" || entry["type"] != typ {
+			t.Fatalf("entry %d = %#v, want coder-1/%s", i+2, entry, typ)
+		}
+	}
+	if lines[7]["content"] != "the complete output" || lines[7]["call_id"] != "c1" {
+		t.Fatalf("full output missing: %#v", lines[7])
+	}
+}
+
 func TestRecorderInvalidArgsFallsBackToString(t *testing.T) {
 	var buf bytes.Buffer
 	r := New(&buf)
@@ -121,5 +151,53 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 	if err := r.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestNewSessionFileCreatesPrivateTimestampedTranscripts(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "aiharn-home")
+	first, firstPath, err := NewSessionFile(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	if got, want := filepath.Dir(firstPath), filepath.Join(home, "transcripts"); got != want {
+		t.Fatalf("transcript directory = %q, want %q", got, want)
+	}
+	if !regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{9}Z\.jsonl$`).MatchString(filepath.Base(firstPath)) {
+		t.Fatalf("transcript filename is not timestamped: %q", firstPath)
+	}
+	info, err := os.Stat(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("transcript permissions = %o, want 600", got)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(firstPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("transcript directory permissions = %o, want 700", got)
+	}
+	first.ObserveHistory("main", "main", []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "first session"}})
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, secondPath, err := NewSessionFile(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if firstPath == secondPath {
+		t.Fatalf("two sessions shared transcript path %q", firstPath)
+	}
+	data, err := os.ReadFile(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "first session") {
+		t.Fatalf("first transcript was lost: %q", data)
 	}
 }

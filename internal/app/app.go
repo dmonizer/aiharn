@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -137,6 +139,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		MaxAgents:     cfg.Limits.MaxOpenAgents,
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
+		SubagentTypes: configuredSubagentTypes(cfg),
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
 			return buildAgent(ctx, cfg, tc, mgr, gate, spec, agentOverrides{}, observer)
 		},
@@ -447,8 +450,10 @@ func buildGate(mode string) (*approval.Gate, error) {
 // execute_command falls back to when the model omits one.
 func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID string) (*tools.Registry, error) {
 	reg := tools.New()
+	spawnToolEnabled := sel.Mode == config.ToolModeAll || (sel.Mode == config.ToolModeList && slices.Contains(sel.Names, tools.NameSpawnSubagent))
 	all := map[string]tools.Tool{
 		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd, commandTimeout),
+		tools.NameListSubagentTypes:   tools.ListSubagentTypes(backend, callerID, spawnToolEnabled),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),
 		tools.NameCheckSubagent:       tools.CheckSubagent(backend, callerID),
@@ -481,6 +486,25 @@ func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int
 		return nil, fmt.Errorf("app: invalid tool selection mode %q", sel.Mode)
 	}
 	return reg, nil
+}
+
+func configuredSubagentTypes(cfg *config.Config) []tools.SubagentType {
+	types := make([]tools.SubagentType, 0, len(cfg.Agents))
+	for name, agentCfg := range cfg.Agents {
+		channel := agentCfg.Channel
+		if channel == "" && len(cfg.Channels) > 0 {
+			channel = cfg.Channels[0].Name
+		}
+		types = append(types, tools.SubagentType{
+			Name:           name,
+			Description:    agentCfg.Description,
+			Model:          agentCfg.Model,
+			Channel:        channel,
+			AllowSubagents: agentCfg.AllowSubagents,
+		})
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i].Name < types[j].Name })
+	return types
 }
 
 func readSystemPrompt(configPath, overridePath string) (string, error) {

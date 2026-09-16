@@ -11,6 +11,7 @@ import (
 	"aiharn/internal/agent"
 	"aiharn/internal/llm"
 	testllm "aiharn/internal/testutil/llm"
+	"aiharn/internal/tools"
 )
 
 // finalTurn is a script entry producing one completed assistant message.
@@ -110,6 +111,69 @@ func TestTopLevelDepthZero(t *testing.T) {
 	}
 	if got := mgr.Agent("main").Depth(); got != 0 {
 		t.Fatalf("top-level depth = %d, want 0", got)
+	}
+}
+
+func TestListSubagentTypesCatalogAndSpawnConstraints(t *testing.T) {
+	manager := agent.NewManager(agent.ManagerOptions{
+		MaxDepth: 1, MaxAgents: 2,
+		SubagentTypes: []tools.SubagentType{
+			{Name: "operator", Model: "quick", Channel: "local"},
+			{Name: "coder", Description: "Code changes", Model: "reasoner", Channel: "ssh", AllowSubagents: true},
+		},
+		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
+			return agent.New(agent.Spec{
+				ID: spec.ID, Type: spec.Type, Depth: spec.Depth, CallerID: spec.CallerID,
+				AllowSubagents: true, Client: blockingClient{},
+			}), nil
+		},
+	})
+	t.Cleanup(func() { _ = manager.Shutdown() })
+	if err := manager.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	rootCatalog, err := manager.ListSubagentTypes(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rootCatalog.CanSpawn || rootCatalog.CallerDepth != 0 || rootCatalog.ActiveAgents != 1 ||
+		len(rootCatalog.Types) != 2 || rootCatalog.Types[0].Name != "coder" || rootCatalog.Types[1].Name != "operator" {
+		t.Fatalf("root catalog = %+v", rootCatalog)
+	}
+	rootCatalog.Types[0].Name = "modified"
+	again, err := manager.ListSubagentTypes(ctx, "main")
+	if err != nil || again.Types[0].Name != "coder" {
+		t.Fatalf("manager catalog mutated: %+v, %v", again, err)
+	}
+
+	childID, err := manager.SpawnSubagent(ctx, "main", "coder", "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	childCatalog, err := manager.ListSubagentTypes(ctx, childID)
+	if err != nil || childCatalog.CanSpawn || childCatalog.CallerDepth != 1 || childCatalog.ActiveAgents != 2 ||
+		len(childCatalog.BlockedReasons) != 2 {
+		t.Fatalf("child constraints = %+v, %v", childCatalog, err)
+	}
+	rootCatalog, err = manager.ListSubagentTypes(ctx, "main")
+	if err != nil || rootCatalog.CanSpawn || rootCatalog.ActiveAgents != 2 || len(rootCatalog.BlockedReasons) != 1 {
+		t.Fatalf("root after spawn = %+v, %v", rootCatalog, err)
+	}
+	if _, err := manager.ListSubagentTypes(ctx, "missing"); !errors.Is(err, agent.ErrCallerNotFound) {
+		t.Fatalf("missing caller error = %v", err)
+	}
+}
+
+func TestListSubagentTypesNoPermissionOrTypes(t *testing.T) {
+	manager := agent.NewManager(agent.ManagerOptions{Builder: builderWithScript(nil)})
+	t.Cleanup(func() { _ = manager.Shutdown() })
+	if err := manager.RegisterTop(newTop(t, false)); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := manager.ListSubagentTypes(context.Background(), "main")
+	if err != nil || catalog.CanSpawn || len(catalog.BlockedReasons) != 2 {
+		t.Fatalf("catalog = %+v, %v", catalog, err)
 	}
 }
 
@@ -233,6 +297,45 @@ func TestSubagentReuse(t *testing.T) {
 	}
 }
 
+func TestPauseSubagentHoldsQueuedWorkAndResumes(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{Builder: builderWithScript([][]llm.Event{
+		finalTurn("first"), finalTurn("second"),
+	})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "first task to complete", func() bool { return mgr.Agent(id).State() == agent.StateIdle })
+	if err := mgr.SetSubagentPaused(context.Background(), "main", id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "task2"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := len(mgr.Agent(id).History()); got != 2 {
+		t.Fatalf("paused agent history items = %d, want 2", got)
+	}
+	status, err := mgr.CheckSubagent(context.Background(), "main", id)
+	if err != nil || !status.Paused {
+		t.Fatalf("paused status = %+v, err=%v", status, err)
+	}
+	if err := mgr.SetSubagentPaused(context.Background(), "main", id, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "second task after resume", func() bool { return len(mgr.Agent(id).History()) == 4 })
+	if err := mgr.CloseSubagent(context.Background(), "main", id); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SetSubagentPaused(context.Background(), "main", id, true); !errors.Is(err, agent.ErrSubagentUnavailable) {
+		t.Fatalf("pause closed subagent: %v", err)
+	}
+}
+
 func TestSubagentDeliversExactlyOnceAtTurnBoundary(t *testing.T) {
 	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript([][]llm.Event{finalTurn("sub done")})})
 	top := newTop(t, true)
@@ -330,7 +433,12 @@ func TestCloseSubagentBusy(t *testing.T) {
 }
 
 func TestCloseSubagentRecursive(t *testing.T) {
-	mgr := agent.NewManager(agent.ManagerOptions{MaxDepth: 5, MaxAgents: 16, Builder: builderWithScript(nil)})
+	mgr := agent.NewManager(agent.ManagerOptions{MaxDepth: 5, MaxAgents: 16, Builder: func(_ context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
+		return agent.New(agent.Spec{
+			ID: spec.ID, Type: spec.Type, Depth: spec.Depth, CallerID: spec.CallerID,
+			AllowSubagents: true, Client: blockingClient{},
+		}), nil
+	}})
 	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
 		t.Fatal(err)
 	}

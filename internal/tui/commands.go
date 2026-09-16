@@ -30,6 +30,7 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 		m.appendLine(kindPlain, "  pgup/pgdown or mouse wheel over input - scroll textarea")
 		m.appendLine(kindPlain, "  ctrl+s - toggle shell view (closed/open/maximized)")
 		m.appendLine(kindPlain, "  click a command - open shell view focused on it")
+		m.appendLine(kindPlain, "  click an agent in the roster - switch its chat and terminal; || pauses queued tasks, x closes")
 	default:
 		m.appendLine(kindPlain, fmt.Sprintf("unknown command %q; type /help for help", name))
 	}

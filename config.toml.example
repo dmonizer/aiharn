@@ -4,6 +4,9 @@
 # for LOCAL paths. Secret-bearing fields (api_key, password) are redacted from
 # all error/log output.
 
+# Local data directory for session transcripts. Defaults to the user's home directory.
+# aiharn_home = "~/.local/share/aiharn"
+
 [models.deepseek_flash]
 provider = "openai_responses"          # protocol the adapter speaks; no silent fallback
 base_url = "https://api.deepseek.com"
@@ -56,13 +59,15 @@ default_shell = "/bin/bash"
 
 [agents.main]
 model = "zai_glm"     # required; validated at startup
+description = "General coordinator; delegates planning and operator tasks" # optional; shown by list_subagent_types
 system_prompt = "prompts/main_pentester.md"
 channel = "sf"            # optional; default = first channel
-tools = "all"                 # "none" | "all" | ["execute_command", "set_approval"]
+tools = "all"                 # "none" | "all" | ["list_subagent_types", "spawn_subagent", ...]
 allow_subagents = true
 
 [agents.planner]
 model = "zai_glm"
+description = "Plans investigations and breaks work into tasks"
 system_prompt = "prompts/planner_pentester.md"
 channel = "sf"
 tools = "none"
@@ -70,6 +75,7 @@ allow_subagents = true
 
 [agents.operator]
 model = "deepseek_flash"
+description = "Performs scoped execution and hands findings back"
 system_prompt = "prompts/operator_pentester.md"
 channel = "sf"
 tools = ["execute_command"]

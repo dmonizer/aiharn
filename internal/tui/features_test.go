@@ -49,6 +49,98 @@ func TestShellCommandAccumulation(t *testing.T) {
 	}
 }
 
+func TestShellOutputFollowsNewestContent(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 80
+	m.height = 14
+	m.resizeInput()
+	m.shellMode = shellOpen
+
+	call := llm.Item{CallID: "c1", Name: "execute_command", Args: `{"command":"seq 20"}`}
+	m.appendToolCall(call)
+	m.appendToolResult(call, strings.Join([]string{
+		"line 01", "line 02", "line 03", "line 04", "line 05",
+		"line 06", "line 07", "line 08", "line 09", "line 10",
+		"line 11", "line 12", "line 13", "line 14", "line 15",
+		"line 16", "line 17", "line 18", "line 19", "line 20",
+	}, "\n"))
+
+	if m.shellScroll != m.shellMaxScroll() || m.shellScroll == 0 {
+		t.Fatalf("shellScroll = %d, max = %d; want output pinned to non-zero bottom", m.shellScroll, m.shellMaxScroll())
+	}
+
+	// Shrinking a followed pane increases its maximum offset. It must move to
+	// that new maximum instead of retaining the now-stale pre-resize offset.
+	m, _ = upd(t, m, tea.WindowSizeMsg{Width: 80, Height: 10})
+	if m.shellScroll != m.shellMaxScroll() {
+		t.Fatalf("after resize shellScroll = %d, max = %d", m.shellScroll, m.shellMaxScroll())
+	}
+}
+
+func TestShellOutputDoesNotFollowAfterManualScroll(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 80
+	m.height = 12
+	m.resizeInput()
+	m.shellMode = shellOpen
+
+	first := llm.Item{CallID: "c1", Name: "execute_command", Args: `{"command":"first"}`}
+	m.appendToolCall(first)
+	m.appendToolResult(first, strings.Repeat("output\n", 20))
+	m.setShellScroll(0)
+	if m.shellFollow {
+		t.Fatal("manual scroll away from bottom should disable following")
+	}
+
+	second := llm.Item{CallID: "c2", Name: "execute_command", Args: `{"command":"second"}`}
+	m.appendToolCall(second)
+	if m.shellScroll != 0 {
+		t.Fatalf("shellScroll = %d, want manual position preserved", m.shellScroll)
+	}
+}
+
+func TestClickNewestShellCommandFollowsItsOutput(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 80
+	m.height = 12
+	m.resizeInput()
+	m.shellMode = shellOpen
+
+	call := llm.Item{CallID: "c1", Name: "execute_command", Args: `{"command":"long-running"}`}
+	m.appendToolCall(call)
+	m.openShellFocus(0)
+	if !m.shellFollow {
+		t.Fatal("newest command focus should follow live output")
+	}
+	m.appendToolResult(call, strings.Repeat("output\n", 20))
+	if m.shellScroll != m.shellMaxScroll() {
+		t.Fatalf("shellScroll = %d, max = %d", m.shellScroll, m.shellMaxScroll())
+	}
+}
+
+func TestShellPaneRendersScrollbarForOverflow(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 50
+	m.height = 12
+	m.resizeInput()
+	m.shellMode = shellOpen
+	call := llm.Item{CallID: "c1", Name: "execute_command", Args: `{"command":"seq 30"}`}
+	m.appendToolCall(call)
+	m.appendToolResult(call, strings.Repeat("output\n", 30))
+
+	view := m.shellPane(m.shellOpenRows(), 1)
+	if !strings.Contains(view, "█") {
+		t.Fatalf("overflowing shell pane has no scrollbar thumb:\n%s", view)
+	}
+	if !strings.Contains(view, "│") {
+		t.Fatalf("overflowing shell pane has no scrollbar track:\n%s", view)
+	}
+	start, size := m.shellScrollbar(m.shellContentRows())
+	if size < 1 || start+size != m.shellContentRows() {
+		t.Fatalf("bottom-pinned thumb = start %d size %d, content rows %d", start, size, m.shellContentRows())
+	}
+}
+
 func TestShellCommandTruncatesPreview(t *testing.T) {
 	m := newTestModel(t)
 	long := strings.Repeat("x", 200)
@@ -136,6 +228,31 @@ func TestTranscriptAutoscrollsToNewest(t *testing.T) {
 		if strings.Contains(v, "line 0") && !strings.Contains(v, "line 90") {
 			t.Fatalf("oldest line visible, expected pinned to bottom: %v", visual)
 		}
+	}
+}
+
+func TestShellScrollbarClickAndDrag(t *testing.T) {
+	m := newTestModel(t)
+	m.width, m.height = 80, 24
+	m.resizeInput()
+	m.shellMode = shellMaximized
+	call := llm.Item{CallID: "long", Name: "execute_command", Args: `{"command":"seq 100"}`}
+	m.appendToolCall(call)
+	m.appendToolResult(call, strings.Repeat("row\n", 100))
+	m.View()
+	if m.shellMaxScroll() == 0 {
+		t.Fatal("test setup did not overflow pane")
+	}
+	x := m.width - 2
+	first := 3 // maximized shell: top border y=1, header y=2
+	m, _ = upd(t, m, tea.MouseMsg{X: x, Y: first, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if m.shellScroll != 0 {
+		t.Fatalf("track top scroll=%d, want 0", m.shellScroll)
+	}
+	last := first + m.shellContentRows() - 1
+	m, _ = upd(t, m, tea.MouseMsg{X: x, Y: last, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion})
+	if m.shellScroll != m.shellMaxScroll() || !m.shellFollow {
+		t.Fatalf("track bottom scroll=%d max=%d follow=%v", m.shellScroll, m.shellMaxScroll(), m.shellFollow)
 	}
 }
 

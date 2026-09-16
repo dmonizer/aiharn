@@ -7,6 +7,7 @@
 
 # Local runtime/session output can contain commands, targets, and host details.
 /aiharn.log.jsonl
+/.aiharn/
 /debug*.log
 
 # Local config may contain credentials and environment-specific paths. Start

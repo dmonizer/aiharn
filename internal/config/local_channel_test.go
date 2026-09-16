@@ -16,6 +16,7 @@ func TestValidateLocalChannel(t *testing.T) {
 	}
 
 	cfg := &Config{
+		AiharnHome: dir,
 		Models: map[string]ModelConfig{
 			"m": {Provider: ProviderOpenAIResponses, BaseURL: "https://api.example.com", APIKey: "k", Model: "gpt"},
 		},

@@ -52,6 +52,7 @@ var (
 	styleCommand     = lipgloss.NewStyle().Foreground(lipgloss.Color("240")) // subdued gray chat command
 	styleShellCmd    = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	styleShellFocus  = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4"))
+	styleShellScroll = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	styleShellBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
 )
 
@@ -125,7 +126,7 @@ func (m *Model) cycleShell() {
 	case shellMaximized:
 		m.shellMode = shellClosed
 	}
-	m.clampShellScroll()
+	m.followShell()
 }
 
 func (m *Model) shellOpenRows() int {
@@ -218,6 +219,14 @@ func (m *Model) openShellFocus(idx int) {
 		m.shellMode = shellOpen
 	}
 	m.shellFocus = idx
+	// A click on the newest command means "show its live output", so keep that
+	// view pinned as the result grows. Older commands remain a stable focus and
+	// deliberately disable following.
+	if idx == len(m.shellCmds)-1 {
+		m.shellFollow = true
+		m.followShell()
+		return
+	}
 	if idx < len(m.shellStart) {
 		m.shellScroll = m.shellStart[idx]
 	}
@@ -256,14 +265,44 @@ func (m *Model) clickShellButton(x, y int) bool {
 					m.shellMode = shellMaximized
 				}
 			}
-			m.clampShellScroll()
+			m.followShell()
 			return true
 		}
 	}
 	return false
 }
 
+// clickShellScrollbar jumps to the portion of output indicated by a click or
+// left-button drag on the visible scrollbar track.
+func (m *Model) clickShellScrollbar(x, y int) bool {
+	contentRows := m.shellContentRows()
+	if m.shellMode == shellClosed || contentRows <= 0 || len(m.shellFlat) <= contentRows || m.width <= 3 || x != m.width-2 {
+		return false
+	}
+	topY := 1
+	if m.shellMode == shellOpen {
+		topY += m.rows() - m.shellOpenRows()
+	}
+	first := topY + 2
+	if y < first || y >= first+contentRows {
+		return false
+	}
+	if contentRows == 1 {
+		m.setShellScroll(m.shellMaxScroll())
+		return true
+	}
+	m.setShellScroll((y - first) * m.shellMaxScroll() / (contentRows - 1))
+	return true
+}
+
 func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if msg.Action == tea.MouseActionMotion {
+		m.hoverX, m.hoverY = msg.X, msg.Y
+		if msg.Button == tea.MouseButtonLeft {
+			m.clickShellScrollbar(msg.X, msg.Y)
+		}
+		return nil
+	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= 1+m.rows() {
@@ -283,6 +322,12 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	case tea.MouseButtonLeft:
 		if msg.Action == tea.MouseActionPress {
+			if m.clickShellScrollbar(msg.X, msg.Y) {
+				return nil
+			}
+			if handled, cmd := m.clickRoster(msg.X, msg.Y); handled {
+				return cmd
+			}
 			if m.clickShellButton(msg.X, msg.Y) {
 				return nil
 			}
@@ -298,7 +343,7 @@ func (m *Model) shellPane(rows int, topY int) string {
 	if rows <= 0 {
 		return ""
 	}
-	m.clampShellScroll()
+	m.followShell()
 
 	innerH := rows - 2
 	if innerH < 0 {
@@ -315,15 +360,53 @@ func (m *Model) shellPane(rows int, topY int) string {
 	if contentRows < 0 {
 		contentRows = 0
 	}
+	showScrollbar := len(m.shellFlat) > contentRows && contentRows > 0
+	contentW := innerW
+	if showScrollbar && contentW > 1 {
+		contentW--
+	}
 	end := m.shellScroll + contentRows
 	if end > len(m.shellFlat) {
 		end = len(m.shellFlat)
 	}
+	thumbStart, thumbSize := m.shellScrollbar(contentRows)
 	for i := m.shellScroll; i < end; i++ {
-		raw := truncateToColumns(m.shellFlat[i], innerW)
-		lines = append(lines, m.shellLineStyle(i, raw))
+		raw := truncateToColumns(m.shellFlat[i], contentW)
+		line := m.shellLineStyle(i, raw)
+		if showScrollbar && innerW > 1 {
+			line = lipgloss.NewStyle().Width(contentW).Render(line)
+			trackRow := i - m.shellScroll
+			glyph := "│"
+			if trackRow >= thumbStart && trackRow < thumbStart+thumbSize {
+				glyph = "█"
+			}
+			line += styleShellScroll.Render(glyph)
+		}
+		lines = append(lines, line)
 	}
 	return styleShellBorder.Render(fill(strings.Join(lines, "\n"), innerH))
+}
+
+// shellScrollbar returns the thumb's start row and height for the current
+// scroll offset. The thumb is proportional to the visible fraction, with a
+// one-row minimum so even very long command output remains navigable.
+func (m *Model) shellScrollbar(contentRows int) (start, size int) {
+	if contentRows <= 0 || len(m.shellFlat) <= contentRows {
+		return 0, 0
+	}
+	size = contentRows * contentRows / len(m.shellFlat)
+	if size < 1 {
+		size = 1
+	}
+	if size > contentRows {
+		size = contentRows
+	}
+	travel := contentRows - size
+	maxScroll := m.shellMaxScroll()
+	if travel > 0 && maxScroll > 0 {
+		start = (m.shellScroll*travel + maxScroll/2) / maxScroll
+	}
+	return start, size
 }
 
 // shellHeader builds the pane header (title left, buttons right) and records the

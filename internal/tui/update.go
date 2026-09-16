@@ -22,6 +22,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resizeInput()
+		m.followShell()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -36,10 +37,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case agentEventMsg:
-		wasThinking := m.thinking
-		m.appendEvent(msg.ev)
-		wait := waitAgentEventContext(m.ctx, m.agent)
-		if !wasThinking && m.thinking {
+		id := msg.ev.AgentID
+		if id == "" && m.agent != nil {
+			id = m.agent.ID()
+		}
+		wasThinking := m.thinking && m.focusedID == id
+		m.appendAgentEvent(msg.ev)
+		if msg.ev.Type == agent.EventState && (msg.ev.State == agent.StateClosed || msg.ev.State == agent.StateErrored) {
+			return m, nil // terminal subagent streams need no permanently blocked bridge
+		}
+		a := m.agent
+		if m.manager != nil && id != "" {
+			a = m.manager.Agent(id)
+		}
+		if a == nil {
+			return m, nil
+		}
+		wait := waitAgentEventContext(m.ctx, a)
+		if m.focusedID == id && !wasThinking && m.thinking {
 			return m, tea.Batch(wait, tickThinking())
 		}
 		return m, wait
@@ -58,7 +73,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case rosterMsg:
 		m.refreshSubagents()
-		return m, waitRosterContext(m.ctx, m.manager)
+		return m, tea.Batch(waitRosterContext(m.ctx, m.manager), m.startSubagentBridges())
+
+	case subagentClosedMsg:
+		if msg.err != nil {
+			m.appendLine(kindError, "close subagent: "+msg.err.Error())
+		}
+		m.refreshSubagents()
+		return m, nil
 
 	case bridgeStoppedMsg:
 		return m, nil
@@ -70,23 +92,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case turnDoneMsg:
-		m.finishThinking(time.Now())
-		m.flushText()
-		m.running = false
-		if m.turnCancel != nil {
-			m.turnCancel()
-			m.turnCancel = nil
+		rootID := ""
+		if m.agent != nil {
+			rootID = m.agent.ID()
 		}
-		expectedCancel := m.stopping && errors.Is(msg.err, context.Canceled)
-		m.stopping = false
-		if msg.err != nil && !expectedCancel {
-			m.appendLine(kindError, "error: "+msg.err.Error())
-		}
-		m.refreshSubagents()
-		if cmd := m.nextTurn(); cmd != nil {
-			return m, cmd
-		}
-		return m, nil
+		return m, m.withAgentView(rootID, func() tea.Cmd {
+			m.finishThinking(time.Now())
+			m.flushText()
+			m.running = false
+			if m.turnCancel != nil {
+				m.turnCancel()
+				m.turnCancel = nil
+			}
+			expectedCancel := m.stopping && errors.Is(msg.err, context.Canceled)
+			m.stopping = false
+			if msg.err != nil && !expectedCancel {
+				m.appendLine(kindError, "error: "+msg.err.Error())
+			}
+			m.refreshSubagents()
+			return m.nextTurn()
+		})
 	}
 	return m, nil
 }
@@ -260,6 +285,14 @@ func (m *Model) submitInput() tea.Cmd {
 	}
 	m.pushHistory(line)
 	m.draft = ""
+	if m.agent != nil && m.focusedID != "" && m.focusedID != m.agent.ID() {
+		if err := m.manager.SendSubagentMessage(m.ctx, m.agent.ID(), m.focusedID, line); err != nil {
+			m.appendLine(kindError, "send to subagent: "+err.Error())
+		} else {
+			m.appendLine(kindPlain, "[queued for "+m.focusedID+"]")
+		}
+		return nil
+	}
 	m.queue = append(m.queue, line)
 	return m.nextTurn()
 }
@@ -338,6 +371,10 @@ func formatThinkingElapsed(elapsed time.Duration) string {
 
 func (m *Model) appendEvent(ev agent.Event) {
 	switch ev.Type {
+	case agent.EventUser:
+		if m.agent != nil && ev.AgentID != m.agent.ID() {
+			m.appendLine(kindUser, "> "+ev.Text)
+		}
 	case agent.EventReasoningStart:
 		m.beginThinking(time.Now())
 	case agent.EventReasoningDelta:

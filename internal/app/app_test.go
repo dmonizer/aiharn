@@ -87,6 +87,9 @@ func TestBuildRegistrySelection(t *testing.T) {
 	if len(all.Names()) != len(tools.Names()) {
 		t.Fatalf("all: got %v, want %v", all.Names(), tools.Names())
 	}
+	if !all.Has(tools.NameListSubagentTypes) {
+		t.Fatal("all must include subagent type discovery")
+	}
 
 	list, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
 		Mode:  config.ToolModeList,
@@ -98,8 +101,30 @@ func TestBuildRegistrySelection(t *testing.T) {
 	if len(list.Names()) != 1 || list.Names()[0] != "execute_command" {
 		t.Fatalf("list: got %v", list.Names())
 	}
+	discovery, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
+		Mode: config.ToolModeList, Names: []string{tools.NameListSubagentTypes},
+	}, nil, "a1")
+	if err != nil || !discovery.Has(tools.NameListSubagentTypes) || discovery.Has(tools.NameSpawnSubagent) {
+		t.Fatalf("discovery-only registry: names=%v err=%v", discovery.Names(), err)
+	}
 	if _, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeList, Names: []string{"not_a_tool"}}, nil, "a1"); err == nil {
 		t.Fatal("expected unknown tool error")
+	}
+}
+
+func TestConfiguredSubagentTypes(t *testing.T) {
+	cfg := &config.Config{
+		Channels: []config.ChannelConfig{{Name: "first"}, {Name: "other"}},
+		Agents: map[string]config.AgentConfig{
+			"zeta":  {Model: "model-z", Description: "Delegator", AllowSubagents: true},
+			"alpha": {Model: "model-a", Channel: "other"},
+		},
+	}
+	types := configuredSubagentTypes(cfg)
+	if len(types) != 2 || types[0].Name != "alpha" || types[0].Channel != "other" ||
+		types[1].Name != "zeta" || types[1].Channel != "first" ||
+		types[1].Description != "Delegator" || !types[1].AllowSubagents {
+		t.Fatalf("configured types = %+v", types)
 	}
 }
 
