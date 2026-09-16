@@ -77,6 +77,34 @@ func TestTurnSimple(t *testing.T) {
 	}
 }
 
+func TestTurnForwardsReasoningConfigurationAndEvents(t *testing.T) {
+	client := &testllm.FakeClient{Script: [][]llm.Event{{
+		{Type: llm.EventReasoningDelta, Text: "checking"},
+		{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "done"}}},
+	}}}
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m", Client: client,
+		ReasoningEffort: "high", ReasoningSummary: "auto",
+	})
+
+	if err := a.Turn(context.Background(), "hi"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	reqs := client.Requests()
+	if len(reqs) != 1 || reqs[0].ReasoningEffort != "high" || reqs[0].ReasoningSummary != "auto" {
+		t.Fatalf("requests = %+v, want reasoning high/auto", reqs)
+	}
+	events := drainEvents(a)
+	var start, delta bool
+	for _, event := range events {
+		start = start || event.Type == agent.EventReasoningStart
+		delta = delta || event.Type == agent.EventReasoningDelta && event.Text == "checking"
+	}
+	if !start || !delta {
+		t.Fatalf("reasoning events = %+v, want start and delta", events)
+	}
+}
+
 func TestTurnToolCall(t *testing.T) {
 	client := &testllm.FakeClient{
 		Script: [][]llm.Event{

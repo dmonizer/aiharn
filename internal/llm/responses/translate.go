@@ -63,12 +63,20 @@ func buildRequest(req llm.Request) (openai.CreateResponseRequest, error) {
 		))
 	}
 
+	var reasoning *openai.ResponseReasoning
+	if req.ReasoningEffort != "" || req.ReasoningSummary != "" {
+		reasoning = &openai.ResponseReasoning{
+			Effort: req.ReasoningEffort, Summary: req.ReasoningSummary,
+		}
+	}
+
 	return openai.CreateResponseRequest{
 		Model:        req.Model,
 		Instructions: req.System,
 		Input:        input,
 		Tools:        tools,
 		Stream:       true,
+		Reasoning:    reasoning,
 	}, nil
 }
 

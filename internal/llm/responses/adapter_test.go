@@ -59,6 +59,7 @@ func terminalOf(t *testing.T, evts []llm.Event) llm.Event {
 func TestStreamTextDeltasAndCompleted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sseFrame(`{"type":"response.reasoning_summary_text.delta","delta":"Consider"}`))
 		io.WriteString(w, sseFrame(`{"type":"response.output_text.delta","delta":"Hel"}`))
 		io.WriteString(w, sseFrame(`{"type":"response.output_text.delta","delta":"lo"}`))
 		io.WriteString(w, sseFrame(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`))
@@ -72,16 +73,19 @@ func TestStreamTextDeltasAndCompleted(t *testing.T) {
 	}
 	evts := drainWithTimeout(t, ch, 5*time.Second)
 
-	if len(evts) != 3 {
-		t.Fatalf("got %d events, want 3 (2 deltas + completed): %+v", len(evts), evts)
+	if len(evts) != 4 {
+		t.Fatalf("got %d events, want 4 (reasoning + 2 text deltas + completed): %+v", len(evts), evts)
 	}
-	if evts[0].Type != llm.EventTextDelta || evts[0].Text != "Hel" {
-		t.Errorf("evt[0] = %+v, want delta Hel", evts[0])
+	if evts[0].Type != llm.EventReasoningDelta || evts[0].Text != "Consider" {
+		t.Errorf("evt[0] = %+v, want reasoning delta Consider", evts[0])
 	}
-	if evts[1].Type != llm.EventTextDelta || evts[1].Text != "lo" {
-		t.Errorf("evt[1] = %+v, want delta lo", evts[1])
+	if evts[1].Type != llm.EventTextDelta || evts[1].Text != "Hel" {
+		t.Errorf("evt[1] = %+v, want text delta Hel", evts[1])
 	}
-	term := evts[2]
+	if evts[2].Type != llm.EventTextDelta || evts[2].Text != "lo" {
+		t.Errorf("evt[2] = %+v, want text delta lo", evts[2])
+	}
+	term := evts[3]
 	if term.Type != llm.EventCompleted {
 		t.Fatalf("terminal = %+v, want Completed", term)
 	}
@@ -130,9 +134,11 @@ func TestBuildRequestRoundTrip(t *testing.T) {
 	defer srv.Close()
 
 	req := llm.Request{
-		Model:  "m",
-		System: "be helpful",
-		Stream: true,
+		Model:            "m",
+		System:           "be helpful",
+		Stream:           true,
+		ReasoningEffort:  "high",
+		ReasoningSummary: "auto",
 		Input: []llm.Item{
 			{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "run ls"},
 			{Type: llm.ItemFunctionCall, CallID: "call_1", Name: "execute_command", Args: `{"cmd":"ls"}`},
@@ -155,6 +161,10 @@ func TestBuildRequestRoundTrip(t *testing.T) {
 	}
 	if body["instructions"] != "be helpful" {
 		t.Errorf("instructions = %v, want 'be helpful'", body["instructions"])
+	}
+	reasoning, ok := body["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+		t.Errorf("reasoning = %#v, want high/auto", body["reasoning"])
 	}
 
 	input, ok := body["input"].([]any)

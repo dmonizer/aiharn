@@ -100,6 +100,11 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 				continue
 			}
 			sawChoice = true
+			if choice.Delta.ReasoningContent != "" {
+				if !emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: choice.Delta.ReasoningContent}) {
+					return
+				}
+			}
 			for _, delta := range []string{choice.Delta.Content, choice.Delta.Refusal} {
 				if delta != "" {
 					text.WriteString(delta)
@@ -245,7 +250,7 @@ func buildRequest(req llm.Request) (openai.ChatCompletionRequest, error) {
 	}
 
 	return openai.ChatCompletionRequest{
-		Model: req.Model, Messages: messages, Tools: definitions, Stream: true,
+		Model: req.Model, Messages: messages, Tools: definitions, Stream: true, ReasoningEffort: req.ReasoningEffort,
 	}, nil
 }
 

@@ -3,15 +3,18 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/rivo/uniseg"
 )
 
-// Per-kind transcript styles. ANSI basic colors work on every terminal.
+// Per-kind transcript styles. Reasoning uses a lighter 256-color gray than
+// command previews, while the primary transcript kinds retain basic colors.
 var (
 	styleUser      = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	styleAssistant = lipgloss.NewStyle()
+	styleReasoning = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
@@ -24,6 +27,8 @@ func styleLine(kind lineKind, s string) string {
 		return styleUser.Render(s)
 	case kindAssistant:
 		return styleAssistant.Render(s)
+	case kindReasoning, kindReasoningStatus:
+		return styleReasoning.Render(s)
 	case kindTool:
 		return styleTool.Render(s)
 	case kindCommand:
@@ -104,7 +109,14 @@ func (m *Model) transcriptAndSubagents(rows int) string {
 // transcriptRows returns the wrapped transcript as visual rows, bottom-pinned to
 // `rows`, plus a parallel per-row clickable-command index (-1 for non-command).
 func (m *Model) transcriptRows(width, rows int) ([]string, []int) {
-	logical := m.lines
+	logical := make([]line, 0, len(m.lines))
+	for _, ln := range m.lines {
+		if (ln.kind == kindReasoning && !m.showReasoning) ||
+			(ln.kind == kindReasoningStatus && m.showReasoning) {
+			continue
+		}
+		logical = append(logical, ln)
+	}
 	if rows <= 0 {
 		logical = nil
 	} else if len(logical) > rows {
@@ -119,9 +131,16 @@ func (m *Model) transcriptRows(width, rows int) ([]string, []int) {
 			click = append(click, ln.cmd)
 		}
 	}
-	if len(m.curText) != 0 {
+	if len(m.curText) != 0 && (m.curKind != kindReasoning || m.showReasoning) {
 		for _, wl := range wrapLine(string(m.curText), width) {
-			visual = append(visual, styleLine(kindAssistant, wl))
+			visual = append(visual, styleLine(m.curKind, wl))
+			click = append(click, -1)
+		}
+	}
+	if m.thinking && !m.showReasoning {
+		status := fmt.Sprintf("thinking ... (%s)", formatThinkingElapsed(time.Since(m.thinkingStarted)))
+		for _, wl := range wrapLine(status, width) {
+			visual = append(visual, styleLine(kindReasoningStatus, wl))
 			click = append(click, -1)
 		}
 	}
@@ -176,8 +195,12 @@ func (m *Model) statusLine() string {
 	if m.gate != nil {
 		approval = m.gate.Mode().String()
 	}
-	return fmt.Sprintf("model %s · agent %s · channel %s · approval %s",
-		m.status.Model, m.status.AgentType, m.status.Channel, approval)
+	reasoningDisplay := "hidden"
+	if m.showReasoning {
+		reasoningDisplay = "shown"
+	}
+	return fmt.Sprintf("model %s · agent %s · channel %s · approval %s · thinking %s",
+		m.status.Model, m.status.AgentType, m.status.Channel, approval, reasoningDisplay)
 }
 
 // wrapLine hard-wraps s into visual rows no wider than width grapheme columns,

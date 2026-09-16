@@ -353,6 +353,79 @@ func TestInputCappedAndScrollable(t *testing.T) {
 	}
 }
 
+func TestInputScrollsWithPageKeysAndMouseWheel(t *testing.T) {
+	m := newTestModel(t)
+	m.width = 80
+	m.height = 16
+	m.resizeInput()
+	lines := make([]string, 12)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line%d", i)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Paste: true, Runes: []rune(strings.Join(lines, "\n"))})
+
+	bottom := m.textarea.Line()
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyPgUp})
+	pageUp := m.textarea.Line()
+	if pageUp >= bottom {
+		t.Fatalf("line after pgup = %d, want before bottom %d", pageUp, bottom)
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if got := m.textarea.Line(); got <= pageUp {
+		t.Fatalf("line after pgdn = %d, want after %d", got, pageUp)
+	}
+
+	inputY := 1 + m.rows()
+	m, _ = upd(t, m, tea.MouseMsg{Y: inputY, Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
+	wheelUp := m.textarea.Line()
+	if wheelUp >= bottom {
+		t.Fatalf("line after wheel up = %d, want before bottom %d", wheelUp, bottom)
+	}
+	m, _ = upd(t, m, tea.MouseMsg{Y: inputY, Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	if got := m.textarea.Line(); got <= wheelUp {
+		t.Fatalf("line after wheel down = %d, want after %d", got, wheelUp)
+	}
+}
+
+func TestReasoningDisplayToggleAndElapsedStatus(t *testing.T) {
+	m := newTestModel(t)
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	m.beginThinking(started)
+	m.appendReasoning("private summary")
+	m.finishThinking(started.Add(65 * time.Second))
+
+	hidden, _ := m.transcriptRows(80, 20)
+	hiddenText := strings.Join(hidden, "\n")
+	if strings.Contains(hiddenText, "private summary") {
+		t.Fatalf("hidden reasoning was rendered: %q", hiddenText)
+	}
+	if !strings.Contains(hiddenText, "thinking ... (01:05)") {
+		t.Fatalf("elapsed status missing from %q", hiddenText)
+	}
+
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyF10})
+	if !m.showReasoning || !strings.Contains(m.statusLine(), "thinking shown") {
+		t.Fatalf("F10 did not enable reasoning display: show=%v status=%q", m.showReasoning, m.statusLine())
+	}
+	shown, _ := m.transcriptRows(80, 20)
+	shownText := strings.Join(shown, "\n")
+	if !strings.Contains(shownText, "private summary") {
+		t.Fatalf("shown reasoning missing from %q", shownText)
+	}
+	if strings.Contains(shownText, "thinking ...") {
+		t.Fatalf("elapsed placeholder should be replaced by shown reasoning: %q", shownText)
+	}
+}
+
+func TestReasoningStyleIsLighterThanCommandOutput(t *testing.T) {
+	if got := styleReasoning.GetForeground(); got != lipgloss.Color("245") {
+		t.Fatalf("reasoning color = %q, want 245", got)
+	}
+	if got := styleCommand.GetForeground(); got != lipgloss.Color("240") {
+		t.Fatalf("command color = %q, want 240", got)
+	}
+}
+
 func TestQuitOnCtrlC(t *testing.T) {
 	m := newTestModel(t)
 	_, cmd := upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlC})

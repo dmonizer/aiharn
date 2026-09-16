@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -35,8 +36,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case agentEventMsg:
+		wasThinking := m.thinking
 		m.appendEvent(msg.ev)
-		return m, waitAgentEventContext(m.ctx, m.agent)
+		wait := waitAgentEventContext(m.ctx, m.agent)
+		if !wasThinking && m.thinking {
+			return m, tea.Batch(wait, tickThinking())
+		}
+		return m, wait
 
 	case approvalReqMsg:
 		if _, cancelled := m.cancelledApprovals[msg.req.ID]; cancelled {
@@ -57,7 +63,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case bridgeStoppedMsg:
 		return m, nil
 
+	case thinkingTickMsg:
+		if m.thinking {
+			return m, tickThinking()
+		}
+		return m, nil
+
 	case turnDoneMsg:
+		m.finishThinking(time.Now())
 		m.flushText()
 		m.running = false
 		if m.turnCancel != nil {
@@ -91,6 +104,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if msg.String() == "f10" {
+		m.showReasoning = !m.showReasoning
+		return m, nil
+	}
+
 	if m.pending != nil {
 		return m, m.handleApprovalKey(msg)
 	}
@@ -117,7 +135,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.scrollShell(1)
 		case "pgup":
 			m.scrollShell(-m.shellPageSize())
-		case "pgdn":
+		case "pgdown":
 			m.scrollShell(m.shellPageSize())
 		case "home":
 			m.setShellScroll(0)
@@ -150,18 +168,26 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.resizeInput()
 		return m, nil
 
-	case "pgup", "pgdn", "home", "end":
+	case "pgup", "pgdown", "home", "end":
 		if m.shellMode != shellClosed {
 			switch msg.String() {
 			case "pgup":
 				m.scrollShell(-m.shellPageSize())
-			case "pgdn":
+			case "pgdown":
 				m.scrollShell(m.shellPageSize())
 			case "home":
 				m.setShellScroll(0)
 			case "end":
 				m.setShellScroll(m.shellMaxScroll())
 			}
+			return m, nil
+		}
+		if msg.String() == "pgup" {
+			m.pageInput(-1)
+			return m, nil
+		}
+		if msg.String() == "pgdown" {
+			m.pageInput(1)
 			return m, nil
 		}
 	}
@@ -280,15 +306,57 @@ func (m *Model) nextTurn() tea.Cmd {
 	return runTurn(m.agent, turnCtx, input)
 }
 
+func (m *Model) beginThinking(now time.Time) {
+	if m.thinking {
+		return
+	}
+	m.thinking = true
+	m.thinkingStarted = now
+}
+
+func (m *Model) finishThinking(now time.Time) {
+	if !m.thinking {
+		return
+	}
+	m.flushText()
+	m.lines = append(m.lines, line{
+		text: fmt.Sprintf("thinking ... (%s)", formatThinkingElapsed(now.Sub(m.thinkingStarted))),
+		kind: kindReasoningStatus, cmd: -1,
+	})
+	m.trimLines()
+	m.thinking = false
+	m.thinkingStarted = time.Time{}
+}
+
+func formatThinkingElapsed(elapsed time.Duration) string {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	totalSeconds := int(elapsed / time.Second)
+	return fmt.Sprintf("%02d:%02d", totalSeconds/60, totalSeconds%60)
+}
+
 func (m *Model) appendEvent(ev agent.Event) {
 	switch ev.Type {
+	case agent.EventReasoningStart:
+		m.beginThinking(time.Now())
+	case agent.EventReasoningDelta:
+		if !m.thinking {
+			m.beginThinking(time.Now())
+		}
+		m.appendReasoning(ev.Text)
 	case agent.EventText:
+		m.finishThinking(time.Now())
 		m.appendText(ev.Text)
 	case agent.EventToolCall:
+		m.finishThinking(time.Now())
 		m.appendToolCall(ev.Call)
 	case agent.EventToolResult:
 		m.appendToolResult(ev.Call, ev.Text)
 	case agent.EventState:
+		if ev.State != agent.StateRunning {
+			m.finishThinking(time.Now())
+		}
 		m.flushText()
 	}
 }

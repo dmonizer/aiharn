@@ -53,10 +53,12 @@ type Config struct {
 
 // ModelConfig is a named model/API configuration referenced by agents.
 type ModelConfig struct {
-	Provider string `toml:"provider"`
-	BaseURL  string `toml:"base_url"`
-	APIKey   string `toml:"api_key"`
-	Model    string `toml:"model"`
+	Provider         string `toml:"provider"`
+	BaseURL          string `toml:"base_url"`
+	APIKey           string `toml:"api_key"`
+	Model            string `toml:"model"`
+	ReasoningEffort  string `toml:"reasoning_effort"`
+	ReasoningSummary string `toml:"reasoning_summary"`
 }
 
 // AuthConfig selects how an SSH channel authenticates: exactly one of KeyFile

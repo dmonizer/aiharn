@@ -69,6 +69,10 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 			}
 
 			switch evt.Type {
+			case openai.ResponseStreamEventReasoningSummaryTextDelta, openai.ResponseStreamEventReasoningTextDelta:
+				if !emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: evt.Delta}) {
+					return
+				}
 			case openai.ResponseStreamEventOutputTextDelta:
 				if !emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: evt.Delta}) {
 					return

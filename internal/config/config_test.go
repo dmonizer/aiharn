@@ -120,6 +120,59 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestLoadAndValidateReasoningOptions(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	body := strings.Replace(validConfig, `model = "anthropic/claude-opus-4"`, `model = "anthropic/claude-opus-4"
+reasoning_effort = "high"
+reasoning_summary = "auto"`, 1)
+	cfg, err := Load(setup(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	model := cfg.Models["opus_via_openrouter"]
+	if model.ReasoningEffort != "high" || model.ReasoningSummary != "auto" {
+		t.Fatalf("reasoning options = %q/%q, want high/auto", model.ReasoningEffort, model.ReasoningSummary)
+	}
+	if err := Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}}); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestValidateReasoningOptions(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	tests := []struct {
+		name    string
+		mutate  func(*ModelConfig)
+		wantErr string
+	}{
+		{"invalid effort", func(m *ModelConfig) { m.ReasoningEffort = "extreme" }, "reasoning_effort"},
+		{"invalid summary", func(m *ModelConfig) { m.ReasoningSummary = "full" }, "reasoning_summary"},
+		{"summary needs responses", func(m *ModelConfig) {
+			m.Provider = ProviderOpenAIChatCompletions
+			m.ReasoningSummary = "auto"
+		}, "requires provider"},
+		{"summary incompatible with none", func(m *ModelConfig) {
+			m.ReasoningEffort = "none"
+			m.ReasoningSummary = "auto"
+		}, "cannot be requested"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(setup(t, validConfig))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			model := cfg.Models["opus_via_openrouter"]
+			tc.mutate(&model)
+			cfg.Models["opus_via_openrouter"] = model
+			err = Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadAPIConfig(t *testing.T) {
 	t.Setenv("TEST_API_KEY", "model-secret")
 	t.Setenv("TEST_API_LISTEN", "127.0.0.1:7331")

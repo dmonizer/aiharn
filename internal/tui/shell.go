@@ -266,10 +266,18 @@ func (m *Model) clickShellButton(x, y int) bool {
 func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
+		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= 1+m.rows() {
+			m.scrollInput(-3)
+			return nil
+		}
 		if m.shellMode != shellClosed {
 			m.scrollShell(-3)
 		}
 	case tea.MouseButtonWheelDown:
+		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= 1+m.rows() {
+			m.scrollInput(3)
+			return nil
+		}
 		if m.shellMode != shellClosed {
 			m.scrollShell(3)
 		}

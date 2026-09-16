@@ -132,6 +132,31 @@ func (m *Model) resizeInput() {
 	m.textarea.SetHeight(h)
 }
 
+// scrollInput moves the textarea cursor by visual rows. The textarea keeps its
+// viewport pinned to the cursor, which provides reliable scrolling even though
+// its embedded viewport is not exposed publicly.
+func (m *Model) scrollInput(delta int) {
+	if delta < 0 {
+		for ; delta < 0; delta++ {
+			m.textarea.CursorUp()
+		}
+	} else {
+		for ; delta > 0; delta-- {
+			m.textarea.CursorDown()
+		}
+	}
+	// Force the textarea's viewport-repositioning pass after direct cursor moves.
+	m.textarea, _ = m.textarea.Update(nil)
+}
+
+func (m *Model) pageInput(direction int) {
+	rows := m.inputBoxHeight()
+	if rows < 1 {
+		rows = 1
+	}
+	m.scrollInput(direction * rows)
+}
+
 // pressEsc implements double-ESC-to-clear: the first press arms the clear and a
 // second press within escClearWindow clears the input.
 func (m *Model) pressEsc(now time.Time) {

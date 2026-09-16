@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -17,7 +18,12 @@ type (
 	turnDoneMsg      struct{ err error }
 	rosterMsg        struct{}
 	bridgeStoppedMsg struct{}
+	thinkingTickMsg  struct{}
 )
+
+func tickThinking() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return thinkingTickMsg{} })
+}
 
 // waitAgentEvent blocks until the agent emits an event and delivers it as a
 // message. The model re-subscribes after each event, so the bridge never blocks

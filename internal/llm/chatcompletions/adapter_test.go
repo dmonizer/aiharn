@@ -53,7 +53,7 @@ func TestStreamTextAndUsage(t *testing.T) {
 			t.Errorf("path = %q", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		writeSSE(w, `{"choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}`)
+		writeSSE(w, `{"choices":[{"index":0,"delta":{"reasoning_content":"Think","content":"Hel"},"finish_reason":null}]}`)
 		writeSSE(w, `{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`)
 		writeSSE(w, "[DONE]")
 	}))
@@ -64,7 +64,7 @@ func TestStreamTextAndUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := drain(t, events)
-	if len(all) != 3 || all[0].Text != "Hel" || all[1].Text != "lo" {
+	if len(all) != 4 || all[0].Type != llm.EventReasoningDelta || all[0].Text != "Think" || all[1].Text != "Hel" || all[2].Text != "lo" {
 		t.Fatalf("events = %+v", all)
 	}
 	got := terminal(t, all)
@@ -112,7 +112,7 @@ func TestBuildRequestRoundTrip(t *testing.T) {
 	defer server.Close()
 
 	req := llm.Request{
-		Model: "glm", System: "system",
+		Model: "glm", System: "system", ReasoningEffort: "low",
 		Input: []llm.Item{
 			{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "run"},
 			{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "calling"},
@@ -127,6 +127,9 @@ func TestBuildRequestRoundTrip(t *testing.T) {
 	}
 	if got := terminal(t, drain(t, events)); got.Type != llm.EventCompleted {
 		t.Fatalf("terminal = %+v", got)
+	}
+	if body["reasoning_effort"] != "low" {
+		t.Fatalf("reasoning_effort = %#v, want low", body["reasoning_effort"])
 	}
 
 	messages, ok := body["messages"].([]any)

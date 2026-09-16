@@ -52,6 +52,8 @@ type EventType int
 
 const (
 	EventText EventType = iota
+	EventReasoningStart
+	EventReasoningDelta
 	EventToolCall
 	EventToolResult
 	EventState
@@ -61,7 +63,7 @@ const (
 type Event struct {
 	AgentID string
 	Type    EventType
-	Text    string   // EventText delta, or EventToolResult output
+	Text    string   // text/reasoning delta, or EventToolResult output
 	Call    llm.Item // EventToolCall / EventToolResult
 	State   State    // EventState
 }
@@ -76,24 +78,26 @@ type HistoryObserver interface {
 
 // Spec is the resolved, immutable configuration for one agent instance.
 type Spec struct {
-	ID              string
-	Type            string
-	Model           string
-	System          string // system prompt content
-	Client          llm.Client
-	Tools           *tools.Registry
-	Depth           int    // 0 = top-level
-	CallerID        string // "" for top-level
-	AllowSubagents  bool   // whether this agent may spawn subagents
-	EventCapacity   int
-	InboxCapacity   int
-	MaxToolRounds   int           // per-turn cap on tool-call iterations
-	RequestTimeout  time.Duration // per-provider-request timeout (0 = none)
-	ToolResultBytes int64         // cap on model-visible tool output (0 = none)
-	TranscriptItems int           // retained completed transcript items (0 = unlimited)
-	TranscriptBytes int64         // retained completed transcript content bytes (0 = unlimited)
-	Observer        HistoryObserver
-	Cleanup         func() // invoked once at close (e.g. release the session)
+	ID               string
+	Type             string
+	Model            string
+	System           string // system prompt content
+	ReasoningEffort  string
+	ReasoningSummary string
+	Client           llm.Client
+	Tools            *tools.Registry
+	Depth            int    // 0 = top-level
+	CallerID         string // "" for top-level
+	AllowSubagents   bool   // whether this agent may spawn subagents
+	EventCapacity    int
+	InboxCapacity    int
+	MaxToolRounds    int           // per-turn cap on tool-call iterations
+	RequestTimeout   time.Duration // per-provider-request timeout (0 = none)
+	ToolResultBytes  int64         // cap on model-visible tool output (0 = none)
+	TranscriptItems  int           // retained completed transcript items (0 = unlimited)
+	TranscriptBytes  int64         // retained completed transcript content bytes (0 = unlimited)
+	Observer         HistoryObserver
+	Cleanup          func() // invoked once at close (e.g. release the session)
 }
 
 const (
@@ -109,15 +113,17 @@ var ErrAgentClosed = errors.New("agent: agent closed")
 // Manager also serializes a subagent's inbox and the TUI drives the top-level
 // agent from one event loop.
 type Agent struct {
-	id             string
-	typ            string
-	model          string
-	system         string
-	client         llm.Client
-	tools          *tools.Registry
-	depth          int
-	callerID       string
-	allowSubagents bool
+	id               string
+	typ              string
+	model            string
+	system           string
+	reasoningEffort  string
+	reasoningSummary string
+	client           llm.Client
+	tools            *tools.Registry
+	depth            int
+	callerID         string
+	allowSubagents   bool
 
 	maxToolRounds   int
 	requestTimeout  time.Duration
@@ -173,26 +179,28 @@ func New(spec Spec) *Agent {
 		spec.MaxToolRounds = defaultMaxToolRounds
 	}
 	return &Agent{
-		id:              spec.ID,
-		typ:             spec.Type,
-		model:           spec.Model,
-		system:          spec.System,
-		client:          spec.Client,
-		tools:           spec.Tools,
-		depth:           spec.Depth,
-		callerID:        spec.CallerID,
-		allowSubagents:  spec.AllowSubagents,
-		maxToolRounds:   spec.MaxToolRounds,
-		requestTimeout:  spec.RequestTimeout,
-		toolResultBytes: spec.ToolResultBytes,
-		transcriptItems: spec.TranscriptItems,
-		transcriptBytes: spec.TranscriptBytes,
-		cleanup:         spec.Cleanup,
-		observer:        spec.Observer,
-		state:           StateStarting,
-		events:          make(chan Event, spec.EventCapacity),
-		inbox:           make(chan string, spec.InboxCapacity),
-		closeDone:       make(chan struct{}),
+		id:               spec.ID,
+		typ:              spec.Type,
+		model:            spec.Model,
+		system:           spec.System,
+		reasoningEffort:  spec.ReasoningEffort,
+		reasoningSummary: spec.ReasoningSummary,
+		client:           spec.Client,
+		tools:            spec.Tools,
+		depth:            spec.Depth,
+		callerID:         spec.CallerID,
+		allowSubagents:   spec.AllowSubagents,
+		maxToolRounds:    spec.MaxToolRounds,
+		requestTimeout:   spec.RequestTimeout,
+		toolResultBytes:  spec.ToolResultBytes,
+		transcriptItems:  spec.TranscriptItems,
+		transcriptBytes:  spec.TranscriptBytes,
+		cleanup:          spec.Cleanup,
+		observer:         spec.Observer,
+		state:            StateStarting,
+		events:           make(chan Event, spec.EventCapacity),
+		inbox:            make(chan string, spec.InboxCapacity),
+		closeDone:        make(chan struct{}),
 	}
 }
 
@@ -352,6 +360,9 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 	a.trimHistory()
 
 	for round := 0; round < a.maxToolRounds; round++ {
+		if a.reasoningSummary != "" || (a.reasoningEffort != "" && a.reasoningEffort != "none") {
+			a.emit(Event{Type: EventReasoningStart})
+		}
 		rctx, cancel := a.requestContext(ctx)
 		stream, err := a.client.Stream(rctx, a.buildRequest())
 		if err != nil {
@@ -516,10 +527,12 @@ func (a *Agent) buildRequest() llm.Request {
 	a.mu.Unlock()
 
 	req := llm.Request{
-		Model:  a.model,
-		System: a.system,
-		Stream: true,
-		Input:  history,
+		Model:            a.model,
+		System:           a.system,
+		Stream:           true,
+		Input:            history,
+		ReasoningEffort:  a.reasoningEffort,
+		ReasoningSummary: a.reasoningSummary,
 	}
 	if a.tools != nil {
 		req.Tools = a.tools.Definitions()
@@ -532,6 +545,8 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Ite
 	textDeltas := 0
 	for ev := range stream {
 		switch ev.Type {
+		case llm.EventReasoningDelta:
+			a.emit(Event{Type: EventReasoningDelta, Text: ev.Text})
 		case llm.EventTextDelta:
 			textDeltas++
 			a.emit(Event{Type: EventText, Text: ev.Text})

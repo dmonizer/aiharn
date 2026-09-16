@@ -35,6 +35,8 @@ const (
 	kindPlain lineKind = iota
 	kindUser
 	kindAssistant
+	kindReasoning
+	kindReasoningStatus
 	kindTool
 	kindCommand
 	kindError
@@ -57,6 +59,7 @@ type Model struct {
 
 	lines    []line // flushed transcript lines, oldest first
 	curText  []byte // streamed text not yet flushed to a line
+	curKind  lineKind
 	textarea textarea.Model
 	queue    []string // inputs waiting for the agent to become idle
 	running  bool
@@ -97,6 +100,10 @@ type Model struct {
 	// stopping the TUI bridges or closing the session.
 	turnCancel context.CancelFunc
 	stopping   bool
+
+	showReasoning   bool
+	thinking        bool
+	thinkingStarted time.Time
 
 	width  int
 	height int
@@ -155,8 +162,20 @@ func (m *Model) appendLine(kind lineKind, s string) {
 	m.trimLines()
 }
 
-// appendText accumulates a streamed text delta, flushing complete lines.
+// appendText accumulates a streamed assistant-text delta.
 func (m *Model) appendText(s string) {
+	m.appendStreamText(kindAssistant, s)
+}
+
+func (m *Model) appendReasoning(s string) {
+	m.appendStreamText(kindReasoning, s)
+}
+
+func (m *Model) appendStreamText(kind lineKind, s string) {
+	if len(m.curText) > 0 && m.curKind != kind {
+		m.flushText()
+	}
+	m.curKind = kind
 	m.curText = append(m.curText, sanitizeTerminalText(s)...)
 	if len(m.curText) > maxPartialTextBytes {
 		const marker = "[earlier streamed text truncated]"
@@ -172,7 +191,7 @@ func (m *Model) appendText(s string) {
 		if i < 0 {
 			return
 		}
-		m.lines = append(m.lines, line{text: string(m.curText[:i]), kind: kindAssistant, cmd: -1})
+		m.lines = append(m.lines, line{text: string(m.curText[:i]), kind: m.curKind, cmd: -1})
 		m.trimLines()
 		m.curText = m.curText[i+1:]
 	}
@@ -192,8 +211,9 @@ func (m *Model) trimLines() {
 // flushText moves any partial streamed text into the transcript.
 func (m *Model) flushText() {
 	if len(m.curText) != 0 {
-		m.lines = append(m.lines, line{text: string(m.curText), kind: kindAssistant, cmd: -1})
+		m.lines = append(m.lines, line{text: string(m.curText), kind: m.curKind, cmd: -1})
 		m.curText = nil
+		m.curKind = kindPlain
 		m.trimLines()
 	}
 }

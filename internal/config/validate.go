@@ -61,6 +61,18 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 			errs = append(errs, fmt.Sprintf("models[%q].api_key is required", name))
 		}
 		validateModelBaseURL(&errs, name, m)
+		if !validReasoningEffort(m.ReasoningEffort) {
+			errs = append(errs, fmt.Sprintf("models[%q].reasoning_effort %q is invalid", name, m.ReasoningEffort))
+		}
+		if !validReasoningSummary(m.ReasoningSummary) {
+			errs = append(errs, fmt.Sprintf("models[%q].reasoning_summary %q is invalid", name, m.ReasoningSummary))
+		}
+		if m.ReasoningSummary != "" && m.Provider != ProviderOpenAIResponses {
+			errs = append(errs, fmt.Sprintf("models[%q].reasoning_summary requires provider %q", name, ProviderOpenAIResponses))
+		}
+		if m.ReasoningEffort == "none" && m.ReasoningSummary != "" {
+			errs = append(errs, fmt.Sprintf("models[%q]: reasoning_summary cannot be requested when reasoning_effort is %q", name, "none"))
+		}
 	}
 
 	// Channels: names unique, required fields, type known, auth set.
@@ -206,6 +218,24 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		return fmt.Errorf("config: validation failed:\n  - %s", joinErrs(errs))
 	}
 	return nil
+}
+
+func validReasoningEffort(value string) bool {
+	switch value {
+	case "", "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+func validReasoningSummary(value string) bool {
+	switch value {
+	case "", "auto", "concise", "detailed":
+		return true
+	default:
+		return false
+	}
 }
 
 func joinErrs(errs []string) string {

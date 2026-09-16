@@ -21,9 +21,9 @@ const (
 type ItemType string
 
 const (
-	ItemMessage             ItemType = "message"
-	ItemFunctionCall        ItemType = "function_call"
-	ItemFunctionCallOutput  ItemType = "function_call_output"
+	ItemMessage            ItemType = "message"
+	ItemFunctionCall       ItemType = "function_call"
+	ItemFunctionCallOutput ItemType = "function_call_output"
 )
 
 // Item is a normalized, provider-neutral transcript entry. The agent is the
@@ -47,11 +47,13 @@ type ToolDefinition struct {
 
 // Request is a complete, stateless chat request.
 type Request struct {
-	Model  string
-	System string // system prompt / instructions
-	Stream bool
-	Input  []Item // full history, oldest first
-	Tools  []ToolDefinition
+	Model            string
+	System           string // system prompt / instructions
+	Stream           bool
+	Input            []Item // full history, oldest first
+	Tools            []ToolDefinition
+	ReasoningEffort  string // optional; supported values are model-dependent
+	ReasoningSummary string // Responses API summary mode: auto, concise, or detailed
 }
 
 // Usage reports token consumption for a completed response.
@@ -66,14 +68,15 @@ type EventType int
 
 const (
 	EventTextDelta EventType = iota
-	EventCompleted           // terminal: normalized output Items + Usage + FinishReason
-	EventFailed              // terminal: stream/provider error
+	EventReasoningDelta
+	EventCompleted // terminal: normalized output Items + Usage + FinishReason
+	EventFailed    // terminal: stream/provider error
 )
 
 // Event is a single normalized event emitted on the stream.
 type Event struct {
 	Type         EventType
-	Text         string // TextDelta
+	Text         string // TextDelta or ReasoningDelta
 	Items        []Item // Completed: output items to append to history
 	Usage        Usage
 	FinishReason string // Completed: "stop" or an incomplete reason
@@ -83,7 +86,7 @@ type Event struct {
 // Client streams a chat completion.
 //
 // Contract: setup/request failures are returned synchronously. After a non-nil
-// channel is returned, the producer emits zero or more TextDelta events, then
+// channel is returned, the producer emits zero or more text/reasoning events, then
 // exactly one terminal Completed or Failed event, then closes the channel.
 // Cancelling ctx unblocks any blocked send and closes the channel promptly
 // (without a terminal event).
