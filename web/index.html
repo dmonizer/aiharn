@@ -11,6 +11,7 @@
 </head>
 <body>
   <div class="shell">
+    <div id="sidebar-scrim" class="sidebar-scrim" aria-hidden="true"></div>
     <aside class="sidebar">
       <div class="brand">
         <div class="mark" aria-hidden="true">A</div>
@@ -24,13 +25,13 @@
       </div>
       <div class="sidebar-foot">
         <button id="open-settings" class="quiet-button">Settings</button>
-        <p>Tokens live only in this browser tab.</p>
+        <p>Login credentials live only in this browser tab.</p>
       </div>
     </aside>
 
     <section class="workspace">
       <header class="topbar">
-        <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open sessions">☰</button>
+        <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open sessions" aria-expanded="false" aria-controls="session-list">☰</button>
         <div class="session-title">
           <div class="eyebrow" id="endpoint-label">Not configured</div>
           <h1 id="agent-title">Current session</h1>
@@ -64,10 +65,11 @@
       <label>Name<input id="settings-name" name="name" autocomplete="off" placeholder="Production agent"></label>
       <label>API base URL<input id="settings-url" name="url" type="url" autocomplete="url" placeholder="https://agent.example.com" required></label>
       <p class="field-help" id="settings-url-help">Use the server origin, without <code>/api/v1</code>.</p>
-      <label>Bearer token<input id="settings-token" name="token" type="password" autocomplete="off" placeholder="Unchanged when left blank"></label>
-      <p class="field-help" id="settings-token-help">Leave blank to keep the stored token. Tokens live only in this browser tab.</p>
+      <label>Username<input id="settings-username" name="username" autocomplete="username" placeholder="Username"></label>
+      <label>Password<input id="settings-password" name="password" type="password" autocomplete="current-password" placeholder="Unchanged when left blank"></label>
+      <p class="field-help" id="settings-password-help">Enter your password to log in. Credentials stay in this browser tab.</p>
       <p id="settings-error" class="field-error hidden" role="alert"></p>
-      <div class="dialog-actions"><button type="button" id="forget-token" class="danger-button">Forget token</button><button type="submit" class="primary-button">Save</button></div>
+      <div class="dialog-actions"><button type="button" id="forget-credentials" class="danger-button">Log out</button><button type="submit" class="primary-button">Log in / Save</button></div>
     </form>
   </dialog>
 

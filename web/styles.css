@@ -376,7 +376,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .approval-actions .deny { color: #ffaaaa; }
 
 .transcript {
-  flex: 1 1 0;
+  /* flex-basis auto, not 0: a 0 basis gives a scaled shrink factor of 0, so this
+     item could not yield space to the bounded strip below it. Defence in depth
+     only (the strip's max-height is what fixes the layout); auto keeps the
+     transcript the element that gives up room, down to min-height: 0. */
+  flex: 1 1 auto;
   min-height: 0;
   padding: 26px max(28px, calc((100% - 920px) / 2));
   overflow-y: auto;
@@ -460,10 +464,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .tool-section-label { padding: 9px 12px 0; color: var(--faint); font: 10px ui-monospace, "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
 .tool-section pre { max-height: 330px; margin: 0; padding: 7px 12px 11px; overflow: auto; color: #aeb8bf; font: 11px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
 
+.thinking-block { margin: -4px 0 18px; border: 1px solid var(--line); border-radius: 10px; background: #101316; }
+.thinking-block summary { padding: 9px 12px; color: var(--muted); font: 11px ui-monospace, "SFMono-Regular", Consolas, monospace; cursor: pointer; }
+.thinking-block pre { max-height: 330px; margin: 0; padding: 8px 12px 12px; overflow: auto; color: #aeb8bf; font: 11px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
+.thinking-icon { display: inline-block; min-width: 20px; color: var(--accent); font-size: 15px; }
+.thinking-block.active .thinking-icon { color: var(--warn); animation: thinking-breathe 1.8s ease-in-out infinite; }
+@keyframes thinking-breathe { 50% { opacity: .3; transform: scale(.85); } }
+@media (prefers-reduced-motion: reduce) { .thinking-block.active .thinking-icon { animation: none; } }
+
 /* Agent messages still queued in an inbox: not in the transcript yet. A
    bounded, bordered strip directly above the composer so it can never be
    mistaken for the transcript. */
 .pending-agent-messages {
+  /* A long queued report used to hold the whole column open at its content
+     height, pushing the composer thousands of pixels below the viewport: a flex
+     item's content-based minimum size (min-height: auto) was clamped by nothing.
+     The max-height below is what stops that; overflow-y keeps the excess
+     scrolling inside the strip instead of spilling over the composer. */
+  overflow-y: auto;
+  /* At most 30% of the window, at most 320px, and never so much that the rest of
+     the column is squeezed. Fixed overhead below the strip is 229px (76px topbar
+     + 121px composer + its 22px and 10px margins), so a 320px reserve leaves an
+     80px transcript down to a 331px-tall window (where the strip's 22px
+     padding/border floor takes over). 30vh alone is not enough: at 1280x400 it
+     is 120px, which still squeezed the transcript to its own 52px padding. */
+  max-height: min(30vh, 320px, calc(100vh - 320px));
+  /* flex: none keeps the strip out of the free-space split entirely, so the
+     transcript is always the element that absorbs a deficit. */
+  flex: none;
   margin: 0 max(28px, calc((100% - 920px) / 2)) 10px;
   padding: 10px 14px;
   border: 1px solid #4a5a3a;
@@ -585,12 +613,17 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
 .dialog-actions .danger-button { margin-right: auto; }
 
 .mobile-only { display: none; }
+.sidebar-scrim { display: none; }
 
 @media (max-width: 760px) {
   .shell { grid-template-columns: 1fr; }
   .sidebar { position: fixed; z-index: 10; inset: 0 auto 0 0; width: min(84vw, 290px); transform: translateX(-102%); transition: transform .2s ease; box-shadow: 18px 0 50px rgba(0, 0, 0, .5); }
   body.menu-open .sidebar { transform: translateX(0); }
+  body.menu-open .sidebar-scrim { display: block; position: fixed; z-index: 9; inset: 0; background: rgba(0, 0, 0, .45); }
+  body.menu-open #mobile-menu { position: fixed; z-index: 11; top: 18px; left: 14px; transform: rotate(90deg); }
+  body.menu-open .brand { padding-left: 45px; }
   .mobile-only { display: grid; }
+  #mobile-menu { transition: transform .2s ease; }
   .topbar { min-height: 68px; gap: 11px; padding: 11px 14px; }
   .session-meta .meta-chip:nth-child(-n+2) { display: none; }
   .transcript { padding: 20px 14px; }
@@ -603,4 +636,67 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
 
 @media (hover: none) {
   .session-actions { visibility: visible; }
+}
+
+/* The execution-channel chip opens a dropdown when switching is supported. */
+.channel-menu-anchor { position: relative; display: inline-flex; }
+
+.meta-chip.channel-toggle {
+    cursor: pointer;
+    appearance: none;
+    text-align: center;
+}
+
+.meta-chip.channel-toggle:hover {
+    border-color: var(--line-bright);
+    color: var(--text);
+}
+
+.meta-chip.channel-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.channel-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 30;
+    min-width: 170px;
+    padding: 6px;
+    border: 1px solid var(--line-bright);
+    border-radius: 10px;
+    background: var(--panel);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .5);
+}
+
+.channel-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: 7px;
+    color: var(--muted);
+    background: transparent;
+    font: 11px ui-monospace, "SFMono-Regular", Consolas, monospace;
+    text-align: left;
+    cursor: pointer;
+}
+
+.channel-option:hover {
+    color: var(--text);
+    background: var(--panel-2);
+}
+
+.channel-option.active {
+    color: var(--accent);
+    background: rgba(185, 244, 95, .08);
+}
+
+.channel-option-type {
+    color: var(--faint);
+    font-size: 9px;
 }

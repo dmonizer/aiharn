@@ -2,11 +2,14 @@
   "use strict";
 
   const ENDPOINT_KEY = "aiharn.remote.endpoint.v2";
-  const TOKEN_KEY = "aiharn.remote.token.v2";
+  const CREDENTIALS_PREFIX = "aiharn.remote.credentials.v1:";
   const SESSION_KEY = "aiharn.remote.session.v2";
   const LEGACY_ENDPOINTS_KEY = "aiharn.remote.apis.v1";
   const LEGACY_ACTIVE_KEY = "aiharn.remote.active.v1";
-  const LEGACY_TOKEN_PREFIX = "aiharn.remote.token.";
+  sessionStorage.removeItem("aiharn.remote.token.v2");
+  for (const key of Object.keys(sessionStorage)) {
+    if (key.startsWith("aiharn.remote.token.")) sessionStorage.removeItem(key);
+  }
   const POLL_MS = 1000;
   const SESSIONS_POLL_MS = 5000;
   // A server built before the API reported its agent roster returns no "agents"
@@ -39,9 +42,10 @@
     settingsForm: document.querySelector("#settings-form"),
     settingsName: document.querySelector("#settings-name"),
     settingsUrl: document.querySelector("#settings-url"),
-    settingsToken: document.querySelector("#settings-token"),
+    settingsUsername: document.querySelector("#settings-username"),
+    settingsPassword: document.querySelector("#settings-password"),
     settingsUrlHelp: document.querySelector("#settings-url-help"),
-    settingsTokenHelp: document.querySelector("#settings-token-help"),
+    settingsPasswordHelp: document.querySelector("#settings-password-help"),
     settingsError: document.querySelector("#settings-error"),
     sessionDialog: document.querySelector("#session-dialog"),
     sessionForm: document.querySelector("#session-form"),
@@ -71,6 +75,8 @@
     sessionMode: "create",
     renameTarget: ""
   };
+
+  let openChannelMenu = null;
 
   function normalizeURL(value) {
     const url = new URL(value || location.origin, location.href);
@@ -127,8 +133,6 @@
       const url = normalizeURL(chosen.url);
       const migrated = { name: chosen.name || new URL(url).host, url };
       localStorage.setItem(ENDPOINT_KEY, JSON.stringify(migrated));
-      const legacyToken = sessionStorage.getItem(LEGACY_TOKEN_PREFIX + String(chosen.id || ""));
-      if (legacyToken) sessionStorage.setItem(TOKEN_KEY, legacyToken);
       return migrated;
     } catch {
       return null;
@@ -142,17 +146,46 @@
     }
   }
 
-  function token() {
-    return sessionStorage.getItem(TOKEN_KEY) || "";
+  function credentialsKey(endpoint = state.endpoint) {
+    return CREDENTIALS_PREFIX + (endpoint?.url || "");
   }
 
-  function setToken(value) {
-    if (value) sessionStorage.setItem(TOKEN_KEY, value);
-    else sessionStorage.removeItem(TOKEN_KEY);
+  function credentials() {
+    try {
+      return JSON.parse(sessionStorage.getItem(credentialsKey()) || "null") || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function username() {
+    return credentials().username || "";
+  }
+
+  function password() {
+    return credentials().password || "";
+  }
+
+  function forgetCredentials(endpoint = state.endpoint) {
+    sessionStorage.removeItem(credentialsKey(endpoint));
+  }
+
+  function basicAuthorization(user, pass) {
+    const bytes = new TextEncoder().encode(user + ":" + pass);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return "Basic " + btoa(binary);
   }
 
   function selectedAgentID() {
     return state.selectedAgents.get(state.sessionId) || "";
+  }
+
+  function setMenuOpen(open) {
+    document.body.classList.toggle("menu-open", open);
+    const button = document.querySelector("#mobile-menu");
+    button.setAttribute("aria-expanded", String(open));
+    button.setAttribute("aria-label", open ? "Close sessions" : "Open sessions");
   }
 
   function draftKey(sessionID = state.sessionId, agentID = selectedAgentID()) {
@@ -190,8 +223,9 @@
     if (!endpoint) throw new Error("No API is configured");
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
-    const bearer = token();
-    if (bearer) headers.set("Authorization", "Bearer " + bearer);
+    if (username() && password()) {
+      headers.set("Authorization", basicAuthorization(username(), password()));
+    }
     if (options.body) headers.set("Content-Type", "application/json");
 
     const response = await fetch(endpoint.url + "/api/v1" + path, {
@@ -330,7 +364,10 @@
   }
 
   function selectAgent(id) {
-    if (!state.endpoint || selectedAgentID() === id) return;
+    if (!state.endpoint || selectedAgentID() === id) {
+      setMenuOpen(false);
+      return;
+    }
     state.drafts.set(draftKey(), elements.message.value);
     state.selectedAgents.set(state.sessionId, id);
     elements.message.value = state.drafts.get(draftKey()) || "";
@@ -348,12 +385,12 @@
     elements.transcript.replaceChildren(emptyState("Loading agent…", id));
     renderPendingAgentMessages();
     poll();
-    document.body.classList.remove("menu-open");
+    setMenuOpen(false);
   }
 
   function selectSession(id) {
     if (!state.endpoint || state.sessionId === id) {
-      document.body.classList.remove("menu-open");
+      setMenuOpen(false);
       return;
     }
     state.drafts.set(draftKey(), elements.message.value);
@@ -367,7 +404,7 @@
     renderSessionList();
     renderWaiting();
     poll();
-    document.body.classList.remove("menu-open");
+    setMenuOpen(false);
   }
 
   async function closeSession(id) {
@@ -452,14 +489,17 @@
   // mode, state). The approval mode is interactive only when the snapshot
   // advertises the "approval_mode" capability: a server that predates the
   // /session/approval route would otherwise receive a doomed POST and surface
-  // an error, so an old server keeps the plain, non-clickable chip.
-  function renderSessionMeta(session, capabilities) {
-    elements.sessionMeta.replaceChildren(
-      ...(session.model ? [chip(session.model)] : []),
-      ...(session.channel ? [chip(session.channel)] : []),
-      approvalChip(session, capabilities),
-      chip(session.state || "unknown", "state-" + (session.state || "unknown"))
-    );
+  // an error, so an old server keeps the plain, non-clickable chip. The
+  // execution channel is interactive only when the server advertises the
+  // "channel_switch" capability and the session is live.
+  function renderSessionMeta(session, capabilities, channels) {
+    const items = [];
+    if (session.model) items.push(chip(session.model));
+    const channel = channelChip(session, capabilities, channels);
+    if (channel) items.push(channel);
+    items.push(approvalChip(session, capabilities));
+    items.push(chip(session.state || "unknown", "state-" + (session.state || "unknown")));
+    elements.sessionMeta.replaceChildren(...items);
   }
 
   function approvalChip(session, capabilities) {
@@ -482,7 +522,8 @@
 
   async function toggleApprovalMode(button, capabilities) {
     if (!state.endpoint || button.disabled) return;
-    const session = state.snapshots.get(state.sessionId)?.session || {};
+    const snapshot = state.snapshots.get(state.sessionId);
+    const session = snapshot?.session || {};
     const mode = session.approval_mode || "ask";
     const next = mode === "ask" ? "allow-all" : "ask";
     const payload = { mode: next };
@@ -500,7 +541,7 @@
       setApprovalMode(applied);
       // Re-render immediately so the chip shows the new mode; the once-per-
       // second poll will confirm it against the server.
-      renderSessionMeta(session, capabilities);
+      renderSessionMeta(session, capabilities, snapshot?.channels);
     } catch (error) {
       // Surface through the existing notice and restore the chip so the poll
       // loop keeps running instead of leaving a stuck, disabled button.
@@ -516,6 +557,111 @@
     if (entry) entry.approval_mode = mode;
     const snapshot = state.snapshots.get(state.sessionId);
     if (snapshot && snapshot.session) snapshot.session.approval_mode = mode;
+  }
+
+  // channelChip renders the execution-channel chip. When the server advertises
+  // channel switching and the session is live, the chip is a button that opens a
+  // dropdown; otherwise it is the existing plain chip.
+  function channelChip(session, capabilities, channels) {
+    if (!session.channel) return null;
+    const capable = Array.isArray(capabilities) &&
+      capabilities.indexOf("channel_switch") !== -1;
+    const unavailable = session.state === "closed" || session.state === "errored";
+    if (!capable || unavailable) return chip(session.channel);
+
+    const wrapper = document.createElement("span");
+    wrapper.className = "channel-menu-anchor";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "meta-chip channel-toggle";
+    button.textContent = session.channel;
+    button.title = "Switch execution channel";
+    button.setAttribute("aria-haspopup", "listbox");
+    button.setAttribute("aria-expanded", "false");
+    button.addEventListener("click", () => toggleChannelMenu(button, channels));
+    wrapper.append(button);
+    return wrapper;
+  }
+
+  function closeChannelMenu() {
+    if (openChannelMenu) {
+      openChannelMenu.remove();
+      openChannelMenu = null;
+    }
+    const open = document.querySelector(".channel-toggle[aria-expanded='true']");
+    if (open) open.setAttribute("aria-expanded", "false");
+  }
+
+  function toggleChannelMenu(button, channels) {
+    if (openChannelMenu && button.getAttribute("aria-expanded") === "true") {
+      closeChannelMenu();
+      return;
+    }
+    closeChannelMenu();
+    button.setAttribute("aria-expanded", "true");
+
+    const wrapper = document.createElement("span");
+    wrapper.className = "channel-menu-anchor channel-menu-open";
+    const menu = document.createElement("div");
+    menu.className = "channel-menu";
+    menu.setAttribute("role", "listbox");
+    menu.setAttribute("aria-label", "Execution channel");
+
+    const current = button.textContent;
+    for (const channel of channels || []) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "channel-option" + (channel.name === current ? " active" : "");
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", channel.name === current ? "true" : "false");
+
+      const label = document.createElement("span");
+      label.textContent = channel.name;
+      const type = document.createElement("span");
+      type.className = "channel-option-type";
+      type.textContent = channel.type;
+      option.append(label, type);
+
+      option.addEventListener("click", () => {
+        closeChannelMenu();
+        selectChannel(channel.name);
+      });
+      menu.append(option);
+    }
+
+    wrapper.append(menu);
+    button.parentElement.appendChild(wrapper);
+    openChannelMenu = wrapper;
+  }
+
+  async function selectChannel(name) {
+    if (!state.endpoint || !name) return;
+    const payload = { channel: name };
+    if (state.sessionSupport === true && state.sessionId) {
+      payload.session_id = state.sessionId;
+    }
+    const snapshot = state.snapshots.get(state.sessionId);
+    const session = snapshot?.session || {};
+    try {
+      const result = await apiCall("/session/channel", {
+        method: "POST", body: JSON.stringify(payload)
+      });
+      const applied = result && typeof result.channel === "string" ? result.channel : name;
+      setChannel(applied);
+      renderSessionMeta(session, snapshot?.capabilities, snapshot?.channels);
+    } catch (error) {
+      showConnection(error.message || "Could not change the execution channel.");
+    }
+    await poll(true);
+  }
+
+  // setChannel records the server-confirmed channel on the active session and its
+  // cached snapshot so the next render reflects it without a fresh poll.
+  function setChannel(name) {
+    const entry = activeSession();
+    if (entry) entry.channel = name;
+    const snapshot = state.snapshots.get(state.sessionId);
+    if (snapshot && snapshot.session) snapshot.session.channel = name;
   }
 
   function renderSnapshot(snapshot) {
@@ -548,15 +694,15 @@
       state: session.state, depth: 0, paused: false
     }] : agents, session.agent_id);
 
-    renderSessionMeta(session, snapshot.capabilities);
+    renderSessionMeta(session, snapshot.capabilities, snapshot.channels);
     elements.queue.textContent = snapshot.queued_messages
       ? snapshot.queued_messages + " queued"
       : "";
     const unavailable = session.state === "closed" || session.state === "errored";
     elements.message.disabled = unavailable;
     elements.send.disabled = unavailable || !elements.message.value.trim();
-    renderApprovals(snapshot.pending_approvals || []);
-    renderMessages(snapshot.messages || []);
+    renderApprovals(snapshot.pending_approvals || [], snapshot.pending_tool_limits || []);
+    renderMessages(snapshot.messages || [], snapshot.live_reasoning);
     renderPendingAgentMessages(snapshot.pending_agent_messages);
     if (state.sessionSupport === false) showConnection(LEGACY_SERVER_NOTICE);
     else if (stale) showConnection(STALE_SERVER_NOTICE);
@@ -619,7 +765,7 @@
     strip.append(head, items);
   }
 
-  function renderMessages(messages) {
+  function renderMessages(messages, liveReasoning) {
     const previousTop = elements.transcript.scrollTop;
     const nearBottom = elements.transcript.scrollHeight - previousTop -
       elements.transcript.clientHeight < 100;
@@ -627,15 +773,22 @@
       elements.transcript.querySelectorAll(".tool-block[open]"),
       (block) => block.dataset.toolKey
     ));
+    const existingThinking = Array.from(elements.transcript.querySelectorAll(".thinking-block"));
+    const expandedThinking = new Set(existingThinking.filter((block) => block.open).map((block) => block.dataset.thinkingKey));
+    const hadLiveThinking = existingThinking.some((block) => block.dataset.thinkingKey === "live");
     elements.transcript.replaceChildren();
-    if (!messages.length) {
+    if (!messages.length && !liveReasoning) {
       elements.transcript.append(emptyState("Session is ready", "Send a message to begin."));
       return;
     }
 
+    let thinkingIndex = 0;
     for (const entry of groupMessages(messages)) {
       const message = entry.message;
-      if (message.type === "message") {
+      if (message.type === "reasoning") {
+        const key = "thinking-" + thinkingIndex++;
+        elements.transcript.append(renderThinking(message.content || "", false, key, expandedThinking.has(key)));
+      } else if (message.type === "message") {
         // A completed subagent report arrives in the top-level history as a
         // role:"user" item injected by the agent system. Without an origin it is
         // indistinguishable from something the human typed, so it used to wear
@@ -684,9 +837,29 @@
         elements.transcript.append(renderToolBlock(entry, expandedTools));
       }
     }
+    if (liveReasoning) {
+      elements.transcript.append(renderThinking(liveReasoning.text || "", Boolean(liveReasoning.active),
+        "live", expandedThinking.has("live") || !hadLiveThinking));
+    }
     elements.transcript.scrollTop = nearBottom
       ? elements.transcript.scrollHeight
       : previousTop;
+  }
+
+  function renderThinking(content, active, key, expanded) {
+    const details = document.createElement("details");
+    details.className = "thinking-block" + (active ? " active" : "");
+    details.dataset.thinkingKey = key;
+    details.open = expanded;
+    const summary = document.createElement("summary");
+    const icon = document.createElement("span");
+    icon.className = "thinking-icon";
+    icon.textContent = active ? "◌" : "✓";
+    summary.append(icon, document.createTextNode(active ? "Thinking…" : "Thinking"));
+    const body = document.createElement("pre");
+    body.textContent = content || (active ? "Waiting for the model…" : "");
+    details.append(summary, body);
+    return details;
   }
 
   function groupMessages(messages) {
@@ -755,7 +928,7 @@
     details.append(section);
   }
 
-  function renderApprovals(approvals) {
+  function renderApprovals(approvals, toolLimits = []) {
     elements.approvals.replaceChildren();
     for (const approval of approvals) {
       const card = document.createElement("article");
@@ -794,6 +967,41 @@
         button.className = className;
         button.textContent = text;
         button.addEventListener("click", () => resolveApproval(approval.id, decision, button));
+        actions.append(button);
+      }
+      card.append(content, actions);
+      elements.approvals.append(card);
+    }
+    for (const limit of toolLimits) {
+      const card = document.createElement("article");
+      card.className = "approval-card";
+      const content = document.createElement("div");
+      const heading = document.createElement("div");
+      heading.className = "approval-heading";
+      heading.textContent = agentLabel(limit.agent_id) + " used " + limit.count +
+        " tool calls this turn. Stop, continue without a cap, or double to " + (limit.limit * 2) + "?";
+      content.append(heading);
+      const actions = document.createElement("div");
+      actions.className = "approval-actions";
+      for (const [label, decision] of [["Stop", "stop"], ["Continue", "continue"], ["Double", "double"]]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = decision === "stop" ? "deny" : "approve";
+        button.textContent = label;
+        button.addEventListener("click", async () => {
+          for (const sibling of actions.children) sibling.disabled = true;
+          try {
+            const payload = { decision, agent_id: limit.agent_id };
+            if (state.sessionSupport === true && state.sessionId) payload.session_id = state.sessionId;
+            await apiCall("/tool-limits/" + encodeURIComponent(limit.id), {
+              method: "POST", body: JSON.stringify(payload)
+            });
+            poll(true);
+          } catch (error) {
+            showConnection(error.message || "Could not resolve tool-call limit.");
+            for (const sibling of actions.children) sibling.disabled = false;
+          }
+        });
         actions.append(button);
       }
       card.append(content, actions);
@@ -864,7 +1072,7 @@
       state.sessions = [];
       renderSessionList();
       showConnection(error.status === 401
-        ? "Authentication required. Set the access token in settings."
+        ? "Invalid username or password. Open settings to log in."
         : error.message);
     } finally {
       clearTimeout(state.sessionsTimer);
@@ -924,7 +1132,7 @@
       elements.message.disabled = true;
       elements.send.disabled = true;
       showConnection(error.status === 401
-        ? "Authentication required. Set the access token in settings."
+        ? "Invalid username or password. Open settings to log in."
         : error.message);
     } finally {
       // Reschedule whenever this is still the newest poll. Comparing on the
@@ -983,18 +1191,18 @@
     const endpoint = state.endpoint;
     elements.settingsName.value = endpoint?.name || "";
     elements.settingsUrl.value = endpoint?.url || "";
-    // Never prefill the token: a blank field keeps whatever is stored.
-    elements.settingsToken.value = "";
+    elements.settingsUsername.value = username();
+    elements.settingsPassword.value = "";
     elements.settingsUrl.readOnly = Boolean(endpoint?.deployed);
     elements.settingsUrlHelp.textContent = endpoint?.deployed
-      ? "Configured by deployment; the token below is still editable."
+      ? "Configured by deployment; login below is still editable."
       : "";
     if (!endpoint?.deployed) {
       elements.settingsUrlHelp.textContent = "Use the server origin, without /api/v1.";
     }
-    elements.settingsTokenHelp.textContent = token()
-      ? "Leave blank to keep the stored token. Tokens live only in this browser tab."
-      : "No token stored yet. Tokens live only in this browser tab.";
+    elements.settingsPasswordHelp.textContent = password()
+      ? "Leave blank to keep the password for this browser tab."
+      : "Enter your password to log in. Credentials stay in this browser tab.";
     showDialogError(elements.settingsError, "");
     elements.settingsDialog.showModal();
     setTimeout(() => elements.settingsName.focus(), 0);
@@ -1044,8 +1252,9 @@
   });
   document.querySelector("#new-session").addEventListener("click", () => openSessionDialog("create"));
   document.querySelector("#mobile-menu").addEventListener("click", () => {
-    document.body.classList.toggle("menu-open");
+    setMenuOpen(!document.body.classList.contains("menu-open"));
   });
+  document.querySelector("#sidebar-scrim").addEventListener("click", () => setMenuOpen(false));
 
   elements.settingsForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1066,14 +1275,23 @@
       }
     }
     const changed = !previous || previous.url !== url;
+    const enteredUsername = elements.settingsUsername.value.trim();
+    const enteredPassword = elements.settingsPassword.value;
+    if (!enteredUsername || (!enteredPassword && (changed || enteredUsername !== username() || !password()))) {
+      showDialogError(elements.settingsError, "Enter a username and password.");
+      return;
+    }
+    if (changed) forgetCredentials(previous);
     saveEndpoint({
       name: previous?.deployed ? previous.name : name,
       url,
       deployed: Boolean(previous?.deployed)
     });
-    // Only a non-empty field replaces the stored token.
-    if (elements.settingsToken.value) setToken(elements.settingsToken.value);
-    elements.settingsToken.value = "";
+    sessionStorage.setItem(credentialsKey(), JSON.stringify({
+      username: enteredUsername,
+      password: enteredPassword || password()
+    }));
+    elements.settingsPassword.value = "";
     elements.settingsDialog.close();
     if (changed) {
       // Session ids belong to one server, so a new URL starts a new selection.
@@ -1088,11 +1306,12 @@
     }
   });
   elements.settingsUrl.addEventListener("input", () => showDialogError(elements.settingsError, ""));
-  document.querySelector("#forget-token").addEventListener("click", () => {
-    setToken("");
-    elements.settingsToken.value = "";
-    elements.settingsTokenHelp.textContent =
-      "No token stored yet. Tokens live only in this browser tab.";
+  document.querySelector("#forget-credentials").addEventListener("click", () => {
+    forgetCredentials();
+    elements.settingsUsername.value = "";
+    elements.settingsPassword.value = "";
+    elements.settingsPasswordHelp.textContent =
+      "Enter your password to log in. Credentials stay in this browser tab.";
     showDialogError(elements.settingsError, "");
     refreshAfterEndpointChange();
     poll(true);
@@ -1163,6 +1382,18 @@
   };
   composerResize.addEventListener("pointerup", endResize);
   composerResize.addEventListener("pointercancel", endResize);
+
+  document.addEventListener("click", (event) => {
+    // A click on the toggle button is handled by its own listener; treating it
+    // as an outside click here would immediately close the menu it just opened.
+    const onToggle = event.target && event.target.closest && event.target.closest(".channel-toggle");
+    if (openChannelMenu && !openChannelMenu.contains(event.target) && !onToggle) {
+      closeChannelMenu();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeChannelMenu();
+  });
 
   renderSessionList();
   renderWaiting();
