@@ -79,7 +79,9 @@ system_prompt = "prompts/main_pentester.md"
 channel = "sf"
 # working_dir is unset by default; an agent override takes precedence over its channel's.
 # working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"
-# tools = "none" # default; also accepts "all" or a tool-name list
+# tools = "none" # default; accepts "ALL", "NONE", "execute_command,spawn_subagent", or a TOML array (including ["ALL"] or ["NONE"])
+# Available: execute_command, set_approval, list_subagent_types, spawn_subagent,
+# send_subagent_message, send_agent_message, check_subagent, list_subagents, close_subagent
 tools = "all"
 # allow_subagents = false # default
 allow_subagents = true
@@ -108,7 +110,9 @@ command_output_bytes = 262144  # raw stdout+stderr cap per command (bytes)
 tool_result_bytes = 65536      # max model-visible tool result (bytes)
 inbox_depth = 32               # per-agent interim-message queue
 event_capacity = 256           # agent->TUI event channel
-request_timeout = "60s"        # provider request timeout
+toolcalls_per_turn = 64        # ask to stop, continue without a cap, or double at this many tool calls
+thinking_timeout = "180s"      # request setup and thinking, until answer text or a tool call begins
+request_timeout = "60s"        # answer text or tool call through response completion
 transcript_max_items = 200     # retained conversation items (0 = default)
 transcript_max_bytes = 1048576 # retained conversation content bytes (0 = default)
 
@@ -117,11 +121,10 @@ mode = "ask"                   # default; alternative: "allow-all"
 
 # Optional current-session HTTP API. The values below are all defaults, so the
 # API stays disabled. Every value can be overridden with the
-# matching --api-* flag. AIHARN_API_TOKEN overrides token; prefer interpolation
-# or the environment variable instead of committing a literal secret.
+# matching --api-* flag. AIHARN_AUTH_FILE overrides auth_file.
 [api]
 listen = ""               # default: disabled; e.g. "127.0.0.1:7331"
-token = ""                # default; set a secret for non-loopback listening
+auth_file = ""            # required when enabled; path outside web/
 allow_origins = []        # default: no cross-origin frontend access
 only = false             # default: run the terminal UI; true requires listen
 max_sessions = 8         # default; counts the default session; 0 uses the built-in default
