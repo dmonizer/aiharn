@@ -61,6 +61,7 @@ const (
 	ItemMessage            ItemType = "message"
 	ItemFunctionCall       ItemType = "function_call"
 	ItemFunctionCallOutput ItemType = "function_call_output"
+	ItemReasoning          ItemType = "reasoning" // display-only; never sent to the provider
 )
 
 // Item is a normalized, provider-neutral transcript entry. The agent is the
@@ -114,8 +115,9 @@ type EventType int
 const (
 	EventTextDelta EventType = iota
 	EventReasoningDelta
-	EventCompleted // terminal: normalized output Items + Usage + FinishReason
-	EventFailed    // terminal: stream/provider error
+	EventCompleted       // terminal: normalized output Items + Usage + FinishReason
+	EventFailed          // terminal: stream/provider error
+	EventResponseStarted // first answer or tool-call output; ends the thinking budget
 )
 
 // Event is a single normalized event emitted on the stream.

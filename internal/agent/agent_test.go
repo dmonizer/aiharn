@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -81,7 +82,7 @@ func TestTurnForwardsReasoningConfigurationAndEvents(t *testing.T) {
 	client := &testllm.FakeClient{Script: [][]llm.Event{{
 		{Type: llm.EventReasoningDelta, Text: "checking"},
 		{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "done"}}},
-	}}}
+	}, {{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "again"}}}}}}
 	a := agent.New(agent.Spec{
 		ID: "a1", Type: "main", Model: "m", Client: client,
 		ReasoningEffort: "high", ReasoningSummary: "auto",
@@ -102,6 +103,18 @@ func TestTurnForwardsReasoningConfigurationAndEvents(t *testing.T) {
 	}
 	if !start || !delta {
 		t.Fatalf("reasoning events = %+v, want start and delta", events)
+	}
+	history := a.History()
+	if len(history) != 3 || history[1].Type != llm.ItemReasoning || history[1].Content != "checking" {
+		t.Fatalf("reasoning history = %+v", history)
+	}
+	if err := a.Turn(context.Background(), "follow-up"); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range client.Requests()[1].Input {
+		if item.Type == llm.ItemReasoning {
+			t.Fatal("display-only reasoning was sent to provider")
+		}
 	}
 }
 
@@ -328,13 +341,237 @@ func TestTurnRequestTimeout(t *testing.T) {
 		Client:         blockingClient{},
 		RequestTimeout: 50 * time.Millisecond,
 	})
+	defer a.Close()
 
-	err := a.Turn(context.Background(), "hi")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	if err := a.Turn(context.Background(), "hi"); err != nil {
+		t.Fatalf("Turn: %v", err)
 	}
-	if a.State() != agent.StateErrored {
-		t.Fatalf("state = %v, want errored", a.State())
+	if a.State() != agent.StateIdle {
+		t.Fatalf("state = %v, want idle", a.State())
+	}
+	if got := a.History()[1].Content; !strings.Contains(got, "time budget for thinking (50ms)") {
+		t.Fatalf("timeout note = %q", got)
+	}
+	if !a.SendAgent("subagent report", &llm.Delivery{From: "sub-1", To: "a1", Direction: llm.DirectionUp, Kind: llm.KindReport}) {
+		t.Fatal("timed-out parent rejected subagent report")
+	}
+}
+
+type timeoutThenClient struct {
+	mu       sync.Mutex
+	calls    int
+	first    llm.Event
+	requests []llm.Request
+}
+
+func (c *timeoutThenClient) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
+	c.mu.Lock()
+	c.calls++
+	call := c.calls
+	c.requests = append(c.requests, req)
+	c.mu.Unlock()
+	out := make(chan llm.Event, 2)
+	go func() {
+		defer close(out)
+		if call == 1 {
+			out <- c.first
+			<-ctx.Done()
+			return
+		}
+		out <- llm.Event{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "recovered"}}}
+	}()
+	return out, nil
+}
+
+func TestTimeoutPhaseAndNextInput(t *testing.T) {
+	for _, tc := range []struct {
+		name, phase, partial string
+		first                llm.Event
+		thinking, response   time.Duration
+	}{
+		{"thinking", "thinking", "", llm.Event{Type: llm.EventReasoningDelta, Text: "considering"}, 25 * time.Millisecond, time.Second},
+		{"response", "response", "partial", llm.Event{Type: llm.EventTextDelta, Text: "partial"}, time.Second, 25 * time.Millisecond},
+		{"tool call", "response", "", llm.Event{Type: llm.EventResponseStarted}, time.Second, 25 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &timeoutThenClient{first: tc.first}
+			a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client,
+				ThinkingTimeout: tc.thinking, RequestTimeout: tc.response})
+			defer a.Close()
+			if err := a.Turn(context.Background(), "first"); err != nil {
+				t.Fatal(err)
+			}
+			if a.State() != agent.StateIdle {
+				t.Fatalf("state = %v", a.State())
+			}
+			history := a.History()
+			got := history[len(history)-1].Content
+			if !strings.Contains(got, "time budget for "+tc.phase) || !strings.HasPrefix(got, tc.partial) {
+				t.Fatalf("timeout transcript = %q", got)
+			}
+			if !a.SendAgent("subagent report", &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindReport}) {
+				t.Fatal("report was rejected")
+			}
+			deadline := time.After(time.Second)
+			for {
+				client.mu.Lock()
+				calls := client.calls
+				client.mu.Unlock()
+				if calls >= 2 {
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatal("subagent report did not resume timed-out parent")
+				case <-time.After(time.Millisecond):
+				}
+			}
+			client.mu.Lock()
+			reqs := append([]llm.Request(nil), client.requests...)
+			client.mu.Unlock()
+			if len(reqs) != 2 || len(reqs[1].Input) < 3 {
+				t.Fatalf("next request = %+v", reqs)
+			}
+			if !strings.Contains(reqs[1].Input[1].Content, "time budget for "+tc.phase) ||
+				reqs[1].Input[2].Content != "subagent report" {
+				t.Fatalf("next request did not receive timeout and report: %+v", reqs[1].Input)
+			}
+			var saw bool
+			for _, ev := range drainEvents(a) {
+				if ev.Type == agent.EventTimeout && ev.TimeoutPhase == tc.phase {
+					saw = true
+				}
+			}
+			if !saw {
+				t.Fatal("missing timeout event for live chat")
+			}
+		})
+	}
+}
+
+func TestUserInputAfterTimeoutReceivesNote(t *testing.T) {
+	client := &timeoutThenClient{first: llm.Event{Type: llm.EventReasoningDelta, Text: "working"}}
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client,
+		ThinkingTimeout: 25 * time.Millisecond, RequestTimeout: time.Second})
+	defer a.Close()
+	if err := a.Turn(context.Background(), "first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Turn(context.Background(), "continue"); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	reqs := append([]llm.Request(nil), client.requests...)
+	client.mu.Unlock()
+	if len(reqs) != 2 || !strings.Contains(reqs[1].Input[1].Content, "time budget for thinking") ||
+		reqs[1].Input[2].Content != "continue" {
+		t.Fatalf("user continuation request = %+v", reqs)
+	}
+}
+
+func TestProviderDeadlineIsRecoverable(t *testing.T) {
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: &testllm.FakeClient{SetupErr: context.DeadlineExceeded},
+		ThinkingTimeout: time.Second, RequestTimeout: time.Second})
+	if err := a.Turn(context.Background(), "first"); err != nil {
+		t.Fatal(err)
+	}
+	if a.State() != agent.StateIdle || !strings.Contains(a.History()[1].Content, "provider request during thinking") {
+		t.Fatalf("state=%v history=%+v", a.State(), a.History())
+	}
+}
+
+type blockingSetupClient struct{}
+
+func (blockingSetupClient) Stream(ctx context.Context, _ llm.Request) (<-chan llm.Event, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestThinkingTimeoutDuringRequestSetup(t *testing.T) {
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: blockingSetupClient{},
+		ThinkingTimeout: 25 * time.Millisecond, RequestTimeout: time.Second})
+	if err := a.Turn(context.Background(), "first"); err != nil {
+		t.Fatal(err)
+	}
+	if a.State() != agent.StateIdle || !strings.Contains(a.History()[1].Content, "time budget for thinking (25ms)") {
+		t.Fatalf("state=%v history=%+v", a.State(), a.History())
+	}
+}
+
+func waitToolLimit(t *testing.T, a *agent.Agent, count int) agent.ToolLimitRequest {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if pending := a.PendingToolLimit(); pending != nil && pending.Count == count {
+			return *pending
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("tool-call limit prompt for count %d did not appear", count)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func TestToolCallLimitCanDoubleThenContinue(t *testing.T) {
+	reg := tools.New()
+	if err := reg.Register(stubTool{name: "noop", out: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &testllm.FakeClient{}
+	for i := 1; i <= 3; i++ {
+		client.Script = append(client.Script, []llm.Event{{Type: llm.EventCompleted, Items: []llm.Item{{
+			Type: llm.ItemFunctionCall, CallID: fmt.Sprintf("c%d", i), Name: "noop", Args: "{}",
+		}}}})
+	}
+	client.Script = append(client.Script, []llm.Event{{Type: llm.EventCompleted, Items: []llm.Item{{
+		Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "done",
+	}}}})
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client, Tools: reg, ToolcallsPerTurn: 1})
+	defer a.Close()
+	done := make(chan error, 1)
+	go func() { done <- a.Turn(context.Background(), "go") }()
+	first := waitToolLimit(t, a, 1)
+	if first.Limit != 1 || a.DecideToolLimit(first.ID, "double") != nil {
+		t.Fatalf("first prompt = %+v", first)
+	}
+	second := waitToolLimit(t, a, 2)
+	if second.Limit != 2 || a.DecideToolLimit(second.ID, "continue") != nil {
+		t.Fatalf("second prompt = %+v", second)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if a.State() != agent.StateIdle || len(client.Requests()) != 4 || a.PendingToolLimit() != nil {
+		t.Fatalf("state=%v requests=%d pending=%+v", a.State(), len(client.Requests()), a.PendingToolLimit())
+	}
+}
+
+func TestToolCallLimitStopKeepsHistoryValid(t *testing.T) {
+	reg := tools.New()
+	if err := reg.Register(stubTool{name: "noop", out: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &testllm.FakeClient{Script: [][]llm.Event{
+		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemFunctionCall, CallID: "c1", Name: "noop", Args: "{}"}}}},
+		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemFunctionCall, CallID: "c2", Name: "noop", Args: "{}"}}}},
+	}}
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client, Tools: reg, ToolcallsPerTurn: 1})
+	defer a.Close()
+	done := make(chan error, 1)
+	go func() { done <- a.Turn(context.Background(), "go") }()
+	pending := waitToolLimit(t, a, 1)
+	if err := a.DecideToolLimit(pending.ID, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	history := a.History()
+	if a.State() != agent.StateIdle || len(history) < 6 || history[len(history)-2].Type != llm.ItemFunctionCallOutput ||
+		!strings.Contains(history[len(history)-2].Content, "skipped") ||
+		!strings.Contains(history[len(history)-1].Content, "Stopped this turn") {
+		t.Fatalf("state=%v history=%+v", a.State(), history)
 	}
 }
 

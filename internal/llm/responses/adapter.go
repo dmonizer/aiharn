@@ -77,6 +77,11 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 				if !emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: evt.Delta}) {
 					return
 				}
+			case openai.ResponseStreamEventFunctionArgumentsDelta,
+				openai.ResponseStreamEventCustomToolInputDelta:
+				if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
+					return
+				}
 			case openai.ResponseStreamEventCompleted:
 				if evt.Response == nil {
 					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: completed event has no response")})

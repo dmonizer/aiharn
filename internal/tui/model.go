@@ -86,6 +86,8 @@ type Model struct {
 	approvalScroll     int
 	approvalLinkHit    approvalHit
 	approvalCloseHit   approvalHit
+	toolLimit          *agent.ToolLimitRequest
+	toolLimitQueue     []agent.ToolLimitRequest
 
 	// shell session view
 	shellCmds    []shellCmd

@@ -59,6 +59,43 @@ func TestUpdateTextDelta(t *testing.T) {
 	}
 }
 
+func TestTimeoutNoteFollowsPartialBlock(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delta agent.EventType
+		phase string
+	}{
+		{"thinking", agent.EventReasoningDelta, "thinking"},
+		{"response", agent.EventText, "response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestModel(t)
+			m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: tc.delta, Text: "partial"}})
+			m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventTimeout, TimeoutPhase: tc.phase, Text: "time budget exceeded"}})
+			m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventState, State: agent.StateIdle}})
+			var found bool
+			for i := 1; i < len(m.lines); i++ {
+				if m.lines[i-1].text == "partial" && m.lines[i].text == "time budget exceeded" &&
+					m.lines[i-1].kind == m.lines[i].kind {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("timeout note not beside partial block: %+v", m.lines)
+			}
+		})
+	}
+}
+
+func TestClosedCallerCloseSubagentIsWarning(t *testing.T) {
+	m := newTestModel(t)
+	m, _ = upd(t, m, subagentClosedMsg{id: "sub-1", err: agent.ErrCallerUnavailable})
+	if len(m.lines) == 0 || m.lines[len(m.lines)-1].kind != kindPlain ||
+		!strings.Contains(m.lines[len(m.lines)-1].text, "warning: subagent was not closed") {
+		t.Fatalf("lines = %+v", m.lines)
+	}
+}
+
 func TestUpdateToolCallFlushesText(t *testing.T) {
 	m := newTestModel(t)
 	m, _ = upd(t, m, agentEventMsg{ev: agent.Event{Type: agent.EventText, Text: "run"}})

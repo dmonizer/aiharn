@@ -114,6 +114,9 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 				}
 			}
 			for position, call := range choice.Delta.ToolCalls {
+				if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
+					return
+				}
 				index := position
 				if call.Index != nil {
 					index = *call.Index

@@ -7,6 +7,7 @@ package recorder
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -145,6 +146,14 @@ func (r *Recorder) ObserveEvent(agentID, agentType string, event agent.Event) {
 		e.Type, e.Content, e.CallID, e.Name = "tool_output_full", event.Text, event.Call.CallID, event.Call.Name
 	case agent.EventState:
 		e.Type, e.Content = "state", event.State.String()
+	case agent.EventTimeout:
+		e.Type, e.Content = "timeout", event.Text
+	case agent.EventToolLimit:
+		if event.ToolLimit == nil {
+			return
+		}
+		e.Type = "tool_limit"
+		e.Content = fmt.Sprintf("%d/%d", event.ToolLimit.Count, event.ToolLimit.Limit)
 	default:
 		return // user messages and tool calls are already in completed history
 	}
@@ -212,6 +221,9 @@ func entryFromItem(agentID, agentType string, it llm.Item) Entry {
 	case llm.ItemFunctionCallOutput:
 		e.Type = "tool_result"
 		e.CallID = it.CallID
+		e.Content = it.Content
+	case llm.ItemReasoning:
+		e.Type = "reasoning"
 		e.Content = it.Content
 	}
 	return e

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,6 +67,8 @@ const (
 	// again when it is injected into the recipient's history (Pending false).
 	// Appended last so existing EventType values stay stable.
 	EventAgentMessage
+	EventTimeout
+	EventToolLimit
 )
 
 // Event is a single streamed event emitted by an agent for live display.
@@ -81,6 +84,10 @@ type Event struct {
 	// Pending is true on EventAgentMessage while the message still sits in the
 	// recipient's inbox, and false once it has been injected into its history.
 	Pending bool
+	// TimeoutPhase identifies thinking or response, including provider deadlines
+	// that occur during either phase, on EventTimeout.
+	TimeoutPhase string
+	ToolLimit    *ToolLimitRequest
 }
 
 // HistoryObserver receives history items as they are appended to an agent's
@@ -113,8 +120,9 @@ type Spec struct {
 	AllowSubagents   bool   // whether this agent may spawn subagents
 	EventCapacity    int
 	InboxCapacity    int
-	MaxToolRounds    int           // per-turn cap on tool-call iterations
-	RequestTimeout   time.Duration // per-provider-request timeout (0 = none)
+	ToolcallsPerTurn int           // initial tool-call limit; 0 uses the default
+	RequestTimeout   time.Duration // answer and tool-call output phase timeout (0 = none)
+	ThinkingTimeout  time.Duration // request setup and thinking, until answer/tool output begins
 	ToolResultBytes  int64         // cap on model-visible tool output (0 = none)
 	TranscriptItems  int           // retained completed transcript items (0 = unlimited)
 	TranscriptBytes  int64         // retained completed transcript content bytes (0 = unlimited)
@@ -123,9 +131,9 @@ type Spec struct {
 }
 
 const (
-	defaultEventCapacity = 256
-	defaultInboxCapacity = 32
-	defaultMaxToolRounds = 64
+	defaultEventCapacity    = 256
+	defaultInboxCapacity    = 32
+	defaultToolcallsPerTurn = 64
 )
 
 // ErrAgentClosed is returned when a new turn is attempted after Close.
@@ -148,24 +156,32 @@ type Agent struct {
 	callerID         string
 	allowSubagents   bool
 
-	maxToolRounds   int
-	requestTimeout  time.Duration
-	toolResultBytes int64
-	transcriptItems int
-	transcriptBytes int64
+	toolcallsPerTurn int
+	requestTimeout   time.Duration
+	thinkingTimeout  time.Duration
+	toolResultBytes  int64
+	transcriptItems  int
+	transcriptBytes  int64
 
-	mu      sync.Mutex
-	turnMu  sync.Mutex
-	active  sync.WaitGroup
-	history []llm.Item
-	state   State
-	events  chan Event
+	mu             sync.Mutex
+	turnMu         sync.Mutex
+	active         sync.WaitGroup
+	history        []llm.Item
+	liveReasoning  string
+	thinkingActive bool
+	state          State
+	events         chan Event
 
 	inbox chan inboxItem
 	// pendingInbox tracks agent-authored messages still queued in inbox and
 	// not yet drained into history, so a polling API client (which has no event
 	// stream) can list them. Guarded by mu.
 	pendingInbox []inboxItem
+	// A timeout leaves the top-level agent ready to continue when its next
+	// input is a subagent report, without requiring a human follow-up.
+	resumeAfterTimeout bool
+	pendingToolLimit   *pendingToolLimit
+	toolLimitSeq       uint64
 	// Pause holds queued tasks at turn boundaries. In-flight work is allowed to
 	// complete, avoiding duplicate commands or provider requests on resume.
 	paused bool
@@ -206,8 +222,13 @@ func New(spec Spec) *Agent {
 	if spec.InboxCapacity <= 0 {
 		spec.InboxCapacity = defaultInboxCapacity
 	}
-	if spec.MaxToolRounds <= 0 {
-		spec.MaxToolRounds = defaultMaxToolRounds
+	if spec.ToolcallsPerTurn <= 0 {
+		spec.ToolcallsPerTurn = defaultToolcallsPerTurn
+	}
+	// Callers that only set the legacy request timeout still get a bound on
+	// provider setup and thinking before an answer starts.
+	if spec.ThinkingTimeout <= 0 {
+		spec.ThinkingTimeout = spec.RequestTimeout
 	}
 	return &Agent{
 		id:               spec.ID,
@@ -222,8 +243,9 @@ func New(spec Spec) *Agent {
 		depth:            spec.Depth,
 		callerID:         spec.CallerID,
 		allowSubagents:   spec.AllowSubagents,
-		maxToolRounds:    spec.MaxToolRounds,
+		toolcallsPerTurn: spec.ToolcallsPerTurn,
 		requestTimeout:   spec.RequestTimeout,
+		thinkingTimeout:  spec.ThinkingTimeout,
 		toolResultBytes:  spec.ToolResultBytes,
 		transcriptItems:  spec.TranscriptItems,
 		transcriptBytes:  spec.TranscriptBytes,
@@ -322,6 +344,7 @@ func (a *Agent) send(item inboxItem) bool {
 	}
 	select {
 	case a.inbox <- item:
+		resume := a.depth == 0 && a.resumeAfterTimeout
 		if item.delivery != nil {
 			a.pendingInbox = append(a.pendingInbox, item)
 		}
@@ -330,6 +353,9 @@ func (a *Agent) send(item inboxItem) bool {
 		// must never run under the agent lock.
 		if item.delivery != nil {
 			a.emit(Event{Type: EventAgentMessage, Text: item.text, Delivery: item.delivery, Pending: true})
+		}
+		if resume {
+			go a.continueAfterTimeout()
 		}
 		return true
 	default:
@@ -402,22 +428,39 @@ func (a *Agent) setOnStateChange(fn func()) { a.onStateChange = fn }
 // Turn runs one full turn on behalf of a caller: it drains the inbox (subagent
 // results and other inbound messages, injected as synthetic user messages),
 // appends input, then streams and executes tool calls until the model responds
-// with no tool calls. On error it returns the error and sets the state to
-// errored (or idle for cancellation).
+// with no tool calls. A time-budget expiry is recorded in chat and leaves the
+// agent idle; other errors are returned and set the state to errored.
 func (a *Agent) Turn(ctx context.Context, input string) error {
-	return a.runTurn(ctx, input, llm.OriginHuman, nil, true)
+	return a.runTurn(ctx, input, llm.OriginHuman, nil, true, false)
 }
 
 // turn is the core loop: append input and iterate stream → tools until the model
 // stops calling tools. It does not drain the inbox; Turn and the subagent run
 // loop manage that.
 func (a *Agent) turn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery) error {
-	return a.runTurn(ctx, input, origin, delivery, false)
+	return a.runTurn(ctx, input, origin, delivery, false, false)
 }
 
-func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery, drainInbox bool) error {
+func (a *Agent) continueAfterTimeout() {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := a.runTurn(ctx, "", llm.OriginAgent, nil, true, true); err != nil && !errors.Is(err, context.Canceled) {
+		logging.Debug("agent: timeout continuation failed", slog.String("agent_id", a.id), slog.Any("err", err))
+	}
+}
+
+func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery, drainInbox, onlyPending bool) error {
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
+	a.mu.Lock()
+	if onlyPending && !a.resumeAfterTimeout {
+		a.mu.Unlock()
+		return nil
+	}
+	a.resumeAfterTimeout = false
+	a.mu.Unlock()
 
 	start := time.Now()
 	logging.Debug("agent: turn start",
@@ -485,8 +528,12 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 	ctx = turnCtx
 
 	a.setState(StateRunning)
-	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input, Origin: origin, Delivery: delivery})
-	if delivery != nil {
+	if input != "" || !onlyPending {
+		a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input, Origin: origin, Delivery: delivery})
+	}
+	if onlyPending {
+		// The queued subagent message was appended while draining the inbox.
+	} else if delivery != nil {
 		// A delivery-carrying turn input (a subagent task prompt) has just
 		// entered history: report it as the delivered agent message, and NOT as
 		// a raw user turn, so a UI does not render the same task twice.
@@ -496,14 +543,28 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 	}
 	a.trimHistory()
 
-	for round := 0; round < a.maxToolRounds; round++ {
+	toolCount, toolLimit := 0, a.toolcallsPerTurn
+	for round := 0; ; round++ {
+		a.setThinkingActive(true)
 		if a.reasoningSummary != "" || (a.reasoningEffort != "" && a.reasoningEffort != "none") {
 			a.emit(Event{Type: EventReasoningStart})
 		}
-		rctx, cancel := a.requestContext(ctx)
+		rctx, cancel := context.WithCancel(ctx)
+		budget := newResponseBudget(cancel, a.thinkingTimeout)
 		stream, err := a.client.Stream(rctx, a.buildRequest())
 		if err != nil {
+			a.finishReasoning()
+			phase, duration := budget.timeout()
+			if phase == "" && errors.Is(err, context.DeadlineExceeded) {
+				current, _ := budget.current()
+				phase = "provider request during " + current
+			}
+			budget.stop()
 			cancel()
+			if phase != "" && ctx.Err() == nil {
+				a.recordTimeout(phase, duration, "")
+				return nil
+			}
 			logging.Debug("agent: client.Stream error",
 				slog.String("component", "agent"),
 				slog.String("agent_id", a.id),
@@ -513,9 +574,20 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 			return fail(err)
 		}
 
-		output, err := a.collect(rctx, stream)
+		output, partial, err := a.collect(rctx, stream, budget)
+		a.finishReasoning()
+		phase, duration := budget.timeout()
+		if phase == "" && errors.Is(err, context.DeadlineExceeded) {
+			current, _ := budget.current()
+			phase = "provider request during " + current
+		}
+		budget.stop()
 		cancel()
 		if err != nil {
+			if phase != "" && ctx.Err() == nil {
+				a.recordTimeout(phase, duration, partial)
+				return nil
+			}
 			logging.Debug("agent: collect error",
 				slog.String("component", "agent"),
 				slog.String("agent_id", a.id),
@@ -546,7 +618,34 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 			return nil
 		}
 
-		for _, call := range calls {
+		for i, call := range calls {
+			if toolLimit > 0 && toolCount >= toolLimit {
+				decision, err := a.awaitToolLimit(ctx, toolCount, toolLimit)
+				if err != nil {
+					return fail(err)
+				}
+				switch decision {
+				case "stop":
+					for _, skipped := range calls[i:] {
+						a.append(llm.Item{Type: llm.ItemFunctionCallOutput, CallID: skipped.CallID,
+							Content: "skipped: turn stopped at tool-call limit"})
+					}
+					note := fmt.Sprintf("[Stopped this turn after %d tool calls.]", toolCount)
+					a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: note})
+					a.emit(Event{Type: EventText, Text: note})
+					a.trimHistory()
+					a.setState(StateIdle)
+					return nil
+				case "continue":
+					toolLimit = 0
+				case "double":
+					if toolLimit > int(^uint(0)>>1)/2 {
+						toolLimit = 0
+					} else {
+						toolLimit *= 2
+					}
+				}
+			}
 			a.emit(Event{Type: EventToolCall, Call: call})
 			result := a.runTool(ctx, call)
 			a.append(llm.Item{
@@ -554,10 +653,9 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 				CallID:  call.CallID,
 				Content: result,
 			})
+			toolCount++
 		}
 	}
-
-	return fail(fmt.Errorf("turn exceeded %d tool-call rounds", a.maxToolRounds))
 }
 
 // run drives a subagent: it consumes one task at a time from the inbox, runs a
@@ -683,8 +781,12 @@ func (a *Agent) Close() {
 		a.mu.Lock()
 		a.state = StateClosed
 		a.pendingInbox = nil
+		turnCancel := a.turnCancel
 		a.mu.Unlock()
 
+		if turnCancel != nil {
+			turnCancel()
+		}
 		if a.cancel != nil {
 			a.cancel()
 		}
@@ -720,7 +822,12 @@ func (a *Agent) lastAssistant() string {
 
 func (a *Agent) buildRequest() llm.Request {
 	a.mu.Lock()
-	history := append([]llm.Item(nil), a.history...)
+	history := make([]llm.Item, 0, len(a.history))
+	for _, item := range a.history {
+		if item.Type != llm.ItemReasoning {
+			history = append(history, item)
+		}
+	}
 	a.mu.Unlock()
 
 	req := llm.Request{
@@ -737,15 +844,23 @@ func (a *Agent) buildRequest() llm.Request {
 	return req
 }
 
-func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Item, error) {
+func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event, budget *responseBudget) ([]llm.Item, string, error) {
 	var output []llm.Item
+	var partial strings.Builder
 	textDeltas := 0
 	for ev := range stream {
 		switch ev.Type {
 		case llm.EventReasoningDelta:
+			a.addReasoning(ev.Text)
 			a.emit(Event{Type: EventReasoningDelta, Text: ev.Text})
+		case llm.EventResponseStarted:
+			a.setThinkingActive(false)
+			budget.response(a.requestTimeout)
 		case llm.EventTextDelta:
+			a.setThinkingActive(false)
+			budget.response(a.requestTimeout)
 			textDeltas++
+			partial.WriteString(ev.Text)
 			a.emit(Event{Type: EventText, Text: ev.Text})
 		case llm.EventCompleted:
 			if ev.FinishReason != "" && ev.FinishReason != "stop" {
@@ -756,7 +871,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Ite
 					slog.String("finish_reason", ev.FinishReason),
 					slog.Int("text_deltas", textDeltas),
 				)
-				return nil, fmt.Errorf("llm response incomplete: %s", ev.FinishReason)
+				return nil, partial.String(), fmt.Errorf("llm response incomplete: %s", ev.FinishReason)
 			}
 			output = ev.Items
 			logging.Debug("agent: collect terminal",
@@ -775,7 +890,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Ite
 				slog.Int("text_deltas", textDeltas),
 				slog.Any("err", ev.Err),
 			)
-			return nil, ev.Err
+			return nil, partial.String(), ev.Err
 		}
 	}
 	if output == nil {
@@ -787,7 +902,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Ite
 				slog.Int("text_deltas", textDeltas),
 				slog.Any("err", err),
 			)
-			return nil, err
+			return nil, partial.String(), err
 		}
 		logging.Debug("agent: collect terminal",
 			slog.String("component", "agent"),
@@ -795,9 +910,9 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event) ([]llm.Ite
 			slog.String("reason", "no_terminal"),
 			slog.Int("text_deltas", textDeltas),
 		)
-		return nil, errors.New("llm stream ended without a terminal event")
+		return nil, partial.String(), errors.New("llm stream ended without a terminal event")
 	}
-	return output, nil
+	return output, partial.String(), nil
 }
 
 func (a *Agent) runTool(ctx context.Context, call llm.Item) string {
@@ -850,13 +965,30 @@ func (a *Agent) runTool(ctx context.Context, call llm.Item) string {
 	return result
 }
 
-// requestContext derives a per-request context with the configured timeout, if
-// any, so a single slow provider call cannot stall a turn indefinitely.
-func (a *Agent) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if a.requestTimeout <= 0 {
-		return parent, func() {}
+// recordTimeout keeps partial answer text and a specific explanation in history.
+// The next user or subagent turn therefore sees what stopped, while the agent
+// stays idle and can still receive reports from its subagents.
+func (a *Agent) recordTimeout(phase string, duration time.Duration, partial string) {
+	budget := ""
+	if duration > 0 {
+		budget = fmt.Sprintf(" (%s)", duration)
 	}
-	return context.WithTimeout(parent, a.requestTimeout)
+	note := fmt.Sprintf("[Your %s agent ran over the time budget for %s%s. The response is incomplete.]", a.typ, phase, budget)
+	content := note
+	if partial != "" {
+		content = partial + "\n\n" + note
+	}
+	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: content})
+	a.emit(Event{Type: EventTimeout, Text: note, TimeoutPhase: phase})
+	a.trimHistory()
+	a.mu.Lock()
+	a.resumeAfterTimeout = a.depth == 0
+	pending := len(a.inbox) > 0
+	a.mu.Unlock()
+	a.setState(StateIdle)
+	if pending && a.depth == 0 {
+		go a.continueAfterTimeout()
+	}
 }
 
 func (a *Agent) fail(err error) error {
@@ -977,6 +1109,18 @@ func (a *Agent) emit(e Event) {
 	select {
 	case a.events <- e:
 	default:
+		if e.Type == EventToolLimit {
+			// A full stream buffer must not hide the decision that unblocks this
+			// turn. Drop one older display event to make room for the prompt.
+			select {
+			case <-a.events:
+			default:
+			}
+			select {
+			case a.events <- e:
+			default:
+			}
+		}
 	}
 }
 

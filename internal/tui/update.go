@@ -42,6 +42,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if id == "" && m.agent != nil {
 			id = m.agent.ID()
 		}
+		if msg.ev.Type == agent.EventToolLimit && m.toolLimit == nil && id != "" && id != m.focusedID {
+			m.focusAgent(id)
+		}
 		wasThinking := m.thinking && m.focusedID == id
 		m.appendAgentEvent(msg.ev)
 		if msg.ev.Type == agent.EventState && (msg.ev.State == agent.StateClosed || msg.ev.State == agent.StateErrored) {
@@ -78,7 +81,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case subagentClosedMsg:
 		if msg.err != nil {
-			m.appendLine(kindError, "close subagent: "+msg.err.Error())
+			if errors.Is(msg.err, agent.ErrCallerUnavailable) {
+				m.appendLine(kindPlain, "warning: subagent was not closed because its caller is not open")
+			} else {
+				m.appendLine(kindError, "close subagent: "+msg.err.Error())
+			}
 		}
 		m.refreshSubagents()
 		return m, nil
@@ -121,6 +128,37 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		m.cancel()
 		return m, tea.Quit
+	}
+	if msg.String() == "esc" && m.toolLimit != nil && m.stopAllRequests() {
+		return m, nil
+	}
+	if m.toolLimit != nil {
+		var decision string
+		switch msg.String() {
+		case "s":
+			decision = "stop"
+		case "c":
+			decision = "continue"
+		case "d":
+			decision = "double"
+		default:
+			return m, nil
+		}
+		req := m.toolLimit
+		a := m.manager.Agent(req.AgentID)
+		if a == nil {
+			m.appendLine(kindPlain, "warning: agent for tool-call limit is no longer available")
+		} else if err := a.DecideToolLimit(req.ID, decision); err != nil {
+			m.appendLine(kindPlain, "warning: tool-call limit prompt expired: "+err.Error())
+		}
+		m.toolLimit = nil
+		if len(m.toolLimitQueue) > 0 {
+			next := m.toolLimitQueue[0]
+			m.toolLimitQueue = m.toolLimitQueue[1:]
+			m.toolLimit = &next
+			m.focusAgent(next.AgentID)
+		}
+		return m, nil
 	}
 	if m.approvalPopover && m.pending == nil {
 		m.approvalPopover = false
@@ -267,7 +305,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // top-level prompts, queued subagent tasks, and approval UI state. It returns
 // false when there was no work, allowing Esc to keep its input-clearing role.
 func (m *Model) stopAllRequests() bool {
-	hadWork := m.running || len(m.queue) > 0 || m.pending != nil || len(m.approvals) > 0
+	hadWork := m.running || len(m.queue) > 0 || m.pending != nil || len(m.approvals) > 0 || m.toolLimit != nil
 	if m.turnCancel != nil {
 		m.turnCancel()
 	}
@@ -293,6 +331,8 @@ func (m *Model) stopAllRequests() bool {
 	m.queue = nil
 	m.pending = nil
 	m.approvals = nil
+	m.toolLimit = nil
+	m.toolLimitQueue = nil
 	m.approvalPopover = false
 	m.lastEsc = time.Time{}
 	m.stopping = m.running
@@ -419,6 +459,23 @@ func (m *Model) appendEvent(ev agent.Event) {
 	case agent.EventText:
 		m.finishThinking(time.Now())
 		m.appendText(ev.Text)
+	case agent.EventTimeout:
+		if strings.Contains(ev.TimeoutPhase, "thinking") {
+			m.appendReasoning("\n" + ev.Text)
+		} else {
+			m.appendText("\n" + ev.Text)
+		}
+	case agent.EventToolLimit:
+		if ev.ToolLimit != nil {
+			if m.toolLimit == nil {
+				copy := *ev.ToolLimit
+				m.toolLimit = &copy
+			} else {
+				m.toolLimitQueue = append(m.toolLimitQueue, *ev.ToolLimit)
+			}
+			m.flushText()
+			m.appendLine(kindPlain, fmt.Sprintf("%d tool calls this turn. [s]top  [c]ontinue without limit  [d]ouble to %d", ev.ToolLimit.Count, ev.ToolLimit.Limit*2))
+		}
 	case agent.EventToolCall:
 		m.finishThinking(time.Now())
 		m.appendToolCall(ev.Call)
