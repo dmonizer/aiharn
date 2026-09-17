@@ -1,13 +1,29 @@
 (() => {
   "use strict";
 
-  const ENDPOINTS_KEY = "aiharn.remote.apis.v1";
-  const ACTIVE_KEY = "aiharn.remote.active.v1";
-  const TOKEN_PREFIX = "aiharn.remote.token.";
+  const ENDPOINT_KEY = "aiharn.remote.endpoint.v2";
+  const TOKEN_KEY = "aiharn.remote.token.v2";
+  const SESSION_KEY = "aiharn.remote.session.v2";
+  const LEGACY_ENDPOINTS_KEY = "aiharn.remote.apis.v1";
+  const LEGACY_ACTIVE_KEY = "aiharn.remote.active.v1";
+  const LEGACY_TOKEN_PREFIX = "aiharn.remote.token.";
   const POLL_MS = 1000;
+  const SESSIONS_POLL_MS = 5000;
+  // A server built before the API reported its agent roster returns no "agents"
+  // field at all; the console used to invent a one-entry list in that case,
+  // which made a stale binary look like a healthy session with no subagents.
+  const STALE_SERVER_NOTICE = "This API server is older than this console and does not " +
+    "report agents. Rebuild and restart aiharn to see subagents.";
+  // A server built before session management existed has no /sessions route and
+  // rejects unknown JSON fields, so it would answer 400 to a payload carrying
+  // session_id. The console detects that and omits the field, which keeps it
+  // usable against an older backend.
+  const LEGACY_SERVER_NOTICE = "This API server is older than this console: it has no session " +
+    "support and does not report agents. Rebuild and restart aiharn to list, create, rename " +
+    "and close sessions, and to see subagents.";
 
   const elements = {
-    apiList: document.querySelector("#api-list"),
+    sessionList: document.querySelector("#session-list"),
     agentList: document.querySelector("#agent-list"),
     transcript: document.querySelector("#transcript"),
     approvals: document.querySelector("#approvals"),
@@ -19,33 +35,42 @@
     message: document.querySelector("#message"),
     send: document.querySelector("#send"),
     queue: document.querySelector("#queue-state"),
-    apiDialog: document.querySelector("#api-dialog"),
-    apiForm: document.querySelector("#api-form"),
-    apiName: document.querySelector("#api-name"),
-    apiUrl: document.querySelector("#api-url"),
-    apiToken: document.querySelector("#api-token"),
-    tokenDialog: document.querySelector("#token-dialog"),
-    tokenForm: document.querySelector("#token-form"),
-    tokenValue: document.querySelector("#token-value"),
-    tokenLabel: document.querySelector("#token-api-label")
+    settingsDialog: document.querySelector("#settings-dialog"),
+    settingsForm: document.querySelector("#settings-form"),
+    settingsName: document.querySelector("#settings-name"),
+    settingsUrl: document.querySelector("#settings-url"),
+    settingsToken: document.querySelector("#settings-token"),
+    settingsUrlHelp: document.querySelector("#settings-url-help"),
+    settingsTokenHelp: document.querySelector("#settings-token-help"),
+    settingsError: document.querySelector("#settings-error"),
+    sessionDialog: document.querySelector("#session-dialog"),
+    sessionForm: document.querySelector("#session-form"),
+    sessionTitle: document.querySelector("#session-dialog-title"),
+    sessionName: document.querySelector("#session-name"),
+    sessionSubmit: document.querySelector("#session-submit"),
+    sessionError: document.querySelector("#session-error")
   };
 
   const state = {
-    endpoints: loadEndpoints(),
-    activeId: localStorage.getItem(ACTIVE_KEY),
+    endpoint: loadEndpoint(),
+    sessionId: localStorage.getItem(SESSION_KEY) || "",
+    sessions: [],
+    defaultSessionId: "",
     snapshots: new Map(),
     selectedAgents: new Map(),
     drafts: new Map(),
-    health: new Map(),
     request: null,
+    sessionsRequest: null,
     timer: null,
+    sessionsTimer: null,
+    // sessionSupport is null until /sessions has been probed: true when the
+    // server understands session_id, false when it is an older build.
+    sessionSupport: null,
     fingerprint: "",
-    connected: false
+    connected: false,
+    sessionMode: "create",
+    renameTarget: ""
   };
-
-  if (!state.endpoints.some((item) => item.id === state.activeId)) {
-    state.activeId = state.endpoints[0]?.id || "";
-  }
 
   function normalizeURL(value) {
     const url = new URL(value || location.origin, location.href);
@@ -58,91 +83,115 @@
     return url.toString().replace(/\/$/, "");
   }
 
-  function hash(value) {
-    let result = 2166136261;
-    for (let i = 0; i < value.length; i += 1) {
-      result ^= value.charCodeAt(i);
-      result = Math.imul(result, 16777619);
-    }
-    return (result >>> 0).toString(36);
-  }
-
-  function deployedEndpoints() {
-    const configured = Array.isArray(window.AIHARN_CONFIG?.apis) ? window.AIHARN_CONFIG.apis : [];
-    return configured.flatMap((item) => {
-      try {
-        const url = normalizeURL(item.url);
-        return [{ id: "deployed-" + hash(url), name: item.name || new URL(url).host, url, deployed: true }];
-      } catch {
-        return [];
-      }
-    });
-  }
-
-  function savedEndpoints() {
+  // deploymentEndpoint returns the endpoint baked into config.js, accepting
+  // either {endpoint: {...}} or the legacy {apis: [...]} shape. A deployment
+  // endpoint wins over the one stored in this browser.
+  function deploymentEndpoint() {
+    const config = window.AIHARN_CONFIG || {};
+    const candidate = config.endpoint ||
+      (Array.isArray(config.apis) ? config.apis[0] : null);
+    if (!candidate || !candidate.url) return null;
     try {
-      const parsed = JSON.parse(localStorage.getItem(ENDPOINTS_KEY) || "[]");
-      if (!Array.isArray(parsed)) return [];
-      return parsed.flatMap((item) => {
-        try {
-          const url = normalizeURL(item.url);
-          const fallbackID = crypto.randomUUID?.() || Date.now().toString(36) +
-            Math.random().toString(36).slice(2);
-          return [{ id: String(item.id || fallbackID),
-            name: String(item.name || new URL(url).host), url, deployed: false }];
-        } catch {
-          return [];
-        }
-      });
+      const url = normalizeURL(candidate.url);
+      return { name: candidate.name || new URL(url).host, url, deployed: true };
     } catch {
-      return [];
+      return null;
     }
   }
 
-  function loadEndpoints() {
-    const merged = new Map();
-    for (const endpoint of [...deployedEndpoints(), ...savedEndpoints()]) {
-      if (![...merged.values()].some((item) => item.url === endpoint.url)) {
-        merged.set(endpoint.id, endpoint);
+  // loadEndpoint returns the single configured endpoint, migrating the legacy
+  // multi-API storage on first use. The legacy keys are left untouched so that
+  // reverting this console still works.
+  function loadEndpoint() {
+    let stored = null;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(ENDPOINT_KEY) || "null");
+      if (parsed && parsed.url) {
+        const url = normalizeURL(parsed.url);
+        stored = { name: parsed.name || new URL(url).host, url };
       }
+    } catch {
+      stored = null;
     }
-    return [...merged.values()];
+    if (!stored) stored = migrateEndpoint();
+    return deploymentEndpoint() || stored;
   }
 
-  function persistEndpoints() {
-    const local = state.endpoints
-      .filter((endpoint) => !endpoint.deployed)
-      .map(({ id, name, url }) => ({ id, name, url }));
-    localStorage.setItem(ENDPOINTS_KEY, JSON.stringify(local));
+  function migrateEndpoint() {
+    try {
+      const list = JSON.parse(localStorage.getItem(LEGACY_ENDPOINTS_KEY) || "[]");
+      if (!Array.isArray(list) || !list.length) return null;
+      const activeId = localStorage.getItem(LEGACY_ACTIVE_KEY);
+      const chosen = list.find((item) => item && item.id === activeId) || list[0];
+      if (!chosen || !chosen.url) return null;
+      const url = normalizeURL(chosen.url);
+      const migrated = { name: chosen.name || new URL(url).host, url };
+      localStorage.setItem(ENDPOINT_KEY, JSON.stringify(migrated));
+      const legacyToken = sessionStorage.getItem(LEGACY_TOKEN_PREFIX + String(chosen.id || ""));
+      if (legacyToken) sessionStorage.setItem(TOKEN_KEY, legacyToken);
+      return migrated;
+    } catch {
+      return null;
+    }
   }
 
-  function activeEndpoint() {
-    return state.endpoints.find((endpoint) => endpoint.id === state.activeId);
+  function saveEndpoint(endpoint) {
+    state.endpoint = endpoint;
+    if (!endpoint.deployed) {
+      localStorage.setItem(ENDPOINT_KEY, JSON.stringify({ name: endpoint.name, url: endpoint.url }));
+    }
+  }
+
+  function token() {
+    return sessionStorage.getItem(TOKEN_KEY) || "";
+  }
+
+  function setToken(value) {
+    if (value) sessionStorage.setItem(TOKEN_KEY, value);
+    else sessionStorage.removeItem(TOKEN_KEY);
   }
 
   function selectedAgentID() {
-    return state.selectedAgents.get(state.activeId) || "";
+    return state.selectedAgents.get(state.sessionId) || "";
   }
 
-  function draftKey(endpointID = state.activeId, agentID = selectedAgentID()) {
-    return endpointID + ":" + agentID;
+  function draftKey(sessionID = state.sessionId, agentID = selectedAgentID()) {
+    return sessionID + ":" + agentID;
   }
 
-  function tokenFor(endpoint) {
-    return endpoint ? sessionStorage.getItem(TOKEN_PREFIX + endpoint.id) || "" : "";
+  // The wire protocol keys everything by agent id; a spawned agent may also
+  // carry a human-readable name. Resolve display labels from the current
+  // session's cached roster so the list, header, approvals and agent-message
+  // headers all agree. A missing name (an older server reports none) or a name
+  // that merely repeats the id is not a custom name, so the id stands in.
+  function agentLabel(id) {
+    if (!id) return "?";
+    const roster = state.snapshots.get(state.sessionId)?.agents;
+    if (Array.isArray(roster)) {
+      const match = roster.find((agent) => agent && agent.id === id);
+      if (match && typeof match.name === "string" && match.name && match.name !== id) {
+        return match.name;
+      }
+    }
+    return id;
   }
 
-  function setToken(endpoint, value) {
-    if (!endpoint) return;
-    if (value) sessionStorage.setItem(TOKEN_PREFIX + endpoint.id, value);
-    else sessionStorage.removeItem(TOKEN_PREFIX + endpoint.id);
+  function clearSessionState() {
+    state.sessions = [];
+    state.defaultSessionId = "";
+    state.snapshots = new Map();
+    state.selectedAgents = new Map();
+    state.sessionId = "";
+    localStorage.removeItem(SESSION_KEY);
   }
 
-  async function apiCall(endpoint, path, options = {}) {
+  async function apiCall(path, options = {}) {
+    const endpoint = state.endpoint;
+    if (!endpoint) throw new Error("No API is configured");
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
-    const token = tokenFor(endpoint);
-    if (token) headers.set("Authorization", "Bearer " + token);
+    const bearer = token();
+    if (bearer) headers.set("Authorization", "Bearer " + bearer);
     if (options.body) headers.set("Content-Type", "application/json");
 
     const response = await fetch(endpoint.url + "/api/v1" + path, {
@@ -165,44 +214,95 @@
     return payload;
   }
 
-  function renderEndpointList() {
-    elements.apiList.replaceChildren();
-    for (const endpoint of state.endpoints) {
+  function activeSession() {
+    return state.sessions.find((item) => item.id === state.sessionId);
+  }
+
+  function renderSessionList() {
+    elements.sessionList.replaceChildren();
+    if (!state.sessions.length) {
+      const empty = document.createElement("div");
+      empty.className = "session-empty";
+      empty.textContent = !state.endpoint
+        ? "No API configured."
+        : state.sessionSupport === false
+          ? "This server has no session support."
+          : "No sessions reported.";
+      elements.sessionList.append(empty);
+      return;
+    }
+    for (const session of state.sessions) {
       const item = document.createElement("div");
-      item.className = "api-item" + (endpoint.id === state.activeId ? " active" : "");
+      item.className = "session-item" + (session.id === state.sessionId ? " active" : "");
       item.tabIndex = 0;
       item.setAttribute("role", "button");
-      item.addEventListener("click", () => selectEndpoint(endpoint.id));
+      item.setAttribute("aria-current", session.id === state.sessionId ? "true" : "false");
+      const choose = () => selectSession(session.id);
+      item.addEventListener("click", choose);
       item.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") selectEndpoint(endpoint.id);
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          choose();
+        }
       });
 
       const dot = document.createElement("span");
-      dot.className = "api-dot " + (state.health.get(endpoint.id) || "");
+      dot.className = "session-dot " + (session.state || "");
       const copy = document.createElement("span");
-      copy.className = "api-copy";
+      copy.className = "session-copy";
       const name = document.createElement("strong");
-      name.textContent = endpoint.name;
-      const url = document.createElement("span");
-      url.textContent = endpoint.url;
-      copy.append(name, url);
-      const remove = document.createElement("button");
-      remove.className = "remove-api";
-      remove.type = "button";
-      remove.textContent = endpoint.deployed ? "⌁" : "×";
-      remove.title = endpoint.deployed ? "Configured by deployment" : "Remove API";
-      remove.disabled = endpoint.deployed;
-      remove.addEventListener("click", (event) => {
+      name.textContent = session.name || session.id;
+      if (session.default) {
+        const marker = document.createElement("em");
+        marker.textContent = "default";
+        name.append(marker);
+      }
+      const detail = document.createElement("span");
+      const count = Array.isArray(session.agents) ? session.agents.length - 1 : 0;
+      detail.textContent = count > 0
+        ? count + (count === 1 ? " subagent" : " subagents")
+        : (session.model || session.id);
+      copy.append(name, detail);
+
+      const actions = document.createElement("span");
+      actions.className = "session-actions";
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "session-action";
+      rename.textContent = "✎";
+      rename.title = "Rename session";
+      rename.setAttribute("aria-label", "Rename session " + (session.name || session.id));
+      rename.addEventListener("click", (event) => {
         event.stopPropagation();
-        removeEndpoint(endpoint.id);
+        openSessionDialog("rename", session);
       });
-      item.append(dot, copy, remove);
-      elements.apiList.append(item);
+      actions.append(rename);
+      if (!session.default) {
+        const close = document.createElement("button");
+        close.type = "button";
+        close.className = "session-action close";
+        close.textContent = "×";
+        close.title = "Close session";
+        close.setAttribute("aria-label", "Close session " + (session.name || session.id));
+        close.addEventListener("click", (event) => {
+          event.stopPropagation();
+          closeSession(session.id);
+        });
+        actions.append(close);
+      }
+      item.append(dot, copy, actions);
+      elements.sessionList.append(item);
     }
   }
 
   function renderAgentList(agents, selectedID) {
     elements.agentList.replaceChildren();
+    if (agents.length <= 1) {
+      const hint = document.createElement("div");
+      hint.className = "agent-empty";
+      hint.textContent = "No subagents yet.";
+      elements.agentList.append(hint);
+    }
     for (const agent of agents) {
       const item = document.createElement("button");
       item.type = "button";
@@ -210,15 +310,16 @@
         (agent.id === selectedID ? " active" : "");
       item.setAttribute("aria-current", agent.id === selectedID ? "true" : "false");
       item.addEventListener("click", () => selectAgent(agent.id));
-      const status = agent.paused ? "paused" : agent.state;
+      const status = agent.paused ? "paused" : (agent.state || "unknown");
       const dot = document.createElement("span");
       dot.className = "agent-dot " + status;
       const copy = document.createElement("span");
       copy.className = "agent-copy";
       const name = document.createElement("strong");
-      name.textContent = agent.depth ? agent.type : "Main · " + agent.type;
+      const named = typeof agent.name === "string" && agent.name && agent.name !== agent.id;
+      name.textContent = named ? agent.name : (agent.depth ? agent.type : "Main · " + agent.type);
       const id = document.createElement("span");
-      id.textContent = agent.id;
+      id.textContent = named ? agent.type + " · " + agent.id : agent.id;
       copy.append(name, id);
       const state = document.createElement("span");
       state.className = "agent-state " + status;
@@ -229,55 +330,63 @@
   }
 
   function selectAgent(id) {
-    const endpoint = activeEndpoint();
-    if (!endpoint || selectedAgentID() === id) return;
+    if (!state.endpoint || selectedAgentID() === id) return;
     state.drafts.set(draftKey(), elements.message.value);
-    state.selectedAgents.set(endpoint.id, id);
+    state.selectedAgents.set(state.sessionId, id);
     elements.message.value = state.drafts.get(draftKey()) || "";
     state.fingerprint = "";
     state.request?.abort();
-    renderAgentList(state.snapshots.get(endpoint.id)?.agents || [], id);
-    elements.agentTitle.textContent = id;
+    const snapshot = state.snapshots.get(state.sessionId);
+    renderAgentList(snapshot?.agents || [], id);
+    // Mirror renderSnapshot's header using the cached roster: a custom name
+    // replaces the bare id until the next poll confirms the selection.
+    const label = agentLabel(id);
+    const entry = (snapshot?.agents || []).find((agent) => agent && agent.id === id);
+    elements.agentTitle.textContent = label === id ? id : label + (entry?.type ? " · " + entry.type : "");
     elements.message.disabled = true;
     elements.send.disabled = true;
     elements.transcript.replaceChildren(emptyState("Loading agent…", id));
+    renderPendingAgentMessages();
     poll();
     document.body.classList.remove("menu-open");
   }
 
-  function selectEndpoint(id) {
-    if (state.activeId === id) {
+  function selectSession(id) {
+    if (!state.endpoint || state.sessionId === id) {
       document.body.classList.remove("menu-open");
       return;
     }
     state.drafts.set(draftKey(), elements.message.value);
-    state.activeId = id;
+    state.sessionId = id;
+    localStorage.setItem(SESSION_KEY, id);
     elements.message.value = state.drafts.get(draftKey()) || "";
-    localStorage.setItem(ACTIVE_KEY, id);
     state.fingerprint = "";
     state.connected = false;
     state.request?.abort();
     clearTimeout(state.timer);
-    renderEndpointList();
+    renderSessionList();
     renderWaiting();
     poll();
     document.body.classList.remove("menu-open");
   }
 
-  function removeEndpoint(id) {
-    const endpoint = state.endpoints.find((item) => item.id === id);
-    if (!endpoint || endpoint.deployed) return;
-    setToken(endpoint, "");
-    state.endpoints = state.endpoints.filter((item) => item.id !== id);
-    persistEndpoints();
-    if (state.activeId === id) {
-      state.activeId = state.endpoints[0]?.id || "";
-      localStorage.setItem(ACTIVE_KEY, state.activeId);
-      state.fingerprint = "";
-      poll();
+  async function closeSession(id) {
+    const session = state.sessions.find((item) => item.id === id);
+    if (!session || session.default || state.sessionSupport === false) return;
+    if (!window.confirm("Close session \"" + (session.name || id) + "\"?")) return;
+    try {
+      await apiCall("/sessions/" + encodeURIComponent(id), { method: "DELETE" });
+    } catch (error) {
+      showConnection(error.message);
+      return;
     }
-    renderEndpointList();
-    if (!state.activeId) renderWaiting();
+    if (state.sessionId === id) {
+      state.sessionId = "";
+      localStorage.removeItem(SESSION_KEY);
+    }
+    state.fingerprint = "";
+    await pollSessions();
+    poll(true);
   }
 
   function showConnection(message) {
@@ -291,19 +400,23 @@
   }
 
   function renderWaiting() {
-    const endpoint = activeEndpoint();
-    elements.endpointLabel.textContent = endpoint?.name || "No API selected";
+    const endpoint = state.endpoint;
+    const session = activeSession();
+    elements.endpointLabel.textContent = endpoint
+      ? endpoint.name + (session?.name ? " · " + session.name : "")
+      : "Not configured";
     elements.agentTitle.textContent = endpoint ? "Connecting…" : "Current session";
     elements.sessionMeta.replaceChildren();
     elements.agentList.replaceChildren();
     elements.approvals.replaceChildren();
+    renderPendingAgentMessages();
     elements.message.disabled = true;
     elements.send.disabled = true;
     elements.queue.textContent = "";
     state.connected = false;
     elements.transcript.replaceChildren(emptyState(
-      endpoint ? "Connecting to Aiharn…" : "Connect an Aiharn API",
-      endpoint ? endpoint.url : "Add one or more active instances, then switch between them from the sidebar."
+      endpoint ? "Connecting to Aiharn…" : "Configure an Aiharn API",
+      endpoint ? endpoint.url : "Open settings to point this console at an Aiharn instance."
     ));
   }
 
@@ -318,11 +431,11 @@
     const copy = document.createElement("p");
     copy.textContent = detail;
     box.append(glyph, heading, copy);
-    if (!activeEndpoint()) {
+    if (!state.endpoint) {
       const button = document.createElement("button");
       button.className = "primary-button";
-      button.textContent = "Add API";
-      button.addEventListener("click", openAPIDialog);
+      button.textContent = "Open settings";
+      button.addEventListener("click", openSettingsDialog);
       box.append(button);
     }
     return box;
@@ -335,28 +448,107 @@
     return item;
   }
 
-  function renderSnapshot(snapshot) {
-    const endpoint = activeEndpoint();
-    const session = snapshot.session || {};
-    if (endpoint && !state.selectedAgents.has(endpoint.id)) {
-      state.selectedAgents.set(endpoint.id, session.agent_id);
-    }
-    elements.endpointLabel.textContent = endpoint?.name || "Aiharn";
-    elements.agentTitle.textContent = session.agent_id
-      ? (session.agent_type && session.agent_type !== session.agent_id
-        ? session.agent_type + " · " + session.agent_id : session.agent_id)
-      : "Current session";
-    elements.message.placeholder = "Message " + (session.agent_id || "Aiharn") + "…";
-    renderAgentList(snapshot.agents?.length ? snapshot.agents : [{
-      id: session.agent_id, type: session.agent_type,
-      state: session.state, depth: 0, paused: false
-    }], session.agent_id);
+  // renderSessionMeta paints the session meta row (model, channel, approval
+  // mode, state). The approval mode is interactive only when the snapshot
+  // advertises the "approval_mode" capability: a server that predates the
+  // /session/approval route would otherwise receive a doomed POST and surface
+  // an error, so an old server keeps the plain, non-clickable chip.
+  function renderSessionMeta(session, capabilities) {
     elements.sessionMeta.replaceChildren(
       ...(session.model ? [chip(session.model)] : []),
       ...(session.channel ? [chip(session.channel)] : []),
-      chip(session.approval_mode || "ask"),
+      approvalChip(session, capabilities),
       chip(session.state || "unknown", "state-" + (session.state || "unknown"))
     );
+  }
+
+  function approvalChip(session, capabilities) {
+    const mode = session.approval_mode || "ask";
+    const unavailable = session.state === "closed" || session.state === "errored";
+    const capable = Array.isArray(capabilities) &&
+      capabilities.indexOf("approval_mode") !== -1;
+    if (!capable || unavailable) return chip(mode);
+    const next = mode === "ask" ? "allow-all" : "ask";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "meta-chip approval-toggle";
+    button.textContent = mode;
+    button.title = "Switch approval mode to " + next;
+    button.setAttribute("aria-label",
+      "Approval mode: " + mode + ". Switch to " + next + ".");
+    button.addEventListener("click", () => toggleApprovalMode(button, capabilities));
+    return button;
+  }
+
+  async function toggleApprovalMode(button, capabilities) {
+    if (!state.endpoint || button.disabled) return;
+    const session = state.snapshots.get(state.sessionId)?.session || {};
+    const mode = session.approval_mode || "ask";
+    const next = mode === "ask" ? "allow-all" : "ask";
+    const payload = { mode: next };
+    // Only a server that has answered /sessions understands session_id; an
+    // older one would reject the field, so it is omitted unless supported.
+    if (state.sessionSupport === true && state.sessionId) {
+      payload.session_id = state.sessionId;
+    }
+    button.disabled = true;
+    try {
+      const result = await apiCall("/session/approval", {
+        method: "POST", body: JSON.stringify(payload)
+      });
+      const applied = result && typeof result.mode === "string" ? result.mode : next;
+      setApprovalMode(applied);
+      // Re-render immediately so the chip shows the new mode; the once-per-
+      // second poll will confirm it against the server.
+      renderSessionMeta(session, capabilities);
+    } catch (error) {
+      // Surface through the existing notice and restore the chip so the poll
+      // loop keeps running instead of leaving a stuck, disabled button.
+      showConnection(error.message || "Could not change the approval mode.");
+      button.disabled = false;
+    }
+  }
+
+  // setApprovalMode records the server-confirmed mode on the active session and
+  // its cached snapshot so the next render reflects it without a fresh poll.
+  function setApprovalMode(mode) {
+    const entry = activeSession();
+    if (entry) entry.approval_mode = mode;
+    const snapshot = state.snapshots.get(state.sessionId);
+    if (snapshot && snapshot.session) snapshot.session.approval_mode = mode;
+  }
+
+  function renderSnapshot(snapshot) {
+    const endpoint = state.endpoint;
+    const session = snapshot.session || {};
+    if (!state.selectedAgents.has(state.sessionId)) {
+      state.selectedAgents.set(state.sessionId, session.agent_id);
+    }
+    const current = activeSession();
+    elements.endpointLabel.textContent = endpoint
+      ? endpoint.name + (current?.name ? " · " + current.name : "")
+      : "Aiharn";
+    // A spawned agent may carry a human-readable name; the header and the
+    // composer placeholder prefer it, matching the agent list.
+    const selectedLabel = session.agent_id ? agentLabel(session.agent_id) : "";
+    const selectedName = selectedLabel && selectedLabel !== session.agent_id ? selectedLabel : "";
+    elements.agentTitle.textContent = selectedName
+      ? selectedName + (session.agent_type ? " · " + session.agent_type : "")
+      : session.agent_id
+        ? (session.agent_type && session.agent_type !== session.agent_id
+          ? session.agent_type + " · " + session.agent_id : session.agent_id)
+        : "Current session";
+    elements.message.placeholder = "Message " +
+      (selectedName || session.agent_id || "Aiharn") + "…";
+
+    const agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
+    const stale = !Array.isArray(snapshot.agents);
+    renderAgentList(stale ? [{
+      id: session.agent_id, type: session.agent_type,
+      state: session.state, depth: 0, paused: false
+    }] : agents, session.agent_id);
+
+    renderSessionMeta(session, snapshot.capabilities);
     elements.queue.textContent = snapshot.queued_messages
       ? snapshot.queued_messages + " queued"
       : "";
@@ -365,9 +557,66 @@
     elements.send.disabled = unavailable || !elements.message.value.trim();
     renderApprovals(snapshot.pending_approvals || []);
     renderMessages(snapshot.messages || []);
-    if (snapshot.last_error) showConnection(snapshot.last_error);
+    renderPendingAgentMessages(snapshot.pending_agent_messages);
+    if (state.sessionSupport === false) showConnection(LEGACY_SERVER_NOTICE);
+    else if (stale) showConnection(STALE_SERVER_NOTICE);
+    else if (snapshot.agents_error) showConnection(snapshot.agents_error);
+    else if (snapshot.last_error) showConnection(snapshot.last_error);
     else hideConnection();
     state.connected = true;
+  }
+
+  // Agent messages still queued in an inbox are not part of the transcript
+  // yet, so the poll (which is the only thing that refreshes the transcript)
+  // cannot show them there. Render them in a bounded strip directly above the
+  // composer, visually distinct from the transcript, so a queued agent message
+  // is visible before the next turn. The strip is hidden entirely when the
+  // server is older (no pending_agent_messages field) or the array is empty.
+  function renderPendingAgentMessages(pending) {
+    let strip = elements.pendingAgentMessages;
+    if (!strip) {
+      strip = document.createElement("section");
+      strip.id = "pending-agent-messages";
+      strip.className = "pending-agent-messages hidden";
+      strip.setAttribute("aria-label", "Agent messages");
+      if (elements.composer && elements.composer.parentNode) {
+        elements.composer.parentNode.insertBefore(strip, elements.composer);
+      }
+      elements.pendingAgentMessages = strip;
+    }
+    strip.replaceChildren();
+    const list = Array.isArray(pending) ? pending : [];
+    if (!list.length) {
+      strip.classList.add("hidden");
+      return;
+    }
+    strip.classList.remove("hidden");
+    const head = document.createElement("div");
+    head.className = "pending-head";
+    const title = document.createElement("span");
+    title.className = "pending-title";
+    title.textContent = "Agent messages";
+    const hint = document.createElement("span");
+    hint.className = "pending-hint";
+    hint.textContent = "Queued between agents. They appear in the transcript after your next message.";
+    head.append(title, hint);
+    const items = document.createElement("ul");
+    items.className = "pending-list";
+    for (const entry of list) {
+      const item = document.createElement("li");
+      item.className = "pending-item";
+      const header = document.createElement("div");
+      header.className = "pending-item-header";
+      const arrow = entry && entry.direction === "down" ? "\u2193" : "\u2191";
+      header.textContent = arrow + " " + agentLabel(entry && entry.from) + " \u2192 " +
+        agentLabel(entry && entry.to) + " \u00b7 " + ((entry && entry.kind) || "message");
+      const text = document.createElement("div");
+      text.className = "pending-item-body";
+      text.textContent = (entry && entry.content) || "";
+      item.append(header, text);
+      items.append(item);
+    }
+    strip.append(head, items);
   }
 
   function renderMessages(messages) {
@@ -387,15 +636,46 @@
     for (const entry of groupMessages(messages)) {
       const message = entry.message;
       if (message.type === "message") {
+        // A completed subagent report arrives in the top-level history as a
+        // role:"user" item injected by the agent system. Without an origin it is
+        // indistinguishable from something the human typed, so it used to wear
+        // the user's own green bubble. Render those as a distinct delivery row;
+        // an older server that omits origin keeps the original behaviour.
+        // A newer server also stamps agent-to-agent traffic with a `delivery`
+        // object naming the direction, endpoints and kind; that gets its own
+        // header. A human message keeps origin:"human" and never carries one.
+        const delivery = message.role === "user" &&
+          message.delivery && typeof message.delivery === "object"
+          ? message.delivery : null;
+        const agentAuthored = message.role === "user" &&
+          (message.origin === "agent" || Boolean(delivery));
         const row = document.createElement("div");
-        row.className = "message-row " + (message.role || "");
         const body = document.createElement("div");
-        body.className = "message";
-        if (message.role !== "user") {
-          const role = document.createElement("div");
-          role.className = "message-role";
-          role.textContent = message.role === "assistant" ? "Aiharn" : message.role;
-          body.append(role);
+        if (agentAuthored) {
+          row.className = "message-row delivery";
+          body.className = "message message-delivery";
+          if (delivery) {
+            const head = document.createElement("div");
+            head.className = "delivery-header";
+            const arrow = delivery.direction === "down" ? "\u2193" : "\u2191";
+            head.textContent = arrow + " " + agentLabel(delivery.from) + " \u2192 " +
+              agentLabel(delivery.to) + " \u00b7 " + (delivery.kind || "message");
+            body.append(head);
+          } else {
+            const label = document.createElement("div");
+            label.className = "message-role";
+            label.textContent = "Agent message";
+            body.append(label);
+          }
+        } else {
+          row.className = "message-row " + (message.role || "");
+          body.className = "message";
+          if (message.role !== "user") {
+            const role = document.createElement("div");
+            role.className = "message-role";
+            role.textContent = message.role === "assistant" ? "Aiharn" : message.role;
+            body.append(role);
+          }
         }
         body.append(document.createTextNode(message.content || ""));
         row.append(body);
@@ -489,7 +769,10 @@
       const agent = document.createElement("div");
       agent.className = "approval-agent";
       const agentType = document.createElement("span");
-      agentType.textContent = "Agent: " + (approval.agent_type || "unknown");
+      const agentName = approval.agent_id && agentLabel(approval.agent_id) !== approval.agent_id
+        ? agentLabel(approval.agent_id) : "";
+      agentType.textContent = "Agent: " + (approval.agent_type || "unknown") +
+        (agentName ? " · " + agentName : "");
       const agentID = document.createElement("span");
       agentID.className = "approval-agent-id";
       agentID.textContent = "ID: " + (approval.agent_id || "unknown");
@@ -519,12 +802,13 @@
   }
 
   async function resolveApproval(id, decision, button) {
-    const endpoint = activeEndpoint();
-    if (!endpoint) return;
+    if (!state.endpoint) return;
     for (const sibling of button.parentElement.children) sibling.disabled = true;
     try {
-      await apiCall(endpoint, "/approvals/" + encodeURIComponent(id), {
-        method: "POST", body: JSON.stringify({ decision })
+      const payload = { decision };
+      if (state.sessionSupport === true && state.sessionId) payload.session_id = state.sessionId;
+      await apiCall("/approvals/" + encodeURIComponent(id), {
+        method: "POST", body: JSON.stringify(payload)
       });
       await poll(true);
     } catch (error) {
@@ -533,52 +817,122 @@
     }
   }
 
+  async function pollSessions() {
+    if (!state.endpoint) {
+      renderSessionList();
+      return;
+    }
+    state.sessionsRequest?.abort();
+    const request = new AbortController();
+    state.sessionsRequest = request;
+    try {
+      const payload = await apiCall("/sessions", { signal: request.signal });
+      state.sessionSupport = true;
+      const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+      state.sessions = sessions;
+      state.defaultSessionId = payload.default_session_id || "";
+      const known = sessions.some((item) => item.id === state.sessionId);
+      const previous = state.sessionId;
+      if (!state.sessionId || !known) {
+        const fallback = state.defaultSessionId || sessions[0]?.id || "";
+        state.sessionId = fallback;
+        if (fallback) localStorage.setItem(SESSION_KEY, fallback);
+      }
+      renderSessionList();
+      if (state.sessionId !== previous) {
+        // A different session is now active: drop the cached render and fetch
+        // it without waiting for the next tick.
+        state.fingerprint = "";
+        state.selectedAgents.delete(state.sessionId);
+        renderWaiting();
+        poll(true);
+      }
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      if (error.status === 404 || error.status === 405) {
+        // An older server: it has no session routes and would reject the
+        // session_id field on messages. Degrade to a single implicit session
+        // instead of failing. The poll keeps running, so restarting the server
+        // is picked up without a reload.
+        state.sessionSupport = false;
+        state.sessionId = "";
+        state.sessions = [];
+        renderSessionList();
+        showConnection(LEGACY_SERVER_NOTICE);
+        return;
+      }
+      state.sessions = [];
+      renderSessionList();
+      showConnection(error.status === 401
+        ? "Authentication required. Set the access token in settings."
+        : error.message);
+    } finally {
+      clearTimeout(state.sessionsTimer);
+      state.sessionsTimer = setTimeout(pollSessions, SESSIONS_POLL_MS);
+    }
+  }
+
   async function poll(immediate = false) {
     clearTimeout(state.timer);
-    const endpoint = activeEndpoint();
-    if (!endpoint) {
+    if (!state.endpoint) {
       renderWaiting();
       return;
     }
     state.request?.abort();
     const request = new AbortController();
     state.request = request;
+    const sessionID = state.sessionId;
     try {
       const agentID = selectedAgentID();
-      const path = "/session" + (agentID ? "?agent_id=" + encodeURIComponent(agentID) : "");
-      const snapshot = await apiCall(endpoint, path, { signal: request.signal });
-      if (endpoint.id !== state.activeId) return;
+      const query = [];
+      if (sessionID) query.push("session_id=" + encodeURIComponent(sessionID));
+      if (agentID) query.push("agent_id=" + encodeURIComponent(agentID));
+      const path = "/session" + (query.length ? "?" + query.join("&") : "");
+      const snapshot = await apiCall(path, { signal: request.signal });
+      if (sessionID !== state.sessionId) return;
       if (agentID !== selectedAgentID()) return;
-      state.health.set(endpoint.id, "online");
       const fingerprint = JSON.stringify(snapshot);
       if (fingerprint !== state.fingerprint) {
         state.fingerprint = fingerprint;
-        state.snapshots.set(endpoint.id, snapshot);
+        state.snapshots.set(state.sessionId, snapshot);
         renderSnapshot(snapshot);
       }
-      renderEndpointList();
     } catch (error) {
       if (error.name === "AbortError") return;
-      if (error.status === 404 && selectedAgentID()) {
-        state.selectedAgents.delete(endpoint.id);
-        state.fingerprint = "";
-        state.connected = false;
-        elements.message.disabled = true;
-        elements.send.disabled = true;
-        showConnection("Selected agent is no longer available; returning to main.");
+      if (sessionID !== state.sessionId) return;
+      if (error.status === 404) {
+        if (selectedAgentID()) {
+          state.selectedAgents.delete(state.sessionId);
+          state.fingerprint = "";
+          state.connected = false;
+          elements.message.disabled = true;
+          elements.send.disabled = true;
+          showConnection("Selected agent is no longer available; returning to main.");
+        } else {
+          state.sessionId = state.defaultSessionId || "";
+          if (state.sessionId) localStorage.setItem(SESSION_KEY, state.sessionId);
+          state.fingerprint = "";
+          state.connected = false;
+          renderSessionList();
+          renderWaiting();
+          showConnection("That session is gone; switched to the default session.");
+        }
         return;
       }
-      state.health.set(endpoint.id, "error");
       state.fingerprint = "";
       state.connected = false;
       elements.message.disabled = true;
       elements.send.disabled = true;
       showConnection(error.status === 401
-        ? "Authentication required. Set the access token for this API."
+        ? "Authentication required. Set the access token in settings."
         : error.message);
-      renderEndpointList();
     } finally {
-      if (endpoint.id === state.activeId) {
+      // Reschedule whenever this is still the newest poll. Comparing on the
+      // session id instead would stop the loop for good whenever the active
+      // session changed while the request was in flight (which is exactly what
+      // happens on startup, when the session list resolves after the first
+      // poll), leaving the console stuck on "Connecting".
+      if (state.request === request) {
         state.timer = setTimeout(poll, immediate ? 50 : POLL_MS);
       }
     }
@@ -586,19 +940,19 @@
 
   async function sendMessage(event) {
     event?.preventDefault();
-    const endpoint = activeEndpoint();
     const agentID = selectedAgentID();
-    const snapshot = endpoint && state.snapshots.get(endpoint.id);
+    const snapshot = state.snapshots.get(state.sessionId);
     const rootID = snapshot?.agents?.[0]?.id || snapshot?.session?.agent_id || "";
     const content = elements.message.value;
-    if (!endpoint || !state.connected || elements.message.disabled || !content.trim()) return;
+    if (!state.endpoint || !state.connected || elements.message.disabled || !content.trim()) return;
     elements.send.disabled = true;
     try {
-      await apiCall(endpoint, "/messages", {
-        method: "POST", body: JSON.stringify(messagePayload(content, agentID, rootID))
+      await apiCall("/messages", {
+        method: "POST",
+        body: JSON.stringify(messagePayload(content, agentID, rootID, state.sessionId))
       });
-      state.drafts.delete(draftKey(endpoint.id, agentID));
-      if (endpoint.id === state.activeId && agentID === selectedAgentID() && elements.message.value === content) {
+      state.drafts.delete(draftKey());
+      if (agentID === selectedAgentID() && elements.message.value === content) {
         elements.message.value = "";
         updateComposer();
       }
@@ -606,88 +960,176 @@
     } catch (error) {
       showConnection(error.message);
     } finally {
-      elements.send.disabled = !state.connected || elements.message.disabled || !elements.message.value.trim();
+      elements.send.disabled = !state.connected || elements.message.disabled ||
+        !elements.message.value.trim();
     }
   }
 
-  function messagePayload(content, agentID, rootID) {
-    return agentID && agentID !== rootID ? { content, agent_id: agentID } : { content };
+  function messagePayload(content, agentID, rootID, sessionID) {
+    const payload = { content };
+    if (agentID && agentID !== rootID) payload.agent_id = agentID;
+    // Only a server that has answered /sessions understands this field; an
+    // older one rejects the whole body as invalid JSON.
+    if (sessionID && state.sessionSupport === true) payload.session_id = sessionID;
+    return payload;
   }
 
-  function openAPIDialog() {
-    elements.apiForm.reset();
-    elements.apiDialog.showModal();
-    setTimeout(() => elements.apiName.focus(), 0);
+  function showDialogError(element, message) {
+    element.textContent = message;
+    element.classList.toggle("hidden", !message);
   }
 
-  function openTokenDialog() {
-    const endpoint = activeEndpoint();
-    if (!endpoint) return;
-    elements.tokenLabel.textContent = endpoint.name + " · " + endpoint.url;
-    elements.tokenValue.value = tokenFor(endpoint);
-    elements.tokenDialog.showModal();
-    setTimeout(() => elements.tokenValue.focus(), 0);
+  function openSettingsDialog() {
+    const endpoint = state.endpoint;
+    elements.settingsName.value = endpoint?.name || "";
+    elements.settingsUrl.value = endpoint?.url || "";
+    // Never prefill the token: a blank field keeps whatever is stored.
+    elements.settingsToken.value = "";
+    elements.settingsUrl.readOnly = Boolean(endpoint?.deployed);
+    elements.settingsUrlHelp.textContent = endpoint?.deployed
+      ? "Configured by deployment; the token below is still editable."
+      : "";
+    if (!endpoint?.deployed) {
+      elements.settingsUrlHelp.textContent = "Use the server origin, without /api/v1.";
+    }
+    elements.settingsTokenHelp.textContent = token()
+      ? "Leave blank to keep the stored token. Tokens live only in this browser tab."
+      : "No token stored yet. Tokens live only in this browser tab.";
+    showDialogError(elements.settingsError, "");
+    elements.settingsDialog.showModal();
+    setTimeout(() => elements.settingsName.focus(), 0);
+  }
+
+  function openSessionDialog(mode, session) {
+    if (state.sessionSupport === false) {
+      state.feedback = LEGACY_SERVER_NOTICE;
+      showConnection(LEGACY_SERVER_NOTICE);
+      return;
+    }
+    state.sessionMode = mode;
+    state.renameTarget = session?.id || "";
+    elements.sessionTitle.textContent = mode === "rename" ? "Rename session" : "New session";
+    elements.sessionSubmit.textContent = mode === "rename" ? "Rename" : "Create";
+    elements.sessionName.value = mode === "rename"
+      ? (session?.name || "")
+      : "Session " + (state.sessions.length + 1);
+    showDialogError(elements.sessionError, "");
+    elements.sessionDialog.showModal();
+    setTimeout(() => {
+      elements.sessionName.focus();
+      elements.sessionName.select();
+    }, 0);
   }
 
   function updateComposer() {
-    elements.send.disabled = !state.connected || elements.message.disabled || !elements.message.value.trim();
+    elements.send.disabled = !state.connected || elements.message.disabled ||
+      !elements.message.value.trim();
   }
 
-  document.querySelectorAll("#add-api, #manage-api, .add-api-cta").forEach((button) => {
-    button.addEventListener("click", openAPIDialog);
+  function refreshAfterEndpointChange() {
+    state.fingerprint = "";
+    state.connected = false;
+    state.sessionsRequest?.abort();
+    state.request?.abort();
+  }
+
+  document.querySelectorAll("#open-settings, #topbar-settings").forEach((button) => {
+    button.addEventListener("click", openSettingsDialog);
   });
-  document.querySelectorAll(".close-dialog").forEach((button) => {
-    button.addEventListener("click", () => elements.apiDialog.close());
+  document.querySelectorAll(".close-settings").forEach((button) => {
+    button.addEventListener("click", () => elements.settingsDialog.close());
   });
-  document.querySelectorAll(".close-token-dialog").forEach((button) => {
-    button.addEventListener("click", () => elements.tokenDialog.close());
+  document.querySelectorAll(".close-session").forEach((button) => {
+    button.addEventListener("click", () => elements.sessionDialog.close());
   });
-  document.querySelector("#set-token").addEventListener("click", openTokenDialog);
+  document.querySelector("#new-session").addEventListener("click", () => openSessionDialog("create"));
   document.querySelector("#mobile-menu").addEventListener("click", () => {
     document.body.classList.toggle("menu-open");
   });
 
-  elements.apiForm.addEventListener("submit", (event) => {
+  elements.settingsForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    let url;
     try {
-      const url = normalizeURL(elements.apiUrl.value);
-      let endpoint = state.endpoints.find((item) => item.url === url);
-      if (!endpoint) {
-        endpoint = {
-          id: "user-" + (crypto.randomUUID?.() || Date.now().toString(36)),
-          name: elements.apiName.value.trim() || new URL(url).host,
-          url,
-          deployed: false
-        };
-        state.endpoints.push(endpoint);
-      } else if (!endpoint.deployed) {
-        endpoint.name = elements.apiName.value.trim() || endpoint.name;
-      }
-      setToken(endpoint, elements.apiToken.value);
-      persistEndpoints();
-      elements.apiDialog.close();
-      selectEndpoint(endpoint.id);
-      renderEndpointList();
+      url = normalizeURL(elements.settingsUrl.value);
     } catch {
-      elements.apiUrl.setCustomValidity("Enter a valid HTTP(S) API URL.");
-      elements.apiUrl.reportValidity();
+      showDialogError(elements.settingsError, "Enter a valid HTTP(S) API URL.");
+      return;
+    }
+    const previous = state.endpoint;
+    let name = elements.settingsName.value.trim();
+    if (!name) {
+      try {
+        name = new URL(url).host;
+      } catch {
+        name = url;
+      }
+    }
+    const changed = !previous || previous.url !== url;
+    saveEndpoint({
+      name: previous?.deployed ? previous.name : name,
+      url,
+      deployed: Boolean(previous?.deployed)
+    });
+    // Only a non-empty field replaces the stored token.
+    if (elements.settingsToken.value) setToken(elements.settingsToken.value);
+    elements.settingsToken.value = "";
+    elements.settingsDialog.close();
+    if (changed) {
+      // Session ids belong to one server, so a new URL starts a new selection.
+      clearSessionState();
+      refreshAfterEndpointChange();
+      renderSessionList();
+      renderWaiting();
+      pollSessions();
+    } else {
+      refreshAfterEndpointChange();
+      poll(true);
     }
   });
-  elements.apiUrl.addEventListener("input", () => elements.apiUrl.setCustomValidity(""));
-
-  elements.tokenForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    setToken(activeEndpoint(), elements.tokenValue.value);
-    elements.tokenDialog.close();
-    state.fingerprint = "";
+  elements.settingsUrl.addEventListener("input", () => showDialogError(elements.settingsError, ""));
+  document.querySelector("#forget-token").addEventListener("click", () => {
+    setToken("");
+    elements.settingsToken.value = "";
+    elements.settingsTokenHelp.textContent =
+      "No token stored yet. Tokens live only in this browser tab.";
+    showDialogError(elements.settingsError, "");
+    refreshAfterEndpointChange();
     poll(true);
   });
-  document.querySelector("#forget-token").addEventListener("click", () => {
-    setToken(activeEndpoint(), "");
-    elements.tokenValue.value = "";
-    elements.tokenDialog.close();
-    state.fingerprint = "";
-    poll(true);
+
+  elements.sessionForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = elements.sessionName.value.trim();
+    if (!name) {
+      showDialogError(elements.sessionError, "Enter a session name.");
+      return;
+    }
+    const renaming = state.sessionMode === "rename";
+    elements.sessionSubmit.disabled = true;
+    try {
+      if (renaming) {
+        await apiCall("/sessions/" + encodeURIComponent(state.renameTarget), {
+          method: "PATCH", body: JSON.stringify({ name })
+        });
+      } else {
+        const created = await apiCall("/sessions", {
+          method: "POST", body: JSON.stringify({ name })
+        });
+        elements.sessionDialog.close();
+        await pollSessions();
+        if (created?.id) {
+          selectSession(created.id);
+          return;
+        }
+      }
+      elements.sessionDialog.close();
+      await pollSessions();
+    } catch (error) {
+      showDialogError(elements.sessionError, error.message);
+    } finally {
+      elements.sessionSubmit.disabled = false;
+    }
   });
 
   elements.composer.addEventListener("submit", sendMessage);
@@ -722,7 +1164,10 @@
   composerResize.addEventListener("pointerup", endResize);
   composerResize.addEventListener("pointercancel", endResize);
 
-  renderEndpointList();
+  renderSessionList();
   renderWaiting();
-  if (state.activeId) poll();
+  if (state.endpoint) {
+    pollSessions();
+    poll();
+  }
 })();

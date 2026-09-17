@@ -12,6 +12,7 @@ import (
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
+	"aiharn/internal/llm"
 )
 
 // Update implements tea.Model. It dispatches on message type and returns the
@@ -317,7 +318,8 @@ func (m *Model) submitInput() tea.Cmd {
 	m.pushHistory(line)
 	m.draft = ""
 	if m.agent != nil && m.focusedID != "" && m.focusedID != m.agent.ID() {
-		if err := m.manager.SendSubagentMessage(m.ctx, m.agent.ID(), m.focusedID, line); err != nil {
+		// A person typed this line into the focused subagent, so it is human-authored.
+		if err := m.manager.SendSubagentMessage(m.ctx, m.agent.ID(), m.focusedID, line, llm.OriginHuman); err != nil {
 			m.appendLine(kindError, "send to subagent: "+err.Error())
 		} else {
 			m.appendLine(kindPlain, "[queued for "+m.focusedID+"]")
@@ -427,5 +429,58 @@ func (m *Model) appendEvent(ev agent.Event) {
 			m.finishThinking(time.Now())
 		}
 		m.flushText()
+	case agent.EventAgentMessage:
+		// Rendered for every agent, not just the focused one: agent-to-agent
+		// traffic is cross-agent and must never be hidden by focus.
+		m.appendAgentMessage(ev)
 	}
+}
+
+// appendAgentMessage renders one agent-to-agent message as its own line. The
+// header names the direction (↑ up / ↓ down), the sender, the recipient, and
+// the kind, so the line is immediately separable from human input and assistant
+// output. A pending message keeps its real direction arrow and gains a
+// "(pending)" marker, and its body is shown too, so a queued message reads the
+// same as a delivered one plus the marker. The body follows the header, and
+// appendLine handles multi-line text and terminal sanitization.
+func (m *Model) appendAgentMessage(ev agent.Event) {
+	// Flush streamed assistant text first so a pending delta cannot be woven
+	// into (or mistaken for) the message body.
+	m.flushText()
+	header := agentMessageHeader(ev)
+	// Show the body for both delivered and pending messages. The lone exception
+	// preserves the nil-Delivery fallback exactly as it was: a malformed pending
+	// event renders just "(agent message) (pending)".
+	showBody := ev.Text != "" && (ev.Delivery != nil || !ev.Pending)
+	if showBody {
+		header += "  " + ev.Text
+	}
+	m.appendLine(kindAgentMessage, header)
+}
+
+// agentMessageHeader builds the provenance header for an agent message. The
+// direction arrow is kept while pending; only the trailing "(pending)" marker
+// signals that the message is still queued. It is defensive about a nil
+// (malformed or stale) Delivery instead of panicking.
+func agentMessageHeader(ev agent.Event) string {
+	d := ev.Delivery
+	if d == nil {
+		header := "(agent message)"
+		if ev.Pending {
+			header += " (pending)"
+		}
+		return header
+	}
+	arrow := "→"
+	switch d.Direction {
+	case llm.DirectionUp:
+		arrow = "↑"
+	case llm.DirectionDown:
+		arrow = "↓"
+	}
+	header := fmt.Sprintf("%s %s → %s · %s", arrow, d.From, d.To, d.Kind)
+	if ev.Pending {
+		header += " (pending)"
+	}
+	return header
 }

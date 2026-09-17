@@ -486,6 +486,150 @@ func TestObserverReceivesAppendedHistory(t *testing.T) {
 	}
 }
 
+func TestTurnRecordsHumanOrigin(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m",
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+	})
+	if err := a.Turn(context.Background(), "typed by a person"); err != nil {
+		t.Fatal(err)
+	}
+	hist := a.History()
+	if len(hist) == 0 || hist[0].Type != llm.ItemMessage || hist[0].Role != llm.RoleUser {
+		t.Fatalf("history = %+v", hist)
+	}
+	if hist[0].Origin != llm.OriginHuman {
+		t.Fatalf("turn input origin = %q, want %q", hist[0].Origin, llm.OriginHuman)
+	}
+}
+
+func TestDrainedInboxPreservesOrigin(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m",
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+	})
+	if !a.Send("queued by a person") {
+		t.Fatal("Send failed")
+	}
+	if !a.SendAgent("[subagent coder (7)] done", &llm.Delivery{
+		From: "coder-7", To: "a1", Direction: llm.DirectionUp, Kind: llm.KindReport,
+	}) {
+		t.Fatal("SendAgent failed")
+	}
+	if err := a.Turn(context.Background(), "typed by a person"); err != nil {
+		t.Fatal(err)
+	}
+	hist := a.History()
+	if len(hist) != 4 {
+		t.Fatalf("history len = %d, want 4: %+v", len(hist), hist)
+	}
+	if hist[0].Content != "queued by a person" || hist[0].Origin != llm.OriginHuman {
+		t.Fatalf("drained human message = %+v", hist[0])
+	}
+	if hist[1].Content != "[subagent coder (7)] done" || hist[1].Origin != llm.OriginAgent {
+		t.Fatalf("drained agent message = %+v", hist[1])
+	}
+	if got := hist[1].Delivery; got == nil || got.From != "coder-7" || got.To != "a1" ||
+		got.Direction != llm.DirectionUp || got.Kind != llm.KindReport {
+		t.Fatalf("drained agent message delivery = %+v", got)
+	}
+	if hist[2].Content != "typed by a person" || hist[2].Origin != llm.OriginHuman {
+		t.Fatalf("turn input = %+v", hist[2])
+	}
+	if hist[2].Delivery != nil {
+		t.Fatalf("human turn input must carry no delivery: %+v", hist[2].Delivery)
+	}
+	// The drained report is reported delivered exactly once, at the point it is
+	// appended to history; the human turn input stays a plain EventUser.
+	events := drainEvents(a)
+	if got := countAgentMessages(events, "[subagent coder (7)] done", false); got != 1 {
+		t.Fatalf("drained report delivered events = %d, want exactly 1: %+v", got, events)
+	}
+}
+
+// TestSendAgentEmitsPendingThenDelivered proves the two EventAgentMessage
+// emissions a live UI relies on: Pending true when the message is queued, and
+// Pending false once it reaches history.
+func TestSendAgentEmitsPendingThenDelivered(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m",
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+	})
+	d := &llm.Delivery{From: "sub-1", To: "a1", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !a.SendAgent("done", d) {
+		t.Fatal("SendAgent failed")
+	}
+	queued := drainEvents(a)
+	var pending bool
+	for _, e := range queued {
+		if e.Type == agent.EventAgentMessage {
+			if !e.Pending || e.Text != "done" || e.Delivery == nil || e.Delivery.From != "sub-1" {
+				t.Fatalf("queued event = %+v", e)
+			}
+			pending = true
+		}
+	}
+	if !pending {
+		t.Fatalf("no Pending EventAgentMessage emitted: %+v", queued)
+	}
+
+	if err := a.Turn(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	delivered := drainEvents(a)
+	count := 0
+	for _, e := range delivered {
+		if e.Type == agent.EventAgentMessage {
+			if e.Pending || e.Text != "done" || e.Delivery == nil || e.Delivery.Kind != llm.KindReport {
+				t.Fatalf("delivered event = %+v", e)
+			}
+			count++
+		}
+		if e.Type == agent.EventUser && e.Text == "done" {
+			t.Fatalf("delivered report also rendered as a raw user turn: %+v", e)
+		}
+	}
+	if count != 1 {
+		t.Fatalf("delivered EventAgentMessage count = %d, want exactly 1: %+v", count, delivered)
+	}
+}
+
+// TestHumanSendEmitsNoAgentMessage asserts a plain Send is still a human
+// message: no delivery and no agent-message event.
+func TestHumanSendEmitsNoAgentMessage(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m",
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+	})
+	if !a.Send("hi") {
+		t.Fatal("Send failed")
+	}
+	for _, e := range drainEvents(a) {
+		if e.Type == agent.EventAgentMessage {
+			t.Fatalf("human Send emitted an agent-message event: %+v", e)
+		}
+	}
+	if err := a.Turn(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	hist := a.History()
+	if hist[0].Content != "hi" || hist[0].Origin != llm.OriginHuman || hist[0].Delivery != nil {
+		t.Fatalf("human message = %+v", hist[0])
+	}
+	var users int
+	for _, e := range drainEvents(a) {
+		if e.Type == agent.EventAgentMessage {
+			t.Fatalf("human turn emitted an agent-message event: %+v", e)
+		}
+		if e.Type == agent.EventUser && e.Text == "go" {
+			users++
+		}
+	}
+	if users != 1 {
+		t.Fatalf("human turn EventUser count = %d, want exactly 1", users)
+	}
+}
+
 func hasText(events []agent.Event, text string) bool {
 	for _, e := range events {
 		if e.Type == agent.EventText && e.Text == text {
@@ -502,4 +646,242 @@ func hasToolCall(events []agent.Event, name string) bool {
 		}
 	}
 	return false
+}
+
+// historyCount returns how many history items carry the given content.
+func historyCount(hist []llm.Item, content string) int {
+	n := 0
+	for _, it := range hist {
+		if it.Content == content {
+			n++
+		}
+	}
+	return n
+}
+
+// countAgentMessages counts EventAgentMessage events for text with the given
+// Pending flag. A delivered event is Pending false; an enqueue event is Pending
+// true.
+func countAgentMessages(events []agent.Event, text string, pending bool) int {
+	n := 0
+	for _, e := range events {
+		if e.Type == agent.EventAgentMessage && e.Text == text && e.Pending == pending {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEnqueueEmitsPendingTrueUnchanged pins the enqueue-time event: a queued
+// agent message reports Pending true once, and nothing is delivered until the
+// text reaches a history.
+func TestEnqueueEmitsPendingTrueUnchanged(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m",
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+	})
+	d := &llm.Delivery{From: "sub-1", To: "a1", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !a.SendAgent("queued report", d) {
+		t.Fatal("SendAgent failed")
+	}
+	events := drainEvents(a)
+	if got := countAgentMessages(events, "queued report", true); got != 1 {
+		t.Fatalf("Pending-true events = %d, want exactly 1: %+v", got, events)
+	}
+	if got := countAgentMessages(events, "queued report", false); got != 0 {
+		t.Fatalf("enqueue emitted %d delivered events before any turn: %+v", got, events)
+	}
+}
+
+// TestDeliveryCarryingTurnInputEmitsDeliveredNotUser proves a subagent task
+// prompt -- a delivery-carrying turn input -- produces exactly one delivered
+// EventAgentMessage and no raw EventUser, so a view cannot render it twice (once
+// structured, once as "> task").
+func TestDeliveryCarryingTurnInputEmitsDeliveredNotUser(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 4, Builder: builderWithScript([][]llm.Event{finalTurn("ack")})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	const prompt = "TASK implement the parser"
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := mgr.Agent(id)
+	waitFor(t, 2*time.Second, "subagent to finish the task", func() bool {
+		return sub.State() == agent.StateIdle
+	})
+
+	events := drainEvents(sub)
+	if got := countAgentMessages(events, prompt, false); got != 1 {
+		t.Fatalf("delivered turn-input events = %d, want exactly 1: %+v", got, events)
+	}
+	for _, e := range events {
+		if e.Type == agent.EventUser && e.Text == prompt {
+			t.Fatalf("delivery-carrying turn input also emitted EventUser: %+v", e)
+		}
+		if e.Type == agent.EventAgentMessage && e.Text == prompt && !e.Pending {
+			if e.Delivery == nil || e.Delivery.Direction != llm.DirectionDown || e.Delivery.Kind != llm.KindTask {
+				t.Fatalf("delivered task event lost its delivery metadata: %+v", e)
+			}
+		}
+	}
+	if n := historyCount(sub.History(), prompt); n != 1 {
+		t.Fatalf("task in history %d times, want exactly 1: %+v", n, sub.History())
+	}
+}
+
+// TestHumanTurnInputEmitsUserOnly proves a person-authored turn input still
+// emits exactly one EventUser and no agent-message event.
+func TestHumanTurnInputEmitsUserOnly(t *testing.T) {
+	a := agent.New(agent.Spec{
+		ID: "a1", Type: "main", Model: "m",
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+	})
+	if err := a.Turn(context.Background(), "typed by a person"); err != nil {
+		t.Fatal(err)
+	}
+	var users int
+	for _, e := range drainEvents(a) {
+		if e.Type == agent.EventAgentMessage {
+			t.Fatalf("human turn emitted an agent-message event: %+v", e)
+		}
+		if e.Type == agent.EventUser {
+			users++
+			if e.Text != "typed by a person" {
+				t.Fatalf("EventUser text = %q", e.Text)
+			}
+		}
+	}
+	if users != 1 {
+		t.Fatalf("human turn EventUser events = %d, want exactly 1", users)
+	}
+}
+
+// TestTaskTakenWhilePausedDeliversOnlyOnResume reproduces the ghost delivered
+// event: a task taken from the inbox while the subagent is paused must not be
+// reported as delivered (it is not in history); the delivered event fires only
+// when the resumed turn appends it to history.
+func TestTaskTakenWhilePausedDeliversOnlyOnResume(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 4, Builder: builderWithScript([][]llm.Event{
+		finalTurn("first done"), finalTurn("second done"),
+	})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "first task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := mgr.Agent(id)
+	waitFor(t, 2*time.Second, "first task to complete", func() bool { return sub.State() == agent.StateIdle })
+	// Let the run loop park in its inbox receive: a task sent next is received
+	// even though the agent is paused (the receive is already past the gate).
+	time.Sleep(50 * time.Millisecond)
+	drainEvents(sub)
+
+	const second = "second task body"
+	if err := mgr.SetSubagentPaused(context.Background(), "main", id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, second, llm.OriginAgent); err != nil {
+		t.Fatal(err)
+	}
+	// The task is taken from the inbox: it leaves the pending list...
+	waitFor(t, 2*time.Second, "task to leave the pending list", func() bool {
+		for _, pm := range mgr.PendingMessages() {
+			if pm.Text == second {
+				return false
+			}
+		}
+		return true
+	})
+	// ...but it is neither delivered nor in history while held.
+	held := drainEvents(sub)
+	if got := countAgentMessages(held, second, false); got != 0 {
+		t.Fatalf("taken-but-unrun task emitted %d delivered events: %+v", got, held)
+	}
+	if historyCount(sub.History(), second) != 0 {
+		t.Fatalf("taken-but-unrun task is already in history: %+v", sub.History())
+	}
+
+	// On resume the task runs: exactly one delivered event and it is in history.
+	if err := mgr.SetSubagentPaused(context.Background(), "main", id, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "resumed task to reach history", func() bool {
+		return historyCount(sub.History(), second) == 1
+	})
+	after := drainEvents(sub)
+	if got := countAgentMessages(after, second, false); got != 1 {
+		t.Fatalf("resumed task delivered events = %d, want exactly 1: %+v", got, after)
+	}
+}
+
+// TestTaskTakenThenShutdownDeliversNothing proves the ghost is gone at shutdown:
+// a task taken from the inbox but dropped before its turn (here, held by a pause
+// and then cancelled by shutdown) emits no delivered event and never appears in
+// history.
+func TestTaskTakenThenShutdownDeliversNothing(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 4, Builder: builderWithScript([][]llm.Event{
+		finalTurn("first done"), finalTurn("never run"),
+	})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "first task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := mgr.Agent(id)
+	waitFor(t, 2*time.Second, "first task to complete", func() bool { return sub.State() == agent.StateIdle })
+	time.Sleep(50 * time.Millisecond)
+	drainEvents(sub)
+
+	// Hold the subagent so a task sent now is taken from the inbox but held
+	// before its turn; shutting down then drops it before it reaches history.
+	if err := mgr.SetSubagentPaused(context.Background(), "main", id, true); err != nil {
+		t.Fatal(err)
+	}
+	const queued = "queued then dropped at shutdown"
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, queued, llm.OriginAgent); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "task to leave the pending list", func() bool {
+		for _, pm := range mgr.PendingMessages() {
+			if pm.Text == queued {
+				return false
+			}
+		}
+		return true
+	})
+	if got := countAgentMessages(drainEvents(sub), queued, false); got != 0 {
+		t.Fatalf("taken-but-unrun task emitted %d delivered events: %+v", got, queued)
+	}
+
+	if err := mgr.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	events := drainEvents(sub)
+	if got := countAgentMessages(events, queued, false); got != 0 {
+		t.Fatalf("dropped task emitted %d delivered events: %+v", got, events)
+	}
+	if historyCount(sub.History(), queued) != 0 {
+		t.Fatalf("dropped task appears in history: %+v", sub.History())
+	}
+}
+
+// TestAgentName proves Name() reports the configured spec name and falls back
+// to the id (so a top-level agent built without a name still has a non-empty
+// display name).
+func TestAgentName(t *testing.T) {
+	if got := agent.New(agent.Spec{ID: "x"}).Name(); got != "x" {
+		t.Fatalf("Name() with no explicit name = %q, want fallback id %q", got, "x")
+	}
+	if got := agent.New(agent.Spec{ID: "x", Name: "researcher"}).Name(); got != "researcher" {
+		t.Fatalf("Name() = %q, want %q", got, "researcher")
+	}
 }

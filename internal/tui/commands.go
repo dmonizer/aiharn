@@ -35,6 +35,7 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 		m.appendLine(kindPlain, "  click a command - open shell view focused on it")
 		m.appendLine(kindPlain, "  click approval ... - inspect the full command; Esc or [x] closes the preview")
 		m.appendLine(kindPlain, "  click an agent in the roster - switch its chat and terminal; || pauses queued tasks, x closes")
+		m.appendLine(kindPlain, "  transcript ↑/↓ = agent-to-agent message (↑ up to an ancestor, ↓ down to a descendant; (pending) = still queued)")
 	default:
 		m.appendLine(kindPlain, fmt.Sprintf("unknown command %q; type /help for help", name))
 	}

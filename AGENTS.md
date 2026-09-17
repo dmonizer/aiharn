@@ -98,6 +98,60 @@ inbox messages. `internal/app` assembles everything from validated config into a
 `internal/tui` is the Bubbletea UI; `internal/webapi` (with `web/`) is the
 optional current-session HTTP API and static frontend (see `docs/remote.md`).
 
+### Sessions (`internal/app`, `internal/webapi`)
+
+"Session" is overloaded in this codebase; disambiguate before changing either
+meaning:
+
+- **Execution session** (`internal/execution.Session`): one long-lived, stateful
+  shell per agent. Unrelated to the API's "session".
+- **Conversation session**: the top-level agent plus its subagent tree, its
+  history, and its transcript — what `GET /api/v1/session` returns. (The TUI
+  never uses the word for the conversation; its "session" mentions are all about
+  the execution-shell pane.)
+
+There is exactly one conversation session per process today, and that is
+load-bearing:
+
+- `Manager.RegisterTop` rejects a second depth-0 agent, so one `Manager` means
+  one top-level agent means one conversation session.
+- Exactly three routes exist, registered in `internal/webapi/api.go`: `GET
+  /api/v1/session` (optional `?agent_id=` addresses a subagent), `POST
+  /api/v1/messages`, and `POST /api/v1/approvals/{id}`. There is no session
+  list, create, switch, or delete.
+- `webapi` binds one `Agent` + `Manager` + `Gate` at construction
+  (`cmd/aiharn/main.go`) and owns the single message queue (`chan string` plus a
+  worker goroutine), so `queued_messages` and `last_error` are server-global
+  rather than per-agent, and are reported only when the top-level agent is
+  selected.
+- `cmd/aiharn/main.go` creates one `recorder` per process and passes it as every
+  agent's observer, so the top-level agent and all subagents append to a single
+  transcript file. Approval ids are sequential per `Gate`, so they are unique
+  only within that gate.
+- `docs/remote.md` records the MVP boundary: previous-session discovery and
+  selection are deliberately deferred to a later API version.
+
+Planned and awaiting approval; none of the following exists yet:
+
+- a session layer in `internal/app` where each session owns its own `Runtime`
+  (own `Manager`, `Gate`, transports, recorder, and message queue);
+- `GET`/`POST /api/v1/sessions` plus `PATCH`/`DELETE /api/v1/sessions/{id}`;
+- an optional `session_id` on the three existing routes, defaulting to the
+  default session (the one the TUI drives), so v1 clients keep working;
+- a new `[api] max_sessions` cap;
+- a web sidebar that lists session names, with API endpoint and token
+  configuration moved into a settings dialog.
+
+### Web console (`web/`)
+
+`web/app.js` is a single IIFE and `web/index.html` carries no inline script or
+style plus a strict CSP (`script-src 'self'`, so no inline handlers and no
+`eval`); new UI must be `addEventListener`-based code in `app.js`/`styles.css`.
+State lives in memory plus `localStorage` (endpoint list and active selection)
+and `sessionStorage` (bearer token, keyed per endpoint). The transcript is
+rendered from a full `GET /api/v1/session` snapshot polled once per second —
+there is no streaming, and the client keeps no history of its own.
+
 ### Test doubles
 
 `internal/testutil/{llm,execution,approval}` hold fakes for the interfaces above;

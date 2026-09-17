@@ -24,6 +24,7 @@ import (
 	"aiharn/internal/llm"
 	"aiharn/internal/llm/chatcompletions"
 	"aiharn/internal/llm/responses"
+	"aiharn/internal/sessions"
 	"aiharn/internal/tools"
 )
 
@@ -39,6 +40,30 @@ type Options struct {
 	// Observer, when set, receives every history item appended by any agent (the
 	// top-level agent and all subagents), enabling a full conversation log.
 	Observer agent.HistoryObserver
+
+	// NewTranscript, when set, is called once per session before that session's
+	// runtime is built. It supersedes Observer, which remains the single shared
+	// transcript used when no factory is set.
+	NewTranscript func(sessionID, sessionName string) (sessions.Transcript, error)
+}
+
+// sessionTranscript resolves the history observer for a new session. With
+// Options.NewTranscript set it creates a per-session transcript and returns it
+// as both the observer and the session-owned sink, so Session can close it
+// independently; otherwise every session shares Options.Observer and owns no
+// transcript of its own. The returned transcript is nil in the shared case.
+func sessionTranscript(opts Options, sessionID, sessionName string) (agent.HistoryObserver, sessions.Transcript, error) {
+	if opts.NewTranscript == nil {
+		return opts.Observer, nil, nil
+	}
+	tr, err := opts.NewTranscript(sessionID, sessionName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("app: create transcript for session %q: %w", sessionID, err)
+	}
+	if tr == nil {
+		return nil, nil, fmt.Errorf("app: transcript factory returned nil for session %q", sessionID)
+	}
+	return tr, tr, nil
 }
 
 // Summary is the startup banner content. It never carries secret values.
@@ -242,6 +267,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 
 	a := agent.New(agent.Spec{
 		ID:               spec.ID,
+		Name:             spec.Name,
 		Type:             spec.Type,
 		Model:            modelCfg.Model,
 		System:           system,
@@ -456,6 +482,7 @@ func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int
 		tools.NameListSubagentTypes:   tools.ListSubagentTypes(backend, callerID, spawnToolEnabled),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID, callerType),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),
+		tools.NameSendAgentMessage:    tools.SendAgentMessage(backend, callerID),
 		tools.NameCheckSubagent:       tools.CheckSubagent(backend, callerID),
 		tools.NameListSubagents:       tools.ListSubagents(backend, callerID),
 		tools.NameCloseSubagent:       tools.CloseSubagent(backend, callerID),

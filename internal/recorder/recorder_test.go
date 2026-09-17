@@ -11,6 +11,7 @@ import (
 
 	"aiharn/internal/agent"
 	"aiharn/internal/llm"
+	"aiharn/internal/sessions"
 )
 
 func decodeLines(t *testing.T, data []byte) []map[string]any {
@@ -32,7 +33,10 @@ func decodeLines(t *testing.T, data []byte) []map[string]any {
 func TestRecorderEmitsNDJSON(t *testing.T) {
 	var buf bytes.Buffer
 	r := New(&buf)
-	r.SetSession(Meta{Model: "m", AgentType: "main", Channel: "c", Approval: "ask"})
+	r.SetSession(Meta{
+		Model: "m", AgentType: "main", Channel: "c", Approval: "ask",
+		SessionID: "s1", SessionName: "Session 1",
+	})
 
 	r.ObserveHistory("main", "main", []llm.Item{
 		{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "hi"},
@@ -49,6 +53,9 @@ func TestRecorderEmitsNDJSON(t *testing.T) {
 	h := lines[0]
 	if h["type"] != "session" || h["model"] != "m" || h["agent"] != "main" || h["approval"] != "ask" {
 		t.Fatalf("header = %#v", h)
+	}
+	if h["session_id"] != "s1" || h["session_name"] != "Session 1" {
+		t.Fatalf("header session fields = %#v", h)
 	}
 
 	if got := lines[1]["type"]; got != "user" {
@@ -199,5 +206,46 @@ func TestNewSessionFileCreatesPrivateTimestampedTranscripts(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "first session") {
 		t.Fatalf("first transcript was lost: %q", data)
+	}
+}
+
+func TestRecorderSetMeta(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	r, err := NewFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetMeta(sessions.TranscriptMeta{
+		ID: "ab12cd34", Name: "Research", Model: "m",
+		AgentType: "main", Channel: "c", Approval: "ask",
+	})
+	r.ObserveHistory("main", "main", []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "hi"}})
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := decodeLines(t, data)[0]
+	if h["session_id"] != "ab12cd34" || h["session_name"] != "Research" {
+		t.Fatalf("header = %#v", h)
+	}
+}
+
+func TestRecorderOmitsUnsetSessionFields(t *testing.T) {
+	var buf bytes.Buffer
+	r := New(&buf)
+	r.SetSession(Meta{Model: "m", AgentType: "main"})
+	r.ObserveHistory("main", "main", []llm.Item{{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "hi"}})
+
+	h := decodeLines(t, buf.Bytes())[0]
+	if _, ok := h["session_id"]; ok {
+		t.Fatalf("shared transcript header carries session_id: %#v", h)
+	}
+	if _, ok := h["session_name"]; ok {
+		t.Fatalf("shared transcript header carries session_name: %#v", h)
 	}
 }

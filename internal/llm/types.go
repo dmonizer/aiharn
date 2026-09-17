@@ -17,6 +17,43 @@ const (
 	RoleAssistant Role = "assistant"
 )
 
+// Origin records who authored a message item. It is internal bookkeeping: the
+// provider adapters build requests field by field (role, content), so it is
+// never sent to a model.
+type Origin string
+
+const (
+	OriginHuman Origin = "human" // typed by a person (console, terminal UI)
+	OriginAgent Origin = "agent" // produced by the agent system, e.g. a delivered subagent report
+)
+
+// Delivery records agent-to-agent message provenance: which agent sent text to
+// which other agent, in which direction, and why. It is set only on message
+// items another agent injected. Like Origin, it is internal bookkeeping: the
+// provider adapters build requests field by field (role, content), so it is
+// never sent to a model.
+type Delivery struct {
+	From      string // sending agent id
+	To        string // receiving agent id
+	Direction string // DirectionUp or DirectionDown, describing the sender's position
+	Kind      string // KindTask, KindReport, or KindMessage
+}
+
+// Delivery direction values. They describe where the message travelled relative
+// to its SENDER: a subagent replying to its caller sends "up" (an ancestor),
+// and a caller delegating to a new subagent sends "down" (a descendant).
+const (
+	DirectionUp   = "up"
+	DirectionDown = "down"
+)
+
+// Delivery kind values, so a UI can label a message by what it is for.
+const (
+	KindTask    = "task"    // a spawn prompt: the caller's instructions to a new subagent
+	KindReport  = "report"  // a subagent's final result, delivered exactly once
+	KindMessage = "message" // a mid-conversation message from send_agent_message
+)
+
 // ItemType discriminates the kinds of transcript entries.
 type ItemType string
 
@@ -36,6 +73,14 @@ type Item struct {
 	CallID  string // function-call id (call and its output)
 	Name    string // function name (function_call)
 	Args    string // raw JSON arguments (function_call)
+	// Origin records who authored a message item (human vs. agent). It is empty
+	// for non-message items and for message items of unknown provenance, such as
+	// older recordings made before origins were tracked.
+	Origin Origin // message items only
+	// Delivery is set only on message items that another agent injected. It
+	// lets a UI show who sent what to whom, and in which direction, instead of
+	// rendering an agent-to-agent message as a person's own text.
+	Delivery *Delivery // message items only
 }
 
 // ToolDefinition describes a callable tool to the model.

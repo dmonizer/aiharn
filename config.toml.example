@@ -124,3 +124,4 @@ listen = ""               # default: disabled; e.g. "127.0.0.1:7331"
 token = ""                # default; set a secret for non-loopback listening
 allow_origins = []        # default: no cross-origin frontend access
 only = false             # default: run the terminal UI; true requires listen
+max_sessions = 8         # default; counts the default session; 0 uses the built-in default

@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,7 @@ func builderWithScript(s [][]llm.Event) agent.Builder {
 		}
 		return agent.New(agent.Spec{
 			ID:             spec.ID,
+			Name:           spec.Name,
 			Type:           spec.Type,
 			Depth:          spec.Depth,
 			CallerID:       spec.CallerID,
@@ -147,7 +149,7 @@ func TestListSubagentTypesCatalogAndSpawnConstraints(t *testing.T) {
 		t.Fatalf("manager catalog mutated: %+v, %v", again, err)
 	}
 
-	childID, err := manager.SpawnSubagent(ctx, "main", "coder", "task")
+	childID, err := manager.SpawnSubagent(ctx, "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +185,7 @@ func TestSpawnDepthLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id1, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "t1")
+	id1, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t1")
 	if err != nil {
 		t.Fatalf("spawn depth 1: %v", err)
 	}
@@ -191,7 +193,7 @@ func TestSpawnDepthLimit(t *testing.T) {
 		t.Fatalf("depth = %d, want 1", mgr.Agent(id1).Depth())
 	}
 
-	if _, err := mgr.SpawnSubagent(context.Background(), id1, "coder", "t2"); !errors.Is(err, agent.ErrMaxDepth) {
+	if _, err := mgr.SpawnSubagent(context.Background(), id1, "coder", "", "t2"); !errors.Is(err, agent.ErrMaxDepth) {
 		t.Fatalf("spawn depth 2 err = %v, want ErrMaxDepth", err)
 	}
 }
@@ -202,10 +204,10 @@ func TestSpawnMaxAgents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "t1"); err != nil {
+	if _, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t1"); err != nil {
 		t.Fatalf("first spawn: %v", err)
 	}
-	if _, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "t2"); !errors.Is(err, agent.ErrMaxAgents) {
+	if _, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t2"); !errors.Is(err, agent.ErrMaxAgents) {
 		t.Fatalf("second spawn err = %v, want ErrMaxAgents", err)
 	}
 }
@@ -237,7 +239,7 @@ func TestSpawnSimultaneous(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = mgr.SpawnSubagent(context.Background(), "main", "coder", "t")
+			_, errs[i] = mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t")
 		}(i)
 	}
 
@@ -260,6 +262,235 @@ func TestSpawnSimultaneous(t *testing.T) {
 	}
 }
 
+func TestSendSubagentMessageOriginIsChosenByCaller(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript([][]llm.Event{
+		finalTurn("done1"), finalTurn("done2"), finalTurn("done3"),
+	})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "first task to complete", func() bool { return mgr.Agent(id).State() == agent.StateIdle })
+
+	// The same method serves a person (TUI/console -> human) and the model's
+	// send_subagent_message tool (-> agent). Each call must keep its origin.
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "typed by a person", llm.OriginHuman); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "human message to arrive", func() bool {
+		return mgr.Agent(id).State() == agent.StateIdle && len(mgr.Agent(id).History()) >= 4
+	})
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "from the model tool", llm.OriginAgent); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "agent message to arrive", func() bool {
+		return mgr.Agent(id).State() == agent.StateIdle && len(mgr.Agent(id).History()) >= 6
+	})
+
+	hist := mgr.Agent(id).History()
+	// history: [task1(agent), done1, human msg(human), reply, agent msg(agent), reply]
+	if got := hist[0]; got.Content != "task1" || got.Origin != llm.OriginAgent {
+		t.Fatalf("initial task = %+v, want agent origin", got)
+	}
+	// The spawn prompt is a task travelling down to a descendant.
+	if d := hist[0].Delivery; d == nil || d.From != "main" || d.To != id ||
+		d.Direction != llm.DirectionDown || d.Kind != llm.KindTask {
+		t.Fatalf("spawn prompt delivery = %+v", hist[0].Delivery)
+	}
+	var human, agentMsg *llm.Item
+	for i := range hist {
+		switch hist[i].Content {
+		case "typed by a person":
+			human = &hist[i]
+		case "from the model tool":
+			agentMsg = &hist[i]
+		}
+	}
+	if human == nil || human.Origin != llm.OriginHuman {
+		t.Fatalf("human-delivered message = %+v, want human origin", human)
+	}
+	// A human message carries no agent delivery metadata.
+	if human.Delivery != nil {
+		t.Fatalf("human-delivered message must have nil delivery: %+v", human.Delivery)
+	}
+	if agentMsg == nil || agentMsg.Origin != llm.OriginAgent {
+		t.Fatalf("model-delivered message = %+v, want agent origin", agentMsg)
+	}
+	// The old downward-only path still records a KindMessage delivery.
+	if d := agentMsg.Delivery; d == nil || d.From != "main" || d.To != id ||
+		d.Direction != llm.DirectionDown || d.Kind != llm.KindMessage {
+		t.Fatalf("downward message delivery = %+v", agentMsg.Delivery)
+	}
+}
+
+// TestSendAgentMessageDown proves caller -> descendant delivery.
+func TestSendAgentMessageDown(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript([][]llm.Event{
+		finalTurn("done1"), finalTurn("done2"),
+	})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "first task to complete", func() bool { return mgr.Agent(id).State() == agent.StateIdle })
+
+	if err := mgr.SendAgentMessage(context.Background(), "main", id, "keep going", llm.KindMessage); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "downstream message to arrive", func() bool {
+		return mgr.Agent(id).State() == agent.StateIdle && len(mgr.Agent(id).History()) >= 4
+	})
+
+	got := findHistoryItem(t, mgr.Agent(id).History(), "keep going")
+	if got.Origin != llm.OriginAgent {
+		t.Fatalf("downstream message origin = %q, want agent", got.Origin)
+	}
+	if d := got.Delivery; d == nil || d.From != "main" || d.To != id ||
+		d.Direction != llm.DirectionDown || d.Kind != llm.KindMessage {
+		t.Fatalf("downstream message delivery = %+v", got.Delivery)
+	}
+}
+
+// TestSendAgentMessageUp proves descendant -> ancestor delivery, that the
+// message waits in the ancestor's inbox until its next turn, and that
+// PendingMessages reports it until then.
+func TestSendAgentMessageUp(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript([][]llm.Event{finalTurn("sub done")})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	top := newTop(t, true)
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "subagent to complete", func() bool { return mgr.Agent(id).State() == agent.StateIdle })
+
+	if err := mgr.SendAgentMessage(context.Background(), id, "main", "progress report", llm.KindMessage); err != nil {
+		t.Fatal(err)
+	}
+	// It waits in the ancestor's inbox; it must not appear before a turn.
+	waitFor(t, 2*time.Second, "up message to be queued", func() bool {
+		for _, pm := range mgr.PendingMessages() {
+			if pm.Text == "progress report" {
+				return true
+			}
+		}
+		return false
+	})
+	if got := top.History(); len(got) != 0 {
+		t.Fatalf("up message leaked into history before the turn boundary: %+v", got)
+	}
+
+	if err := top.Turn(context.Background(), "continue"); err != nil {
+		t.Fatal(err)
+	}
+	got := findHistoryItem(t, top.History(), "progress report")
+	if got.Origin != llm.OriginAgent {
+		t.Fatalf("up message origin = %q, want agent", got.Origin)
+	}
+	if d := got.Delivery; d == nil || d.From != id || d.To != "main" ||
+		d.Direction != llm.DirectionUp || d.Kind != llm.KindMessage {
+		t.Fatalf("up message delivery = %+v", got.Delivery)
+	}
+}
+
+// TestSendAgentMessageRejectsSelfSiblingAndEscape covers the hierarchy rules.
+func TestSendAgentMessageRejectsSelfSiblingAndEscape(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxDepth: 5, MaxAgents: 16, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	left, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "left")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "right")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.SendAgentMessage(context.Background(), left, left, "me", llm.KindMessage); !errors.Is(err, agent.ErrCannotMessageSelf) {
+		t.Fatalf("self message err = %v, want ErrCannotMessageSelf", err)
+	}
+	if err := mgr.SendAgentMessage(context.Background(), left, right, "sibling", llm.KindMessage); !errors.Is(err, agent.ErrAgentsNotRelated) {
+		t.Fatalf("sibling message err = %v, want ErrAgentsNotRelated", err)
+	}
+	if err := mgr.SendAgentMessage(context.Background(), left, "main", "up", llm.KindMessage); err != nil {
+		t.Fatalf("ancestor message err = %v, want nil", err)
+	}
+	// The old downward-only path still refuses a non-descendant.
+	if err := mgr.SendSubagentMessage(context.Background(), left, right, "intrude", llm.OriginAgent); !errors.Is(err, agent.ErrSubagentNotOwned) {
+		t.Fatalf("old-path sibling err = %v, want ErrSubagentNotOwned", err)
+	}
+}
+
+// TestPendingMessagesListsQueuedAndDropsOnDrain proves the polling view the web
+// console depends on: a queued agent message is listed until the recipient's
+// turn drains it.
+func TestPendingMessagesListsQueuedAndDropsOnDrain(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderBlocking()})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	top := newTop(t, true)
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "subagent to start running", func() bool { return mgr.Agent(id).State() == agent.StateRunning })
+
+	if err := mgr.SendAgentMessage(context.Background(), id, "main", "ping", llm.KindMessage); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, pm := range mgr.PendingMessages() {
+		if pm.Text == "ping" {
+			found = true
+			if pm.From != id || pm.To != "main" || pm.Direction != llm.DirectionUp || pm.Kind != llm.KindMessage {
+				t.Fatalf("pending message = %+v", pm)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("queued message not listed as pending: %+v", mgr.PendingMessages())
+	}
+
+	if err := top.Turn(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	for _, pm := range mgr.PendingMessages() {
+		if pm.Text == "ping" {
+			t.Fatalf("drained message still pending: %+v", pm)
+		}
+	}
+}
+
+// findHistoryItem returns the history item with the given content, failing if
+// none exists.
+func findHistoryItem(t *testing.T, hist []llm.Item, content string) llm.Item {
+	t.Helper()
+	for _, it := range hist {
+		if it.Content == content {
+			return it
+		}
+	}
+	t.Fatalf("no history item with content %q: %+v", content, hist)
+	return llm.Item{}
+}
+
 func TestSubagentReuse(t *testing.T) {
 	script := [][]llm.Event{finalTurn("done1"), finalTurn("done2")}
 	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript(script)})
@@ -267,7 +498,7 @@ func TestSubagentReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task1")
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +512,9 @@ func TestSubagentReuse(t *testing.T) {
 		t.Fatalf("subagent not idle/open after completion: %+v", mgr.Agent(id))
 	}
 
-	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "task2"); err != nil {
+	// A follow-up sent with agent origin stands in for the model's
+	// send_subagent_message tool.
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "task2", llm.OriginAgent); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 2*time.Second, "subagent to process second task", func() bool {
@@ -295,6 +528,11 @@ func TestSubagentReuse(t *testing.T) {
 	if hist[3].Content != "done2" {
 		t.Fatalf("second result = %q", hist[3].Content)
 	}
+	// The subagent run loop must preserve the origin carried by each queued
+	// task: both prompts came from the parent model, not a person.
+	if hist[0].Origin != llm.OriginAgent || hist[2].Origin != llm.OriginAgent {
+		t.Fatalf("subagent task origins = %q, %q; want %q", hist[0].Origin, hist[2].Origin, llm.OriginAgent)
+	}
 }
 
 func TestPauseSubagentHoldsQueuedWorkAndResumes(t *testing.T) {
@@ -305,7 +543,7 @@ func TestPauseSubagentHoldsQueuedWorkAndResumes(t *testing.T) {
 	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
 		t.Fatal(err)
 	}
-	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task1")
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +551,7 @@ func TestPauseSubagentHoldsQueuedWorkAndResumes(t *testing.T) {
 	if err := mgr.SetSubagentPaused(context.Background(), "main", id, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "task2"); err != nil {
+	if err := mgr.SendSubagentMessage(context.Background(), "main", id, "task2", llm.OriginAgent); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -343,7 +581,7 @@ func TestSubagentDeliversExactlyOnceAtTurnBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,8 +609,18 @@ func TestSubagentDeliversExactlyOnceAtTurnBoundary(t *testing.T) {
 	if !strings.HasPrefix(hist[0].Content, "[subagent coder (") {
 		t.Fatalf("delivered result not prefixed with subagent id: %q", hist[0].Content)
 	}
+	if hist[0].Origin != llm.OriginAgent {
+		t.Fatalf("delivered result origin = %q, want %q", hist[0].Origin, llm.OriginAgent)
+	}
+	if d := hist[0].Delivery; d == nil || d.From != id || d.To != "main" ||
+		d.Direction != llm.DirectionUp || d.Kind != llm.KindReport {
+		t.Fatalf("delivered report delivery = %+v", hist[0].Delivery)
+	}
 	if hist[1].Content != "continue" {
 		t.Fatalf("input = %+v", hist[1])
+	}
+	if hist[1].Origin != llm.OriginHuman {
+		t.Fatalf("human input origin = %q, want %q", hist[1].Origin, llm.OriginHuman)
 	}
 	if hist[2].Content != "top done" {
 		t.Fatalf("reply = %+v", hist[2])
@@ -385,7 +633,7 @@ func TestCloseSubagentIdle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +655,7 @@ func TestCloseSubagentBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,15 +691,15 @@ func TestCloseSubagentRecursive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id1, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "t1")
+	id1, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	id2, err := mgr.SpawnSubagent(context.Background(), id1, "coder", "t2")
+	id2, err := mgr.SpawnSubagent(context.Background(), id1, "coder", "", "t2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	id3, err := mgr.SpawnSubagent(context.Background(), id2, "coder", "t3")
+	id3, err := mgr.SpawnSubagent(context.Background(), id2, "coder", "", "t3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,16 +724,16 @@ func TestSubagentOperationsCannotEscapeCallerSubtree(t *testing.T) {
 	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
 		t.Fatal(err)
 	}
-	left, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "left")
+	left, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "left")
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "right")
+	right, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "right")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := mgr.SendSubagentMessage(context.Background(), left, right, "intrude"); !errors.Is(err, agent.ErrSubagentNotOwned) {
+	if err := mgr.SendSubagentMessage(context.Background(), left, right, "intrude", llm.OriginAgent); !errors.Is(err, agent.ErrSubagentNotOwned) {
 		t.Fatalf("send err = %v", err)
 	}
 	if _, err := mgr.CheckSubagent(context.Background(), left, right); !errors.Is(err, agent.ErrSubagentNotOwned) {
@@ -526,7 +774,7 @@ func TestErroredAgentReleasesSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id1, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "t1")
+	id1, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +783,7 @@ func TestErroredAgentReleasesSlot(t *testing.T) {
 	})
 
 	// The errored subagent no longer counts against the open-agent limit.
-	if _, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "t2"); err != nil {
+	if _, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "t2"); err != nil {
 		t.Fatalf("spawn after error should release a slot: %v", err)
 	}
 }
@@ -546,7 +794,7 @@ func TestRosterNotifiesOnStateChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +826,7 @@ func TestCancelAllKeepsAgentsReusableAndDropsQueuedSubagentWork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	subID, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "first")
+	subID, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "first")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +880,7 @@ func TestShutdownIdempotentNoLeaks(t *testing.T) {
 
 	var ids []string
 	for i := 0; i < 3; i++ {
-		id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "task")
+		id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -666,5 +914,122 @@ func TestShutdownIdempotentNoLeaks(t *testing.T) {
 		if mgr.Agent(id).State() != agent.StateClosed {
 			t.Fatalf("subagent %q state = %v, want closed", id, mgr.Agent(id).State())
 		}
+	}
+}
+
+// builderDroppingName returns a Builder that deliberately ignores spec.Name, so
+// a display name requested by the caller never reaches the built agent. It
+// exercises the post-build spawn-spec mismatch guard.
+func builderDroppingName() agent.Builder {
+	return func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
+		return agent.New(agent.Spec{
+			ID:             spec.ID,
+			Type:           spec.Type,
+			Depth:          spec.Depth,
+			CallerID:       spec.CallerID,
+			AllowSubagents: true,
+			Client:         &testllm.FakeClient{Script: [][]llm.Event{finalTurn("done")}},
+		}), nil
+	}
+}
+
+// TestSpawnSubagentCustomName proves a caller-supplied display name threads all
+// the way through: the runtime's Agent.Name(), CheckSubagent status, and
+// ListSubagents status all report it.
+func TestSpawnSubagentCustomName(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 4, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const name = "researcher"
+
+	id, err := mgr.SpawnSubagent(ctx, "main", "coder", name, "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.Agent(id).Name(); got != name {
+		t.Fatalf("mgr.Agent(%q).Name() = %q, want %q", id, got, name)
+	}
+
+	status, err := mgr.CheckSubagent(ctx, "main", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Name != name {
+		t.Fatalf("CheckSubagent status.Name = %q, want %q", status.Name, name)
+	}
+
+	list, err := mgr.ListSubagents(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Name != name {
+		t.Fatalf("ListSubagents = %+v, want one entry with Name %q", list, name)
+	}
+}
+
+// TestSpawnSubagentNameDefaultsToID proves an empty or whitespace-only name is
+// not an error and defaults to the generated "coder-N" id.
+func TestSpawnSubagentNameDefaultsToID(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 4, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	for i, req := range []string{"", "   "} {
+		wantID := fmt.Sprintf("coder-%d", i+1)
+		id, err := mgr.SpawnSubagent(ctx, "main", "coder", req, "task")
+		if err != nil {
+			t.Fatalf("SpawnSubagent(name=%q): %v", req, err)
+		}
+		if id != wantID {
+			t.Fatalf("SpawnSubagent(name=%q) id = %q, want %q", req, id, wantID)
+		}
+		if got := mgr.Agent(id).Name(); got != id {
+			t.Fatalf("Name() for request %q = %q, want defaulted id %q", req, got, id)
+		}
+		status, err := mgr.CheckSubagent(ctx, "main", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Name != id {
+			t.Fatalf("status.Name for request %q = %q, want %q", req, status.Name, id)
+		}
+	}
+}
+
+// TestSpawnSubagentNameMismatchRejected proves the post-build guard rejects a
+// builder that does not propagate spec.Name when a custom name was requested,
+// while an empty name still succeeds via the id fallback.
+func TestSpawnSubagentNameMismatchRejected(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 4, Builder: builderDroppingName()})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	if err := mgr.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if _, err := mgr.SpawnSubagent(ctx, "main", "coder", "researcher", "task"); err == nil ||
+		!strings.Contains(err.Error(), "does not match its spawn spec") {
+		t.Fatalf("SpawnSubagent with dropped custom name err = %v, want spawn-spec mismatch", err)
+	}
+	list, err := mgr.ListSubagents(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("mismatched subagent was registered: %+v", list)
+	}
+
+	id, err := mgr.SpawnSubagent(ctx, "main", "coder", "", "task")
+	if err != nil {
+		t.Fatalf("SpawnSubagent with empty name err = %v, want success (id fallback)", err)
+	}
+	if got := mgr.Agent(id).Name(); got != id {
+		t.Fatalf("Name() = %q, want id %q", got, id)
 	}
 }

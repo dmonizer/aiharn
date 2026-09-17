@@ -15,14 +15,17 @@ import (
 
 	"aiharn/internal/agent"
 	"aiharn/internal/llm"
+	"aiharn/internal/sessions"
 )
 
 // Meta is the session-level description written as the log's header line.
 type Meta struct {
-	Model     string
-	AgentType string
-	Channel   string
-	Approval  string
+	Model       string
+	AgentType   string
+	Channel     string
+	Approval    string
+	SessionID   string `json:"session_id,omitempty"`
+	SessionName string `json:"session_name,omitempty"`
 }
 
 // Entry is one NDJSON line. Type discriminates completed history items from
@@ -48,6 +51,9 @@ type Recorder struct {
 	meta          *Meta
 	headerWritten bool
 }
+
+// Recorder implements the per-session transcript sink.
+var _ sessions.Transcript = (*Recorder)(nil)
 
 // New returns a Recorder writing NDJSON to w. w is not closed by Close.
 func New(w io.Writer) *Recorder {
@@ -94,6 +100,19 @@ func (r *Recorder) SetSession(m Meta) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.meta = &m
+}
+
+// SetMeta implements sessions.Transcript, recording the session header used by
+// the header line. Call it before the first ObserveHistory.
+func (r *Recorder) SetMeta(m sessions.TranscriptMeta) {
+	r.SetSession(Meta{
+		Model:       m.Model,
+		AgentType:   m.AgentType,
+		Channel:     m.Channel,
+		Approval:    m.Approval,
+		SessionID:   m.ID,
+		SessionName: m.Name,
+	})
 }
 
 // ObserveHistory implements agent.HistoryObserver, appending one Entry per item.
@@ -163,6 +182,14 @@ func (r *Recorder) ensureHeaderLocked() {
 		h["agent"] = r.meta.AgentType
 		h["channel"] = r.meta.Channel
 		h["approval"] = r.meta.Approval
+		// Emitted only for per-session transcripts; a shared transcript has no
+		// single session identity.
+		if r.meta.SessionID != "" {
+			h["session_id"] = r.meta.SessionID
+		}
+		if r.meta.SessionName != "" {
+			h["session_name"] = r.meta.SessionName
+		}
 	}
 	r.enc.Encode(h)
 }

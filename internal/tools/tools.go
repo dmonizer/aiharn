@@ -29,6 +29,7 @@ func Names() []string {
 		NameListSubagentTypes,
 		NameSpawnSubagent,
 		NameSendSubagentMessage,
+		NameSendAgentMessage,
 		NameCheckSubagent,
 		NameListSubagents,
 		NameCloseSubagent,

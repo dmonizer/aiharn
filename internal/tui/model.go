@@ -42,6 +42,7 @@ const (
 	kindTool
 	kindCommand
 	kindError
+	kindAgentMessage
 )
 
 // line is one flushed transcript line with its presentation kind. cmd indexes

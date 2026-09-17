@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aiharn/internal/approval"
+	"aiharn/internal/llm"
 	"aiharn/internal/tools"
 )
 
@@ -20,7 +21,8 @@ type fakeBackend struct {
 	catalog    tools.SubagentCatalog
 	catalogErr error
 
-	sendErr error
+	sendErr      error
+	sendAgentErr error
 
 	status   tools.SubagentStatus
 	checkErr error
@@ -30,17 +32,22 @@ type fakeBackend struct {
 
 	closeErr error
 
-	mu           sync.Mutex
-	spawnCall    []spawnCall
-	sendCalls    []sendCall
-	checkCalls   []checkCall
-	listCalls    int
-	closeCalls   []string
-	catalogCalls []string
+	mu             sync.Mutex
+	spawnCall      []spawnCall
+	sendCalls      []sendCall
+	sendAgentCalls []sendAgentCall
+	checkCalls     []checkCall
+	listCalls      int
+	closeCalls     []string
+	catalogCalls   []string
 }
 
-type spawnCall struct{ callerID, agentType, prompt string }
-type sendCall struct{ callerID, subagentID, message string }
+type spawnCall struct{ callerID, agentType, name, prompt string }
+type sendCall struct {
+	callerID, subagentID, message string
+	origin                        llm.Origin
+}
+type sendAgentCall struct{ callerID, targetID, message, kind string }
 type checkCall struct{ callerID, subagentID string }
 
 func (f *fakeBackend) ListSubagentTypes(ctx context.Context, callerID string) (tools.SubagentCatalog, error) {
@@ -50,18 +57,25 @@ func (f *fakeBackend) ListSubagentTypes(ctx context.Context, callerID string) (t
 	return f.catalog, f.catalogErr
 }
 
-func (f *fakeBackend) SpawnSubagent(ctx context.Context, callerID, agentType, prompt string) (string, error) {
+func (f *fakeBackend) SpawnSubagent(ctx context.Context, callerID, agentType, name, prompt string) (string, error) {
 	f.mu.Lock()
-	f.spawnCall = append(f.spawnCall, spawnCall{callerID, agentType, prompt})
+	f.spawnCall = append(f.spawnCall, spawnCall{callerID, agentType, name, prompt})
 	f.mu.Unlock()
 	return f.spawnID, f.spawnErr
 }
 
-func (f *fakeBackend) SendSubagentMessage(ctx context.Context, callerID, subagentID, message string) error {
+func (f *fakeBackend) SendSubagentMessage(ctx context.Context, callerID, subagentID, message string, origin llm.Origin) error {
 	f.mu.Lock()
-	f.sendCalls = append(f.sendCalls, sendCall{callerID, subagentID, message})
+	f.sendCalls = append(f.sendCalls, sendCall{callerID, subagentID, message, origin})
 	f.mu.Unlock()
 	return f.sendErr
+}
+
+func (f *fakeBackend) SendAgentMessage(ctx context.Context, callerID, targetID, message, kind string) error {
+	f.mu.Lock()
+	f.sendAgentCalls = append(f.sendAgentCalls, sendAgentCall{callerID, targetID, message, kind})
+	f.mu.Unlock()
+	return f.sendAgentErr
 }
 
 func (f *fakeBackend) CheckSubagent(ctx context.Context, callerID, subagentID string) (tools.SubagentStatus, error) {
@@ -195,8 +209,8 @@ func TestSpawnSubagentAskDenied(t *testing.T) {
 func TestSubagentToolsExemptFromApproval(t *testing.T) {
 	backend := &fakeBackend{
 		catalog: tools.SubagentCatalog{Types: []tools.SubagentType{{Name: "coder", Description: "Implement changes", Model: "gpt", Channel: "local"}}, CanSpawn: true, MaxDepth: 2, MaxOpenAgents: 8, ActiveAgents: 1},
-		status:  tools.SubagentStatus{ID: "coder-1", Type: "coder", State: "idle", Depth: 1, Tail: "done"},
-		list:    []tools.SubagentStatus{{ID: "coder-1", Type: "coder", State: "idle", Depth: 1}},
+		status:  tools.SubagentStatus{ID: "coder-1", Name: "researcher", Type: "coder", State: "idle", Depth: 1, Tail: "done"},
+		list:    []tools.SubagentStatus{{ID: "coder-1", Name: "researcher", Type: "coder", State: "idle", Depth: 1}},
 	}
 	gate := approval.NewGate(approval.ModeAsk)
 
@@ -208,8 +222,9 @@ func TestSubagentToolsExemptFromApproval(t *testing.T) {
 	}{
 		{tools.NameListSubagentTypes, tools.ListSubagentTypes(backend, "caller-1", true), `{}`, "name=coder model=gpt channel=local allow_subagents=false description=Implement changes"},
 		{tools.NameSendSubagentMessage, tools.SendSubagentMessage(backend, "caller-1"), `{"subagent_id":"coder-1","message":"go"}`, "message sent to coder-1"},
-		{tools.NameCheckSubagent, tools.CheckSubagent(backend, "caller-1"), `{"subagent_id":"coder-1"}`, "id=coder-1 type=coder state=idle depth=1"},
-		{tools.NameListSubagents, tools.ListSubagents(backend, "caller-1"), `{}`, "- id=coder-1 type=coder state=idle depth=1"},
+		{tools.NameSendAgentMessage, tools.SendAgentMessage(backend, "caller-1"), `{"agent_id":"main","message":"up"}`, "message sent to main"},
+		{tools.NameCheckSubagent, tools.CheckSubagent(backend, "caller-1"), `{"subagent_id":"coder-1"}`, "id=coder-1 name=researcher type=coder state=idle depth=1"},
+		{tools.NameListSubagents, tools.ListSubagents(backend, "caller-1"), `{}`, "- id=coder-1 name=researcher type=coder state=idle depth=1"},
 		{tools.NameCloseSubagent, tools.CloseSubagent(backend, "caller-1"), `{"subagent_id":"coder-1"}`, "closed subagent coder-1"},
 	}
 	for _, tt := range tests {
@@ -228,6 +243,82 @@ func TestSubagentToolsExemptFromApproval(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestSendSubagentMessageToolTagsAgentOrigin(t *testing.T) {
+	backend := &fakeBackend{}
+	r := newRegistry(t, tools.SendSubagentMessage(backend, "caller-1"))
+	if _, err := r.Run(context.Background(), tools.NameSendSubagentMessage,
+		json.RawMessage(`{"subagent_id":"coder-1","message":"go"}`)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(backend.sendCalls) != 1 {
+		t.Fatalf("send calls = %v", backend.sendCalls)
+	}
+	if got := backend.sendCalls[0].origin; got != llm.OriginAgent {
+		t.Fatalf("tool send origin = %q, want %q", got, llm.OriginAgent)
+	}
+}
+
+func TestSendAgentMessageTool(t *testing.T) {
+	backend := &fakeBackend{}
+	r := newRegistry(t, tools.SendAgentMessage(backend, "caller-1"))
+	out, err := r.Run(context.Background(), tools.NameSendAgentMessage,
+		json.RawMessage(`{"agent_id":"main","message":"status?"}`))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out != "message sent to main" {
+		t.Fatalf("out = %q", out)
+	}
+	if len(backend.sendAgentCalls) != 1 {
+		t.Fatalf("send agent calls = %v", backend.sendAgentCalls)
+	}
+	got := backend.sendAgentCalls[0]
+	if got.callerID != "caller-1" || got.targetID != "main" || got.message != "status?" || got.kind != llm.KindMessage {
+		t.Fatalf("send agent call = %+v", got)
+	}
+}
+
+func TestSendAgentMessageToolRejectsEmptyMessage(t *testing.T) {
+	backend := &fakeBackend{}
+	r := newRegistry(t, tools.SendAgentMessage(backend, "caller-1"))
+	if _, err := r.Run(context.Background(), tools.NameSendAgentMessage,
+		json.RawMessage(`{"agent_id":"main","message":"   "}`)); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+		t.Fatalf("whitespace message err = %v, want empty-message error", err)
+	}
+	// A missing required field is rejected by the schema before Run.
+	if _, err := r.Run(context.Background(), tools.NameSendAgentMessage,
+		json.RawMessage(`{"agent_id":"main"}`)); err == nil || !strings.Contains(err.Error(), "invalid arguments") {
+		t.Fatalf("missing-message err = %v, want invalid-arguments error", err)
+	}
+	if len(backend.sendAgentCalls) != 0 {
+		t.Fatalf("backend called despite invalid args: %v", backend.sendAgentCalls)
+	}
+}
+
+func TestSendAgentMessageToolPropagatesError(t *testing.T) {
+	backend := &fakeBackend{sendAgentErr: errors.New("agents are not related")}
+	r := newRegistry(t, tools.SendAgentMessage(backend, "caller-1"))
+	if _, err := r.Run(context.Background(), tools.NameSendAgentMessage,
+		json.RawMessage(`{"agent_id":"sibling","message":"hi"}`)); err == nil || !strings.Contains(err.Error(), "not related") {
+		t.Fatalf("err = %v, want backend error", err)
+	}
+}
+
+func TestBuiltinNamesIncludeMessaging(t *testing.T) {
+	names := tools.Names()
+	for _, want := range []string{tools.NameSendSubagentMessage, tools.NameSendAgentMessage} {
+		found := false
+		for _, n := range names {
+			if n == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("Names() = %v, missing %q", names, want)
+		}
 	}
 }
 
@@ -306,5 +397,143 @@ func TestListSubagentsEmpty(t *testing.T) {
 	}
 	if out != "no subagents" {
 		t.Fatalf("out = %q", out)
+	}
+}
+
+func TestSpawnSubagentSchemaNameOptional(t *testing.T) {
+	backend := &fakeBackend{}
+	gate := approval.NewGate(approval.ModeAllowAll)
+	def := tools.SpawnSubagent(backend, gate, "caller-1", "coder").Definition()
+
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(def.Parameters, &schema); err != nil {
+		t.Fatalf("schema is not valid JSON: %v", err)
+	}
+	if _, ok := schema.Properties["name"]; !ok {
+		t.Fatalf("schema missing name property: %s", def.Parameters)
+	}
+	if got := strings.Join(schema.Required, ","); got != "agent_type,prompt" {
+		t.Fatalf("required = %v, want [agent_type prompt]", schema.Required)
+	}
+	var nameProp struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(schema.Properties["name"], &nameProp); err != nil {
+		t.Fatalf("name property not JSON: %v", err)
+	}
+	if nameProp.Type != "string" {
+		t.Fatalf("name type = %q, want string", nameProp.Type)
+	}
+}
+
+func TestSpawnSubagentNameReachesBackend(t *testing.T) {
+	backend := &fakeBackend{spawnID: "coder-3"}
+	gate := approval.NewGate(approval.ModeAllowAll)
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
+
+	out, err := r.Run(context.Background(), tools.NameSpawnSubagent,
+		json.RawMessage(`{"agent_type":"coder","name":"  researcher  ","prompt":"go"}`))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out != "spawned subagent coder-3" {
+		t.Fatalf("out = %q", out)
+	}
+	if got := backend.lastSpawn().name; got != "researcher" {
+		t.Fatalf("recorded name = %q, want %q (trimmed)", got, "researcher")
+	}
+}
+
+func TestSpawnSubagentEmptyNameReachesBackendAsEmpty(t *testing.T) {
+	for _, args := range []string{
+		`{"agent_type":"coder","prompt":"go"}`,
+		`{"agent_type":"coder","name":"","prompt":"go"}`,
+	} {
+		backend := &fakeBackend{spawnID: "coder-1"}
+		gate := approval.NewGate(approval.ModeAllowAll)
+		r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
+		if _, err := r.Run(context.Background(), tools.NameSpawnSubagent, json.RawMessage(args)); err != nil {
+			t.Fatalf("Run(%s): %v", args, err)
+		}
+		if backend.spawnCount() != 1 {
+			t.Fatalf("spawn count = %d for %s", backend.spawnCount(), args)
+		}
+		if got := backend.lastSpawn().name; got != "" {
+			t.Fatalf("recorded name = %q for %s, want empty", got, args)
+		}
+	}
+}
+
+func TestSpawnSubagentWhitespaceNameTreatedAsEmpty(t *testing.T) {
+	backend := &fakeBackend{spawnID: "coder-1"}
+	gate := approval.NewGate(approval.ModeAllowAll)
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
+
+	out, err := r.Run(context.Background(), tools.NameSpawnSubagent,
+		json.RawMessage(`{"agent_type":"coder","name":"   \t ","prompt":"go"}`))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out != "spawned subagent coder-1" {
+		t.Fatalf("out = %q", out)
+	}
+	if got := backend.lastSpawn().name; got != "" {
+		t.Fatalf("recorded name = %q, want empty", got)
+	}
+}
+
+func TestSpawnSubagentAcceptsMaxLengthName(t *testing.T) {
+	backend := &fakeBackend{spawnID: "coder-1"}
+	gate := approval.NewGate(approval.ModeAllowAll)
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
+
+	name := strings.Repeat("a", 64)
+	args, _ := json.Marshal(map[string]string{"agent_type": "coder", "name": name, "prompt": "go"})
+	if _, err := r.Run(context.Background(), tools.NameSpawnSubagent, args); err != nil {
+		t.Fatalf("64-rune name rejected: %v", err)
+	}
+	if got := backend.lastSpawn().name; got != name {
+		t.Fatalf("recorded name = %q, want 64-rune name", got)
+	}
+}
+
+func TestSpawnSubagentRejectsOverlongName(t *testing.T) {
+	backend := &fakeBackend{spawnID: "coder-1"}
+	gate := approval.NewGate(approval.ModeAsk)
+	r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
+
+	args, _ := json.Marshal(map[string]string{"agent_type": "coder", "name": strings.Repeat("a", 65), "prompt": "go"})
+	_, err := r.Run(context.Background(), tools.NameSpawnSubagent, args)
+	if err == nil || !strings.Contains(err.Error(), "at most 64") {
+		t.Fatalf("err = %v, want length error", err)
+	}
+	if backend.spawnCount() != 0 {
+		t.Fatalf("backend called despite invalid name (%d calls)", backend.spawnCount())
+	}
+	if reqs := gate.PendingRequests(); len(reqs) != 0 {
+		t.Fatalf("approval gate saw %d request(s) for an invalid name", len(reqs))
+	}
+}
+
+func TestSpawnSubagentRejectsControlCharName(t *testing.T) {
+	for _, bad := range []string{"bad\nname", "a\x7f"} {
+		backend := &fakeBackend{spawnID: "coder-1"}
+		gate := approval.NewGate(approval.ModeAsk)
+		r := newRegistry(t, tools.SpawnSubagent(backend, gate, "caller-1", "coder"))
+
+		args, _ := json.Marshal(map[string]string{"agent_type": "coder", "name": bad, "prompt": "go"})
+		_, err := r.Run(context.Background(), tools.NameSpawnSubagent, args)
+		if err == nil || !strings.Contains(err.Error(), "control characters") {
+			t.Fatalf("name %q: err = %v, want control-character error", bad, err)
+		}
+		if backend.spawnCount() != 0 {
+			t.Fatalf("name %q: backend called despite invalid name", bad)
+		}
+		if reqs := gate.PendingRequests(); len(reqs) != 0 {
+			t.Fatalf("name %q: approval gate saw %d request(s)", bad, len(reqs))
+		}
 	}
 }

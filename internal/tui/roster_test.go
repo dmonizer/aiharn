@@ -50,7 +50,7 @@ func TestRefreshSubagentsReflectsManager(t *testing.T) {
 		t.Fatalf("initial subagents = %v", m.subagents)
 	}
 
-	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestRefreshSubagentsReflectsManager(t *testing.T) {
 
 func TestRosterMsgRefreshes(t *testing.T) {
 	m := newRosterModel(t)
-	if _, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "task"); err != nil {
+	if _, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "task"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,7 +78,7 @@ func TestRosterMsgRefreshes(t *testing.T) {
 
 func TestViewListsSubagents(t *testing.T) {
 	m := newRosterModel(t)
-	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestViewListsSubagents(t *testing.T) {
 
 func TestRosterHoverFocusPauseCloseAndSeparateContexts(t *testing.T) {
 	m := newRosterModel(t)
-	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestRosterHoverFocusPauseCloseAndSeparateContexts(t *testing.T) {
 
 func TestRootTurnCompletionDoesNotFlushFocusedSubagent(t *testing.T) {
 	m := newRosterModel(t)
-	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestRootTurnCompletionDoesNotFlushFocusedSubagent(t *testing.T) {
 
 func TestInputInSubagentViewQueuesToSelectedAgent(t *testing.T) {
 	m := newRosterModel(t)
-	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "first")
+	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "first")
 	if err != nil {
 		t.Fatal(err)
 	}

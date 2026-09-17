@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -60,6 +61,11 @@ const (
 	EventToolCall
 	EventToolResult
 	EventState
+	// EventAgentMessage reports an agent-to-agent message. It is emitted when
+	// the message is enqueued (Pending true, still in the recipient's inbox) and
+	// again when it is injected into the recipient's history (Pending false).
+	// Appended last so existing EventType values stay stable.
+	EventAgentMessage
 )
 
 // Event is a single streamed event emitted by an agent for live display.
@@ -69,6 +75,12 @@ type Event struct {
 	Text    string   // text/reasoning delta, or EventToolResult output
 	Call    llm.Item // EventToolCall / EventToolResult
 	State   State    // EventState
+	// Delivery is set on EventAgentMessage: which agent sent the text, to which
+	// agent, in which direction, and why.
+	Delivery *llm.Delivery
+	// Pending is true on EventAgentMessage while the message still sits in the
+	// recipient's inbox, and false once it has been injected into its history.
+	Pending bool
 }
 
 // HistoryObserver receives history items as they are appended to an agent's
@@ -88,6 +100,7 @@ type ActivityObserver interface {
 // Spec is the resolved, immutable configuration for one agent instance.
 type Spec struct {
 	ID               string
+	Name             string // human-readable display name; "" falls back to ID
 	Type             string
 	Model            string
 	System           string // system prompt content
@@ -123,6 +136,7 @@ var ErrAgentClosed = errors.New("agent: agent closed")
 // agent from one event loop.
 type Agent struct {
 	id               string
+	name             string
 	typ              string
 	model            string
 	system           string
@@ -147,7 +161,11 @@ type Agent struct {
 	state   State
 	events  chan Event
 
-	inbox chan string
+	inbox chan inboxItem
+	// pendingInbox tracks agent-authored messages still queued in inbox and
+	// not yet drained into history, so a polling API client (which has no event
+	// stream) can list them. Guarded by mu.
+	pendingInbox []inboxItem
 	// Pause holds queued tasks at turn boundaries. In-flight work is allowed to
 	// complete, avoiding duplicate commands or provider requests on resume.
 	paused bool
@@ -193,6 +211,7 @@ func New(spec Spec) *Agent {
 	}
 	return &Agent{
 		id:               spec.ID,
+		name:             spec.Name,
 		typ:              spec.Type,
 		model:            spec.Model,
 		system:           spec.System,
@@ -212,13 +231,22 @@ func New(spec Spec) *Agent {
 		observer:         spec.Observer,
 		state:            StateStarting,
 		events:           make(chan Event, spec.EventCapacity),
-		inbox:            make(chan string, spec.InboxCapacity),
+		inbox:            make(chan inboxItem, spec.InboxCapacity),
 		closeDone:        make(chan struct{}),
 	}
 }
 
 // ID returns the agent's unique id.
 func (a *Agent) ID() string { return a.id }
+
+// Name returns the agent's human-readable display name, falling back to the id
+// when none was configured so callers always observe a non-empty name.
+func (a *Agent) Name() string {
+	if a.name != "" {
+		return a.name
+	}
+	return a.id
+}
 
 // Type returns the agent's configured type name.
 func (a *Agent) Type() string { return a.typ }
@@ -249,25 +277,71 @@ func (a *Agent) History() []llm.Item {
 	return append([]llm.Item(nil), a.history...)
 }
 
-// Send enqueues text into the agent's inbox. It never blocks; on overflow the
-// message is dropped and false is returned.
+// inboxItem is one queued inbox message together with its origin and, for
+// agent-authored messages, its delivery metadata, so a drained message is
+// recorded with the provenance it was enqueued with rather than as an
+// indistinguishable synthetic user message. seq orders pending agent messages
+// across the whole process (see Manager.PendingMessages); it stays zero for
+// human messages, which are never tracked as pending.
+type inboxItem struct {
+	text     string
+	origin   llm.Origin
+	delivery *llm.Delivery
+	seq      uint64
+}
+
+// inboxSeq orders agent-authored inbox messages process-wide, so the API can
+// report queued messages in enqueue order across every agent.
+var inboxSeq atomic.Uint64
+
+// Send enqueues text into the agent's inbox as a HUMAN message (console,
+// terminal UI, or API). It never blocks; on overflow the message is dropped and
+// false is returned.
 func (a *Agent) Send(text string) bool {
+	return a.send(inboxItem{text: text, origin: llm.OriginHuman})
+}
+
+// SendAgent enqueues text into the agent's inbox as an AGENT-authored message
+// carrying delivery metadata: a delivered subagent report, a task prompt written
+// by a parent model, or a message from send_agent_message. The origin and
+// delivery travel with the message so a UI never renders agent-injected text as
+// the human's own message. It never blocks; on overflow the message is dropped
+// and false is returned.
+func (a *Agent) SendAgent(text string, d *llm.Delivery) bool {
+	return a.send(inboxItem{text: text, origin: llm.OriginAgent, delivery: d})
+}
+
+func (a *Agent) send(item inboxItem) bool {
+	if item.delivery != nil {
+		item.seq = inboxSeq.Add(1)
+	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.state == StateClosed || a.state == StateErrored {
+		a.mu.Unlock()
 		return false
 	}
 	select {
-	case a.inbox <- text:
+	case a.inbox <- item:
+		if item.delivery != nil {
+			a.pendingInbox = append(a.pendingInbox, item)
+		}
+		a.mu.Unlock()
+		// Emit only after releasing a.mu: emit reaches the activity observer and
+		// must never run under the agent lock.
+		if item.delivery != nil {
+			a.emit(Event{Type: EventAgentMessage, Text: item.text, Delivery: item.delivery, Pending: true})
+		}
 		return true
 	default:
+		a.mu.Unlock()
 		return false
 	}
 }
 
-// drainInbox returns and removes all currently queued inbox messages.
-func (a *Agent) drainInbox() []string {
-	var msgs []string
+// drainInbox returns and removes all currently queued inbox messages, each with
+// the origin and delivery it was enqueued with.
+func (a *Agent) drainInbox() []inboxItem {
+	var msgs []inboxItem
 	for {
 		select {
 		case m := <-a.inbox:
@@ -276,6 +350,40 @@ func (a *Agent) drainInbox() []string {
 			return msgs
 		}
 	}
+}
+
+// markTaken records that a queued agent message has been taken from the inbox,
+// so it is no longer pending. It emits NO event: the delivered event is emitted
+// only when the text actually enters the recipient's history (see runTurn), so a
+// message that is taken but never delivered -- dropped while paused or at
+// shutdown -- is never reported as delivered. Human messages carry no delivery
+// and are ignored. Callers must not hold a.mu.
+func (a *Agent) markTaken(item inboxItem) {
+	if item.delivery == nil {
+		return
+	}
+	a.mu.Lock()
+	a.removePendingLocked(item)
+	a.mu.Unlock()
+}
+
+// removePendingLocked drops one tracked pending message, matching on the
+// process-wide enqueue sequence assigned when it was queued. Callers hold a.mu.
+func (a *Agent) removePendingLocked(item inboxItem) {
+	for i, pending := range a.pendingInbox {
+		if pending.seq == item.seq {
+			a.pendingInbox = append(a.pendingInbox[:i], a.pendingInbox[i+1:]...)
+			return
+		}
+	}
+}
+
+// pendingAgentMessages returns a copy of the agent-authored messages still
+// queued in the inbox but not yet injected into a history, in enqueue order.
+func (a *Agent) pendingAgentMessages() []inboxItem {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]inboxItem(nil), a.pendingInbox...)
 }
 
 // setContext installs the agent's lifecycle context (Manager-internal, called
@@ -297,17 +405,17 @@ func (a *Agent) setOnStateChange(fn func()) { a.onStateChange = fn }
 // with no tool calls. On error it returns the error and sets the state to
 // errored (or idle for cancellation).
 func (a *Agent) Turn(ctx context.Context, input string) error {
-	return a.runTurn(ctx, input, true)
+	return a.runTurn(ctx, input, llm.OriginHuman, nil, true)
 }
 
 // turn is the core loop: append input and iterate stream → tools until the model
 // stops calling tools. It does not drain the inbox; Turn and the subagent run
 // loop manage that.
-func (a *Agent) turn(ctx context.Context, input string) error {
-	return a.runTurn(ctx, input, false)
+func (a *Agent) turn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery) error {
+	return a.runTurn(ctx, input, origin, delivery, false)
 }
 
-func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) error {
+func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery, drainInbox bool) error {
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
 
@@ -362,15 +470,30 @@ func (a *Agent) runTurn(ctx context.Context, input string, drainInbox bool) erro
 	}()
 	if drainInbox {
 		for _, m := range a.drainInbox() {
-			a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: m})
+			a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: m.text, Origin: m.origin, Delivery: m.delivery})
+			a.markTaken(m)
+			// The item is now in history, so a delivery-carrying message becomes
+			// delivered exactly here: the delivered event can never describe
+			// text that is absent from the transcript. Human messages carry no
+			// delivery and emit nothing extra.
+			if m.delivery != nil {
+				a.emit(Event{Type: EventAgentMessage, Text: m.text, Delivery: m.delivery, Pending: false})
+			}
 		}
 	}
 
 	ctx = turnCtx
 
 	a.setState(StateRunning)
-	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input})
-	a.emit(Event{Type: EventUser, Text: input})
+	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input, Origin: origin, Delivery: delivery})
+	if delivery != nil {
+		// A delivery-carrying turn input (a subagent task prompt) has just
+		// entered history: report it as the delivered agent message, and NOT as
+		// a raw user turn, so a UI does not render the same task twice.
+		a.emit(Event{Type: EventAgentMessage, Text: input, Delivery: delivery, Pending: false})
+	} else {
+		a.emit(Event{Type: EventUser, Text: input})
+	}
 	a.trimHistory()
 
 	for round := 0; round < a.maxToolRounds; round++ {
@@ -448,10 +571,18 @@ func (a *Agent) run(ctx context.Context) {
 		}
 		select {
 		case task := <-a.inbox:
+			// The task has left the inbox, so it is no longer pending. It is not
+			// yet delivered: the delivered event is emitted only when the turn
+			// appends it to history, so a task dropped while paused or at
+			// shutdown is never reported as delivered.
+			a.markTaken(task)
 			if !a.waitUnpaused(ctx) {
 				return
 			}
-			if err := a.turn(ctx, task); err != nil {
+			// Preserve the origin and delivery carried by the queued task: a
+			// subagent's task prompt and any injected report are agent-authored,
+			// not human text.
+			if err := a.turn(ctx, task.text, task.origin, task.delivery); err != nil {
 				// A user interrupt cancels one task, not the reusable subagent's
 				// lifecycle. Keep its run loop alive for future messages.
 				if errors.Is(err, context.Canceled) && ctx.Err() == nil {
@@ -519,6 +650,11 @@ func (a *Agent) cancelWork(discardInbox bool) bool {
 	cancel := a.turnCancel
 	affected := cancel != nil
 	if discardInbox {
+		// Every queued message is discarded, so nothing remains pending.
+		if len(a.pendingInbox) > 0 {
+			affected = true
+		}
+		a.pendingInbox = nil
 		for {
 			select {
 			case <-a.inbox:
@@ -546,6 +682,7 @@ func (a *Agent) Close() {
 	a.closeOnce.Do(func() {
 		a.mu.Lock()
 		a.state = StateClosed
+		a.pendingInbox = nil
 		a.mu.Unlock()
 
 		if a.cancel != nil {

@@ -1,6 +1,10 @@
-// Package webapi exposes the active Aiharn session as a versioned JSON API.
+// Package webapi exposes the active Aiharn sessions as a versioned JSON API.
 // It deliberately contains no frontend assets: browser clients can be hosted
 // independently and can connect to one or many API instances.
+//
+// The server holds no conversation state of its own. Every session (its agent
+// tree, approval gate, transcript, and message queue) belongs to the injected
+// sessions.Store, so the same routes serve one session or many.
 package webapi
 
 import (
@@ -22,65 +26,43 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/llm"
 	"aiharn/internal/logging"
+	"aiharn/internal/sessions"
 )
 
 const (
-	maxMessageBytes  = 64 << 10
-	defaultQueueSize = 32
+	maxMessageBytes = 64 << 10
+	// sessionItemPrefix is the subtree pattern for one session's routes.
+	sessionItemPrefix = "/api/v1/sessions/"
 )
 
-// Agent is the portion of the active agent needed by the remote API.
-type Agent interface {
-	ID() string
-	Type() string
-	State() agent.State
-	History() []llm.Item
-	Turn(context.Context, string) error
-}
-
-// SessionInfo contains non-secret labels describing the active session.
-type SessionInfo struct {
-	Model   string
-	Channel string
-}
-
-// Config configures one API server.
+// Config configures one API server. Sessions is required and owns every
+// conversation session; the server keeps no state of its own beyond the
+// listener.
 type Config struct {
 	Listen         string
 	Token          string
 	AllowedOrigins []string
-	QueueSize      int
-	Agent          Agent
-	Manager        *agent.Manager
-	Gate           *approval.Gate
-	Session        SessionInfo
+	Sessions       sessions.Store
 }
 
-// Server owns the HTTP listener and the bounded remote-message worker.
+// Server owns the HTTP listener and exposes the session store over JSON.
 type Server struct {
 	cfg      Config
 	handler  http.Handler
 	server   *http.Server
 	listener net.Listener
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	queue  chan string
-	wg     sync.WaitGroup
+	wg sync.WaitGroup
 
-	mu        sync.Mutex
-	lastError string
-	closed    bool
+	mu     sync.Mutex
+	closed bool
 }
 
 // New validates cfg and constructs a server. Start opens the configured
 // listener; Handler can be used independently by another HTTP host.
 func New(cfg Config) (*Server, error) {
-	if cfg.Agent == nil {
-		return nil, errors.New("webapi: agent is required")
-	}
-	if cfg.Gate == nil {
-		return nil, errors.New("webapi: approval gate is required")
+	if cfg.Sessions == nil {
+		return nil, errors.New("webapi: session store is required")
 	}
 	if cfg.Listen == "" {
 		return nil, errors.New("webapi: listen address is required")
@@ -91,22 +73,16 @@ func New(cfg Config) (*Server, error) {
 	if err := validateOrigins(cfg.AllowedOrigins); err != nil {
 		return nil, err
 	}
-	if cfg.QueueSize <= 0 {
-		cfg.QueueSize = defaultQueueSize
-	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{
-		cfg: cfg, ctx: ctx, cancel: cancel,
-		queue: make(chan string, cfg.QueueSize),
-	}
+	s := &Server{cfg: cfg}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/sessions", s.handleSessions)
+	mux.HandleFunc(sessionItemPrefix, s.handleSessionItem)
 	mux.HandleFunc("/api/v1/session", s.handleSession)
+	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
 	mux.HandleFunc("/api/v1/messages", s.handleMessages)
 	mux.HandleFunc("/api/v1/approvals/", s.handleApproval)
 	s.handler = s.requestLog(s.securityHeaders(s.cors(s.authenticate(mux))))
-
-	go s.runMessages()
 	return s, nil
 }
 
@@ -137,7 +113,7 @@ func (s *Server) Start() error {
 	go func() {
 		defer s.wg.Done()
 		if err := s.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.setLastError("api server stopped: " + err.Error())
+			logging.Debug("api server stopped", slog.String("error", err.Error()))
 		}
 	}()
 	return nil
@@ -153,7 +129,8 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
-// Close stops requests and cancels work initiated by the remote queue.
+// Close stops the listener and waits for in-flight requests. It does not close
+// any session: those belong to the injected store.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -162,7 +139,6 @@ func (s *Server) Close() error {
 	}
 	s.closed = true
 	srv := s.server
-	s.cancel()
 	s.mu.Unlock()
 
 	var err error
@@ -176,17 +152,38 @@ func (s *Server) Close() error {
 }
 
 type sessionResponse struct {
-	APIVersion       int               `json:"api_version"`
-	Session          session           `json:"session"`
+	APIVersion int     `json:"api_version"`
+	Session    session `json:"session"`
+	// Agents is always present and always holds at least the top-level agent.
+	// A client must be able to tell "this session has no subagents" apart from
+	// "this server is too old to report agents at all": a stale binary that
+	// omitted this field is what made the web console show only the main agent.
 	Agents           []agentSummary    `json:"agents"`
 	Messages         []message         `json:"messages"`
 	PendingApprovals []approvalRequest `json:"pending_approvals"`
-	QueuedMessages   int               `json:"queued_messages"`
-	LastError        string            `json:"last_error,omitempty"`
+	// PendingAgentMessages is always present (an empty array, never null): it
+	// lists agent-to-agent messages queued in inboxes but not yet injected into
+	// a history. A polling client has no event stream, so this is how it learns
+	// a message is in flight; the empty array still lets it tell "none pending"
+	// apart from "this server is too old to report them".
+	PendingAgentMessages []pendingMessage `json:"pending_agent_messages"`
+	QueuedMessages       int              `json:"queued_messages"`
+	LastError            string           `json:"last_error,omitempty"`
+	// AgentsError reports a failed subagent roster. The payload stays valid and
+	// the transcript, approvals, and top-level agent are still returned.
+	AgentsError string `json:"agents_error,omitempty"`
+	// Capabilities is always present and lists the optional routes this server
+	// implements, so a client can hide a feature a stale binary lacks instead of
+	// probing the route and failing. See the capabilities helper.
+	Capabilities []string `json:"capabilities"`
 }
 
 type agentSummary struct {
-	ID     string `json:"id"`
+	ID string `json:"id"`
+	// Name is the agent's display name. It is always non-empty: an agent
+	// configured without a name reports its id instead, so a client renders
+	// this field unconditionally and never has to fall back to the id itself.
+	Name   string `json:"name"`
 	Type   string `json:"type"`
 	State  string `json:"state"`
 	Depth  int    `json:"depth"`
@@ -194,21 +191,81 @@ type agentSummary struct {
 }
 
 type session struct {
-	AgentID      string `json:"agent_id"`
-	AgentType    string `json:"agent_type"`
-	Model        string `json:"model"`
-	Channel      string `json:"channel"`
-	State        string `json:"state"`
-	ApprovalMode string `json:"approval_mode"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	CreatedAt    time.Time `json:"created_at"`
+	AgentID      string    `json:"agent_id"`
+	AgentType    string    `json:"agent_type"`
+	Model        string    `json:"model"`
+	Channel      string    `json:"channel"`
+	State        string    `json:"state"`
+	ApprovalMode string    `json:"approval_mode"`
+}
+
+// sessionListResponse is the payload of GET /api/v1/sessions.
+type sessionListResponse struct {
+	APIVersion       int                 `json:"api_version"`
+	DefaultSessionID string              `json:"default_session_id"`
+	Sessions         []sessionDescriptor `json:"sessions"`
+}
+
+// sessionDescriptor describes one session without its transcript.
+type sessionDescriptor struct {
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	CreatedAt      time.Time      `json:"created_at"`
+	Default        bool           `json:"default"`
+	Model          string         `json:"model,omitempty"`
+	Channel        string         `json:"channel,omitempty"`
+	State          string         `json:"state"`
+	Agents         []agentSummary `json:"agents"`
+	AgentsError    string         `json:"agents_error,omitempty"`
+	QueuedMessages int            `json:"queued_messages"`
+	LastError      string         `json:"last_error,omitempty"`
+	// Capabilities is always present, exactly as on GET /api/v1/session.
+	Capabilities []string `json:"capabilities"`
 }
 
 type message struct {
-	Type      string `json:"type"`
-	Role      string `json:"role,omitempty"`
-	Content   string `json:"content,omitempty"`
-	CallID    string `json:"call_id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Arguments any    `json:"arguments,omitempty"`
+	Type string `json:"type"`
+	Role string `json:"role,omitempty"`
+	// Origin records who authored a message item: "human" or "agent". It is set
+	// only on message items, and lets a client tell a person's message apart
+	// from agent-injected text such as a delivered subagent report. It is
+	// omitted on assistant messages and on tool items.
+	Origin string `json:"origin,omitempty"`
+	// Delivery is set only on message items another agent injected, describing
+	// who sent what to whom, in which direction (relative to the sender), and
+	// why. It is omitted on assistant messages and on tool items.
+	Delivery  *delivery `json:"delivery,omitempty"`
+	Content   string    `json:"content,omitempty"`
+	CallID    string    `json:"call_id,omitempty"`
+	Name      string    `json:"name,omitempty"`
+	Arguments any       `json:"arguments,omitempty"`
+}
+
+// delivery mirrors llm.Delivery in the wire payload. direction is relative to
+// the SENDER: "down" when an agent messages a descendant it spawned, "up" when
+// it messages an ancestor (its caller).
+type delivery struct {
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Direction string `json:"direction"`
+	Kind      string `json:"kind"`
+}
+
+// pendingMessage is one agent-authored message queued in an inbox but not yet
+// injected into a history.
+type pendingMessage struct {
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Direction string `json:"direction"`
+	Kind      string `json:"kind"`
+	// Content is the queued text. It is named "content" to match a transcript
+	// message item's body: a client renders both, and two names for the same
+	// concept in one payload is a trap (the console silently read an empty
+	// body when this was "text").
+	Content string `json:"content"`
 }
 
 type approvalRequest struct {
@@ -220,43 +277,116 @@ type approvalRequest struct {
 	Args      any    `json:"arguments,omitempty"`
 }
 
+// approvalModeCapability is advertised in every "capabilities" list. Like the
+// agents field, a client must be able to tell "this server supports switching
+// the approval mode" apart from "this server is too old", rather than probing
+// the route and failing: the web console hides the toggle when it is absent.
+const approvalModeCapability = "approval_mode"
+
+// agentMessagesCapability advertises the bidirectional agent-messaging model:
+// messages carry delivery metadata, and GET /api/v1/session reports queued
+// agent messages. A client hides those affordances when it is absent.
+const agentMessagesCapability = "agent_messages"
+
+// agentNamesCapability advertises that every agent entry carries a display
+// name, so agents[].name may differ from the id. A client uses it to tell "this
+// server reports a name per agent entry" apart from "this server is too old" and
+// fall back to rendering ids, rather than assuming the name and id match.
+const agentNamesCapability = "agent_names"
+
+// capabilities returns a fresh slice for each response. A shared backing array
+// would let one caller's mutation leak into another payload, and keeping the
+// list in one place stops GET /api/v1/session and the session descriptors from
+// drifting apart.
+func capabilities() []string {
+	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability}
+}
+
+// resolve returns the session named by id, or the default session when id is
+// empty.
+func (s *Server) resolve(id string) (sessions.Handle, bool) {
+	handle, ok := s.cfg.Sessions.Lookup(id)
+	if !ok || handle == nil {
+		return nil, false
+	}
+	return handle, true
+}
+
+// defaultSessionID returns the store's default session id, or "".
+func (s *Server) defaultSessionID() string {
+	if handle := s.cfg.Sessions.Default(); handle != nil {
+		return handle.ID()
+	}
+	return ""
+}
+
+// agentSummaries returns one session's roster: the top-level agent first, then
+// every subagent at any depth. A roster failure is reported as a message rather
+// than an error, because losing the roster must not hide the transcript, the
+// approvals, or the top-level agent.
+func (s *Server) agentSummaries(ctx context.Context, handle sessions.Handle) ([]agentSummary, string) {
+	top := handle.Agent()
+	agents := []agentSummary{{
+		ID: top.ID(), Name: top.Name(), Type: top.Type(), State: top.State().String(),
+	}}
+	manager := handle.Manager()
+	if manager == nil {
+		return agents, ""
+	}
+	subs, err := manager.ListSubagents(ctx, top.ID())
+	if err != nil {
+		return agents, "cannot list subagents"
+	}
+	for _, sub := range subs {
+		agents = append(agents, agentSummary{
+			ID: sub.ID, Name: sub.Name, Type: sub.Type, State: sub.State,
+			Depth: sub.Depth, Paused: sub.Paused,
+		})
+	}
+	return agents, ""
+}
+
+// describe renders one session without its transcript.
+func (s *Server) describe(ctx context.Context, handle sessions.Handle, isDefault bool) sessionDescriptor {
+	agents, agentsErr := s.agentSummaries(ctx, handle)
+	return sessionDescriptor{
+		ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
+		Default: isDefault, Model: handle.Model(), Channel: handle.Channel(),
+		State:          handle.Agent().State().String(),
+		Agents:         agents,
+		AgentsError:    agentsErr,
+		QueuedMessages: handle.Queued(), LastError: handle.LastError(),
+		Capabilities: capabilities(),
+	}
+}
+
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
-	agents := []agentSummary{{
-		ID: s.cfg.Agent.ID(), Type: s.cfg.Agent.Type(),
-		State: s.cfg.Agent.State().String(),
-	}}
-	if s.cfg.Manager != nil {
-		subs, err := s.cfg.Manager.ListSubagents(r.Context(), s.cfg.Agent.ID())
-		if err != nil {
-			writeError(w, http.StatusConflict, "cannot list subagents")
-			return
-		}
-		for _, sub := range subs {
-			agents = append(agents, agentSummary{
-				ID: sub.ID, Type: sub.Type, State: sub.State,
-				Depth: sub.Depth, Paused: sub.Paused,
-			})
-		}
+	handle, ok := s.resolve(r.URL.Query().Get("session_id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
 	}
-	selected := s.cfg.Agent
+	agents, agentsErr := s.agentSummaries(r.Context(), handle)
+	selected := handle.Agent()
 	selectedID := r.URL.Query().Get("agent_id")
 	if selectedID != "" && selectedID != selected.ID() {
 		found := false
-		for _, entry := range agents[1:] {
+		for _, entry := range agents {
 			if entry.ID == selectedID {
 				found = true
 				break
 			}
 		}
-		if !found || s.cfg.Manager == nil {
+		manager := handle.Manager()
+		if !found || manager == nil {
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
 		}
-		sub := s.cfg.Manager.Agent(selectedID)
+		sub := manager.Agent(selectedID)
 		if sub == nil {
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
@@ -264,23 +394,126 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		selected = sub
 	}
 	model, channel, queued, lastError := "", "", 0, ""
-	if selected.ID() == s.cfg.Agent.ID() {
-		model, channel = s.cfg.Session.Model, s.cfg.Session.Channel
-		queued, lastError = len(s.queue), s.getLastError()
+	if selected.ID() == handle.Agent().ID() {
+		model, channel = handle.Model(), handle.Channel()
+		queued, lastError = handle.Queued(), handle.LastError()
 	}
 	writeJSON(w, http.StatusOK, sessionResponse{
 		APIVersion: 1,
 		Session: session{
+			ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
 			AgentID: selected.ID(), AgentType: selected.Type(),
 			Model: model, Channel: channel,
 			State:        selected.State().String(),
-			ApprovalMode: s.cfg.Gate.Mode().String(),
+			ApprovalMode: handle.Gate().Mode().String(),
 		},
-		Agents:           agents,
-		Messages:         messagesFromHistory(selected.History()),
-		PendingApprovals: approvalsFromGate(s.cfg.Gate.PendingRequests()),
-		QueuedMessages:   queued, LastError: lastError,
+		Agents:               agents,
+		AgentsError:          agentsErr,
+		Capabilities:         capabilities(),
+		Messages:             messagesFromHistory(selected.History()),
+		PendingApprovals:     approvalsFromGate(handle.Gate().PendingRequests()),
+		PendingAgentMessages: pendingAgentMessages(handle.Manager()),
+		QueuedMessages:       queued, LastError: lastError,
 	})
+}
+
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listSessions(w, r)
+	case http.MethodPost:
+		s.createSession(w, r)
+	default:
+		methodNotAllowed(w, "GET, POST")
+	}
+}
+
+func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
+	handles := s.cfg.Sessions.List()
+	defaultID := s.defaultSessionID()
+	list := make([]sessionDescriptor, 0, len(handles))
+	for _, handle := range handles {
+		list = append(list, s.describe(r.Context(), handle, handle.ID() == defaultID))
+	}
+	writeJSON(w, http.StatusOK, sessionListResponse{
+		APIVersion:       1,
+		DefaultSessionID: defaultID,
+		Sessions:         list,
+	})
+}
+
+func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := decodeOptionalJSON(w, r, &body); err != nil {
+		return
+	}
+	handle, err := s.cfg.Sessions.Create(r.Context(), body.Name)
+	switch {
+	case errors.Is(err, sessions.ErrNameInvalid):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, sessions.ErrLimitReached):
+		writeError(w, http.StatusConflict, "maximum number of sessions reached")
+	case errors.Is(err, sessions.ErrClosed):
+		writeError(w, http.StatusConflict, "session store is closed")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "cannot create session")
+	default:
+		// Building a session opens its execution session, so this call can block
+		// on a slow channel.
+		writeJSON(w, http.StatusCreated, s.describe(r.Context(), handle, false))
+	}
+}
+
+func (s *Server) handleSessionItem(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, sessionItemPrefix)
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		handle, ok := s.resolve(id)
+		if !ok {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, s.describe(r.Context(), handle, handle.ID() == s.defaultSessionID()))
+	case http.MethodPatch:
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			return
+		}
+		handle, err := s.cfg.Sessions.Rename(id, body.Name)
+		switch {
+		case errors.Is(err, sessions.ErrNameInvalid):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, sessions.ErrNotFound):
+			writeError(w, http.StatusNotFound, "session not found")
+		case errors.Is(err, sessions.ErrClosed):
+			writeError(w, http.StatusConflict, "session store is closed")
+		case err != nil:
+			writeError(w, http.StatusInternalServerError, "cannot rename session")
+		default:
+			writeJSON(w, http.StatusOK, s.describe(r.Context(), handle, handle.ID() == s.defaultSessionID()))
+		}
+	case http.MethodDelete:
+		switch err := s.cfg.Sessions.Close(r.Context(), id); {
+		case errors.Is(err, sessions.ErrDefault):
+			writeError(w, http.StatusConflict, "the default session cannot be closed")
+		case errors.Is(err, sessions.ErrNotFound):
+			writeError(w, http.StatusNotFound, "session not found")
+		case err != nil:
+			writeError(w, http.StatusInternalServerError, "cannot close session")
+		default:
+			writeJSON(w, http.StatusOK, map[string]bool{"closed": true})
+		}
+	default:
+		methodNotAllowed(w, "GET, PATCH, DELETE")
+	}
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -289,8 +522,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Content string `json:"content"`
-		AgentID string `json:"agent_id"`
+		Content   string `json:"content"`
+		AgentID   string `json:"agent_id"`
+		SessionID string `json:"session_id"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		return
@@ -303,33 +537,32 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "content exceeds 65536 bytes")
 		return
 	}
-	if body.AgentID != "" && body.AgentID != s.cfg.Agent.ID() {
-		if s.cfg.Manager == nil {
-			writeError(w, http.StatusNotFound, "agent not found")
-			return
-		}
-		err := s.cfg.Manager.SendSubagentMessage(r.Context(), s.cfg.Agent.ID(), body.AgentID, body.Content)
-		switch {
-		case errors.Is(err, agent.ErrSubagentNotFound), errors.Is(err, agent.ErrSubagentNotOwned):
-			writeError(w, http.StatusNotFound, "agent not found")
-		case err != nil:
-			writeError(w, http.StatusConflict, err.Error())
-		default:
-			writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "queued_messages": 0})
-		}
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	if s.cfg.Agent.State() == agent.StateClosed {
+	// A subagent message goes to that agent's inbox, so it never occupies the
+	// session queue the count describes.
+	queued := handle.Queued()
+	if top := handle.Agent(); body.AgentID != "" && body.AgentID != top.ID() {
+		queued = 0
+	}
+	switch err := handle.Submit(r.Context(), body.AgentID, body.Content); {
+	case errors.Is(err, sessions.ErrAgentNotFound):
+		writeError(w, http.StatusNotFound, "agent not found")
+	case errors.Is(err, sessions.ErrNotFound):
+		writeError(w, http.StatusNotFound, "session not found")
+	case errors.Is(err, sessions.ErrClosed):
 		writeError(w, http.StatusConflict, "session is closed")
-		return
-	}
-	select {
-	case s.queue <- body.Content:
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"accepted": true, "queued_messages": len(s.queue),
-		})
-	default:
+	case errors.Is(err, sessions.ErrQueueFull):
 		writeError(w, http.StatusConflict, "message queue is full")
+	case err != nil:
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"accepted": true, "queued_messages": queued,
+		})
 	}
 }
 
@@ -344,19 +577,28 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Decision string `json:"decision"`
+		Decision  string `json:"decision"`
+		SessionID string `json:"session_id"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		return
 	}
+	// Approval ids are sequential per gate, so the same id exists in every
+	// session; the decision must be applied to the addressed session's gate.
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	gate := handle.Gate()
 	var err error
 	switch body.Decision {
 	case "approve":
-		err = s.cfg.Gate.Decide(id, approval.DecisionApproved)
+		err = gate.Decide(id, approval.DecisionApproved)
 	case "deny":
-		err = s.cfg.Gate.Decide(id, approval.DecisionDenied)
+		err = gate.Decide(id, approval.DecisionDenied)
 	case "approve_all":
-		err = s.cfg.Gate.ApproveAll(id)
+		err = gate.ApproveAll(id)
 	default:
 		writeError(w, http.StatusBadRequest, "decision must be approve, deny, or approve_all")
 		return
@@ -368,18 +610,51 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"resolved": true})
 }
 
-func (s *Server) runMessages() {
-	for {
-		select {
-		case content := <-s.queue:
-			s.setLastError("")
-			if err := s.cfg.Agent.Turn(s.ctx, content); err != nil && s.ctx.Err() == nil {
-				s.setLastError(err.Error())
-			}
-		case <-s.ctx.Done():
-			return
-		}
+// handleSessionApproval switches a session's approval mode. This is the
+// user-facing path: the human owns the gate, so it may loosen (ask ->
+// allow-all) as well as tighten (allow-all -> ask). The model reaches the gate
+// through the set_approval tool, which uses Gate.ApplyModelMode and may only
+// tighten; the two paths must not be conflated.
+func (s *Server) handleSessionApproval(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
 	}
+	var body struct {
+		Mode      string `json:"mode"`
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		return
+	}
+	var mode approval.Mode
+	switch body.Mode {
+	case "ask":
+		mode = approval.ModeAsk
+	case "allow-all":
+		mode = approval.ModeAllowAll
+	default:
+		writeError(w, http.StatusBadRequest, "mode must be ask or allow-all")
+		return
+	}
+	// Like handleMessages, an empty session_id addresses the default session.
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	gate := handle.Gate()
+	gate.SetMode(mode)
+	writeJSON(w, http.StatusOK, map[string]string{"mode": gate.Mode().String()})
+}
+
+// decodeOptionalJSON decodes an optional single JSON object. An empty body is
+// not an error, so POST /sessions needs no body.
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	if r.ContentLength == 0 {
+		return nil
+	}
+	return decodeJSON(w, r, dst)
 }
 
 func messagesFromHistory(history []llm.Item) []message {
@@ -389,6 +664,13 @@ func messagesFromHistory(history []llm.Item) []message {
 		switch item.Type {
 		case llm.ItemMessage:
 			m.Type, m.Role = "message", string(item.Role)
+			m.Origin = string(item.Origin)
+			if item.Delivery != nil {
+				m.Delivery = &delivery{
+					From: item.Delivery.From, To: item.Delivery.To,
+					Direction: item.Delivery.Direction, Kind: item.Delivery.Kind,
+				}
+			}
 		case llm.ItemFunctionCall:
 			m.Type, m.Arguments = "tool_call", parseJSON(item.Args)
 		case llm.ItemFunctionCallOutput:
@@ -399,6 +681,22 @@ func messagesFromHistory(history []llm.Item) []message {
 		messages = append(messages, m)
 	}
 	return messages
+}
+
+// pendingAgentMessages renders a session's queued agent messages. It always
+// returns a non-nil slice so the JSON field is present as an empty array, not
+// null, and tolerates a session without a manager.
+func pendingAgentMessages(manager *agent.Manager) []pendingMessage {
+	out := make([]pendingMessage, 0)
+	if manager == nil {
+		return out
+	}
+	for _, m := range manager.PendingMessages() {
+		out = append(out, pendingMessage{
+			From: m.From, To: m.To, Direction: m.Direction, Kind: m.Kind, Content: m.Text,
+		})
+	}
+	return out
 }
 
 func approvalsFromGate(requests []approval.Request) []approvalRequest {
@@ -474,7 +772,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				w.Header().Add("Vary", "Origin")
 			}
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -564,18 +862,6 @@ func validateOrigins(origins []string) error {
 		}
 	}
 	return nil
-}
-
-func (s *Server) setLastError(value string) {
-	s.mu.Lock()
-	s.lastError = value
-	s.mu.Unlock()
-}
-
-func (s *Server) getLastError() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lastError
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

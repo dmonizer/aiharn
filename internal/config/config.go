@@ -139,6 +139,10 @@ type APIConfig struct {
 	Token        string   `toml:"token"`
 	AllowOrigins []string `toml:"allow_origins"`
 	Only         bool     `toml:"only"`
+	// MaxSessions bounds how many conversation sessions the process may hold,
+	// counting the default session the terminal UI drives. Zero uses the
+	// built-in default.
+	MaxSessions int `toml:"max_sessions"`
 }
 
 // Known tool-set names and provider/channel types used as defaults in Validate.

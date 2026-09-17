@@ -241,6 +241,7 @@ listen = "${TEST_API_LISTEN}"
 token = "${TEST_API_TOKEN}"
 allow_origins = ["${TEST_API_ORIGIN}", "https://backup.example"]
 only = true
+max_sessions = 4
 `)
 
 	cfg, err := Load(path)
@@ -259,6 +260,22 @@ only = true
 	}
 	if !cfg.API.Only {
 		t.Fatal("API.Only = false, want true")
+	}
+	if cfg.API.MaxSessions != 4 {
+		t.Fatalf("API.MaxSessions = %d, want 4", cfg.API.MaxSessions)
+	}
+}
+
+func TestAPIWithoutMaxSessionsKeepsZero(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "model-secret")
+	cfg, err := Load(setup(t, validConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Zero is the "use the built-in default" sentinel; the session layer, not
+	// the config layer, resolves it.
+	if cfg.API.MaxSessions != 0 {
+		t.Fatalf("API.MaxSessions = %d, want 0", cfg.API.MaxSessions)
 	}
 }
 
@@ -408,6 +425,15 @@ func TestValidateAPIConfig(t *testing.T) {
 			name:    "remote without token",
 			api:     APIConfig{Listen: "0.0.0.0:7331"},
 			wantErr: "api.token is required",
+		},
+		{
+			name:    "negative max sessions",
+			api:     APIConfig{Listen: "127.0.0.1:7331", MaxSessions: -1},
+			wantErr: "api.max_sessions must not be negative",
+		},
+		{
+			name: "max sessions accepted",
+			api:  APIConfig{Listen: "127.0.0.1:7331", MaxSessions: 4},
 		},
 		{
 			name:    "invalid origin",

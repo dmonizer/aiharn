@@ -19,6 +19,9 @@ var (
 	styleReasoning = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	// Agent-to-agent traffic gets its own magenta so it is never mistaken for
+	// human input (cyan) or assistant output (default).
+	styleAgentMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
 )
 
 // styleLine renders a transcript line in its kind's color (plain passes through
@@ -37,6 +40,8 @@ func styleLine(kind lineKind, s string) string {
 		return styleCommand.Render(s)
 	case kindError:
 		return styleError.Render(s)
+	case kindAgentMessage:
+		return styleAgentMessage.Render(s)
 	default:
 		return s
 	}

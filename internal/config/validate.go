@@ -255,6 +255,9 @@ func validateAPI(errs *[]string, api APIConfig) {
 	if api.Only && api.Listen == "" {
 		*errs = append(*errs, "api.only requires api.listen")
 	}
+	if api.MaxSessions < 0 {
+		*errs = append(*errs, "api.max_sessions must not be negative")
+	}
 	if api.Listen != "" {
 		host, port, err := net.SplitHostPort(api.Listen)
 		if err != nil {

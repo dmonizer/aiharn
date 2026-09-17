@@ -34,7 +34,7 @@ func TestWidePaneBordersAndBottomStatus(t *testing.T) {
 
 func TestStackedPaneBordersAndRosterClick(t *testing.T) {
 	m := newRosterModel(t)
-	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "task")
+	id, err := m.manager.SpawnSubagent(context.Background(), "main", "coder", "", "task")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -18,6 +19,7 @@ import (
 	"aiharn/internal/config"
 	"aiharn/internal/logging"
 	"aiharn/internal/recorder"
+	"aiharn/internal/sessions"
 	"aiharn/internal/tools"
 	"aiharn/internal/tui"
 	"aiharn/internal/webapi"
@@ -106,39 +108,36 @@ func run(args []string) int {
 		return 1
 	}
 
-	rec, err := openRecorder(cfg.AiharnHome, *logPath, specified["log"])
+	transcripts, closeTranscripts, err := transcriptFactory(cfg.AiharnHome, *logPath, specified["log"])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: open session transcript: %v\n", err)
 		return 1
 	}
-	if rec != nil {
-		defer rec.Close()
-	}
+	// Only the shared --log recorder needs closing here; a per-session
+	// transcript is owned and closed by its session.
+	defer closeTranscripts()
 
 	buildOpts := app.Options{
-		Agent:      *agentName,
-		PromptFile: *promptFile,
-		Channel:    *channel,
-		Model:      *modelName,
-		Approval:   *approval,
+		Agent:         *agentName,
+		PromptFile:    *promptFile,
+		Channel:       *channel,
+		Model:         *modelName,
+		Approval:      *approval,
+		NewTranscript: transcripts,
 	}
-	if rec != nil {
-		buildOpts.Observer = rec
-	}
-	rt, err := app.Build(context.Background(), cfg, buildOpts)
+	sessionsMgr, err := app.NewSessionManager(context.Background(), app.SessionManagerOptions{
+		Config: cfg, Build: buildOpts, MaxSessions: apiCfg.MaxSessions,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
 		return 1
 	}
-	defer rt.Close()
+	defer sessionsMgr.Shutdown()
 
-	if rec != nil {
-		rec.SetSession(recorder.Meta{
-			Model:     rt.Summary.Model,
-			AgentType: rt.Summary.AgentType,
-			Channel:   rt.Summary.Channel,
-			Approval:  rt.Summary.Approval,
-		})
+	rt := sessionsMgr.DefaultRuntime()
+	if rt == nil {
+		fmt.Fprintf(os.Stderr, "aiharn: default session is unavailable\n")
+		return 1
 	}
 
 	var api *webapi.Server
@@ -146,8 +145,7 @@ func run(args []string) int {
 		api, err = webapi.New(webapi.Config{
 			Listen: apiCfg.Listen, Token: apiCfg.Token,
 			AllowedOrigins: apiCfg.AllowOrigins,
-			Agent:          rt.Agent, Manager: rt.Manager, Gate: rt.Gate,
-			Session: webapi.SessionInfo{Model: rt.Summary.Model, Channel: rt.Summary.Channel},
+			Sessions:       sessionsMgr,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
@@ -159,7 +157,7 @@ func run(args []string) int {
 			return 1
 		}
 		defer api.Close()
-		fmt.Fprintf(os.Stderr, "aiharn: current-session API listening on %s\n", api.Addr())
+		fmt.Fprintf(os.Stderr, "aiharn: session API listening on %s (up to %d sessions)\n", api.Addr(), sessionLimit(apiCfg.MaxSessions))
 	}
 	if apiCfg.Only {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -182,15 +180,56 @@ func run(args []string) int {
 	return 0
 }
 
-func openRecorder(aiharnHome, logPath string, logOverridden bool) (*recorder.Recorder, error) {
-	if logOverridden {
-		if logPath == "" {
-			return nil, nil
-		}
-		return recorder.NewFile(logPath)
+// transcriptFactory returns the per-session transcript factory and a function
+// that closes whatever the factory owns. An unset (nil) transcript means the
+// session keeps no transcript.
+//
+// By default every session gets its own private, timestamped file under
+// <aiharn_home>/transcripts. An explicit --log PATH shares one file between all
+// sessions, so their records interleave and the header line describes whichever
+// session wrote first; that is the cost of pinning the path. An explicit
+// --log "" disables transcripts entirely.
+func transcriptFactory(aiharnHome, logPath string, logOverridden bool) (func(string, string) (sessions.Transcript, error), func(), error) {
+	if logOverridden && logPath == "" {
+		// A nil factory leaves Options.NewTranscript unset, which means "no
+		// transcript" for every session.
+		return nil, func() {}, nil
 	}
-	rec, _, err := recorder.NewSessionFile(aiharnHome)
-	return rec, err
+	if logOverridden {
+		// One shared recorder for every session, created on first use.
+		var (
+			once sync.Once
+			rec  *recorder.Recorder
+			err  error
+		)
+		factory := func(string, string) (sessions.Transcript, error) {
+			once.Do(func() { rec, err = recorder.NewFile(logPath) })
+			if err != nil {
+				return nil, err
+			}
+			return rec, nil
+		}
+		return factory, func() {
+			if rec != nil {
+				_ = rec.Close()
+			}
+		}, nil
+	}
+	return func(string, string) (sessions.Transcript, error) {
+		rec, _, err := recorder.NewSessionFile(aiharnHome)
+		if err != nil {
+			return nil, err
+		}
+		return rec, nil
+	}, func() {}, nil
+}
+
+// sessionLimit reports the session bound the API will enforce.
+func sessionLimit(configured int) int {
+	if configured <= 0 {
+		return 8
+	}
+	return configured
 }
 
 func toolSet(names []string) map[string]bool {

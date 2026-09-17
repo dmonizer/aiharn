@@ -121,7 +121,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 
 .icon-button:hover { color: var(--text); background: var(--panel-2); }
 
-.api-list {
+.session-list {
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -130,9 +130,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   overflow-y: auto;
 }
 
-.api-item {
+.session-item {
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) 25px;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
   width: 100%;
@@ -145,32 +145,35 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   cursor: pointer;
 }
 
-.api-item:hover { color: var(--text); background: var(--panel-2); }
+.session-item:hover { color: var(--text); background: var(--panel-2); }
 
-.api-item.active {
+.session-item.active {
   border-color: var(--line);
   color: var(--text);
   background: #171c1f;
 }
 
-.api-dot {
+.session-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--faint);
   box-shadow: 0 0 0 3px rgba(89, 99, 108, .12);
 }
+.session-dot.running { background: var(--accent); box-shadow: 0 0 0 3px rgba(185, 244, 95, .1); }
+.session-dot.idle { background: #8bb6cd; }
+.session-dot.starting { background: var(--warn); }
+.session-dot.errored { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 107, .1); }
 
-.api-dot.online { background: var(--accent); box-shadow: 0 0 0 3px rgba(185, 244, 95, .1); }
-.api-dot.error { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 107, .1); }
+.session-copy { min-width: 0; }
+.session-copy strong, .session-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-copy strong { font-size: 13px; }
+.session-copy span { margin-top: 3px; color: var(--faint); font-size: 10px; }
+.session-copy em { margin-left: 5px; color: var(--faint); font-size: 9px; font-style: normal; letter-spacing: .08em; text-transform: uppercase; }
 
-.api-copy { min-width: 0; }
-.api-copy strong, .api-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.api-copy strong { font-size: 13px; }
-.api-copy span { margin-top: 3px; color: var(--faint); font-size: 10px; }
-
-.remove-api {
-  visibility: hidden;
+.session-actions { display: flex; gap: 2px; visibility: hidden; }
+.session-item:hover .session-actions, .session-item:focus-within .session-actions { visibility: visible; }
+.session-action {
   width: 25px;
   height: 25px;
   padding: 0;
@@ -180,8 +183,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   background: transparent;
   cursor: pointer;
 }
-.api-item:hover .remove-api { visibility: visible; }
-.remove-api:hover { color: var(--danger); background: rgba(255, 107, 107, .08); }
+.session-action:hover { color: var(--text); background: var(--panel-2); }
+.session-action.close:hover { color: var(--danger); background: rgba(255, 107, 107, .08); }
+
+.session-empty, .agent-empty {
+  padding: 8px 7px;
+  color: var(--faint);
+  font-size: 10px;
+  line-height: 1.5;
+}
 
 .agent-panel { display: flex; flex: 0 1 44%; flex-direction: column; min-height: 100px; padding-top: 15px; border-top: 1px solid var(--line); }
 .agent-list { display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow-y: auto; }
@@ -209,6 +219,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .agent-dot.running { background: var(--accent); }
 .agent-dot.idle { background: #8bb6cd; }
 .agent-dot.paused { background: var(--warn); }
+.agent-dot.starting { background: var(--warn); }
+.agent-dot.closed { background: var(--faint); }
 .agent-dot.errored { background: var(--danger); }
 .agent-copy { min-width: 0; }
 .agent-copy strong, .agent-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -216,7 +228,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .agent-copy span { margin-top: 2px; color: var(--faint); font: 10px ui-monospace, "SFMono-Regular", Consolas, monospace; }
 .agent-state { color: var(--faint); font-size: 10px; }
 .agent-state.running { color: var(--accent); }
+.agent-state.idle { color: #8bb6cd; }
 .agent-state.paused { color: var(--warn); }
+.agent-state.starting { color: var(--warn); }
+.agent-state.closed { color: var(--faint); }
 .agent-state.errored { color: var(--danger); }
 
 .sidebar-foot {
@@ -282,6 +297,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 
 .meta-chip.state-running { border-color: #536b35; color: var(--accent); }
 .meta-chip.state-errored { border-color: #773d3d; color: var(--danger); }
+
+/* The approval chip is a real button when the server supports switching. */
+.meta-chip.approval-toggle {
+  cursor: pointer;
+  appearance: none;
+  text-align: center;
+}
+
+.meta-chip.approval-toggle:hover {
+  border-color: var(--line-bright);
+  color: var(--text);
+}
+
+.meta-chip.approval-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.meta-chip.approval-toggle:disabled {
+  cursor: default;
+  opacity: .6;
+}
 
 .connection-state {
   flex: none;
@@ -378,6 +415,29 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   color: #ecf5e9;
 }
 .message-role { margin-bottom: 6px; color: var(--faint); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+/* A subagent report delivered into the transcript. It is role:"user" on the
+   wire but was authored by the agent system, so it must never look like the
+   human's own right-aligned green bubble. */
+.message-row.delivery { justify-content: flex-start; }
+.message-delivery {
+  padding: 10px 14px;
+  border: 1px dashed #3a474b;
+  border-radius: 14px 14px 14px 3px;
+  background: #101519;
+  color: #9fabaf;
+}
+.message-delivery .message-role { color: #6f8a86; }
+
+/* Header on an agent-to-agent delivery row: direction · sender -> recipient ·
+   kind. Separated from the human bubble (var(--user)) by colour and weight. */
+.message-delivery .delivery-header {
+  margin-bottom: 7px;
+  color: #8fb0a9;
+  font: 11px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  letter-spacing: .02em;
+}
+.message-delivery .delivery-header::first-letter { color: #cfe3dd; }
+
 
 .tool-block {
   margin: -4px 0 18px;
@@ -399,6 +459,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .tool-section { border-top: 1px solid var(--line); }
 .tool-section-label { padding: 9px 12px 0; color: var(--faint); font: 10px ui-monospace, "SFMono-Regular", Consolas, monospace; text-transform: uppercase; }
 .tool-section pre { max-height: 330px; margin: 0; padding: 7px 12px 11px; overflow: auto; color: #aeb8bf; font: 11px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; }
+
+/* Agent messages still queued in an inbox: not in the transcript yet. A
+   bounded, bordered strip directly above the composer so it can never be
+   mistaken for the transcript. */
+.pending-agent-messages {
+  margin: 0 max(28px, calc((100% - 920px) / 2)) 10px;
+  padding: 10px 14px;
+  border: 1px solid #4a5a3a;
+  border-left: 3px solid #8a9a5b;
+  border-radius: 10px;
+  background: #151a12;
+}
+.pending-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; margin-bottom: 8px; }
+.pending-title { color: #cfe3a8; font-size: 11px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+.pending-hint { color: var(--faint); font-size: 10px; }
+.pending-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.pending-item { border-top: 1px dashed #35402c; padding-top: 8px; }
+.pending-item:first-child { border-top: 0; padding-top: 0; }
+.pending-item-header { margin-bottom: 3px; color: #a9c07a; font: 11px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace; }
+.pending-item-body { color: #c6cfc0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 
 .composer {
   display: grid;
@@ -497,6 +578,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
   background: #0c0f11;
 }
 .field-help { margin: -9px 0 0; color: var(--faint); font-size: 10px; line-height: 1.5; }
+.field-error { margin: 0; padding: 8px 10px; border: 1px solid rgba(255, 107, 107, .35); border-radius: 8px; color: var(--danger); background: rgba(255, 107, 107, .07); font-size: 11px; line-height: 1.45; }
+#settings-dialog { width: min(94vw, 540px); }
 .field-help code { color: var(--muted); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 3px; }
 .dialog-actions .danger-button { margin-right: auto; }
@@ -510,11 +593,14 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
   .mobile-only { display: grid; }
   .topbar { min-height: 68px; gap: 11px; padding: 11px 14px; }
   .session-meta .meta-chip:nth-child(-n+2) { display: none; }
-  #set-token { display: none; }
   .transcript { padding: 20px 14px; }
   .composer { margin: 0 12px 12px; }
   .approvals { padding-right: 14px; padding-left: 14px; }
   .approval-card { grid-template-columns: 1fr; }
   .approval-actions { justify-content: flex-start; }
   .message { max-width: 90%; }
+}
+
+@media (hover: none) {
+  .session-actions { visibility: visible; }
 }
