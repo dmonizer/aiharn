@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
+	"aiharn/internal/authfile"
 	"aiharn/internal/llm"
 	"aiharn/internal/sessions"
 	"aiharn/internal/tools"
@@ -103,6 +105,7 @@ type fakeHandle struct {
 	gate      *approval.Gate
 	model     string
 	channel   string
+	channels  []sessions.Channel
 
 	mu        sync.Mutex
 	queued    int
@@ -111,10 +114,25 @@ type fakeHandle struct {
 	queueFull bool
 }
 
-func (h *fakeHandle) ID() string              { return h.id }
-func (h *fakeHandle) CreatedAt() time.Time    { return h.createdAt }
-func (h *fakeHandle) Model() string           { return h.model }
-func (h *fakeHandle) Channel() string         { return h.channel }
+func (h *fakeHandle) ID() string           { return h.id }
+func (h *fakeHandle) CreatedAt() time.Time { return h.createdAt }
+func (h *fakeHandle) Model() string        { return h.model }
+func (h *fakeHandle) Channel() string      { return h.channel }
+
+func (h *fakeHandle) SetChannel(_ context.Context, name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return sessions.ErrClosed
+	}
+	for _, c := range h.channels {
+		if c.Name == name {
+			h.channel = name
+			return nil
+		}
+	}
+	return sessions.ErrChannelNotFound
+}
 func (h *fakeHandle) Agent() sessions.Agent   { return h.agent }
 func (h *fakeHandle) Manager() *agent.Manager { return h.manager }
 func (h *fakeHandle) Gate() *approval.Gate    { return h.gate }
@@ -169,6 +187,7 @@ func (h *fakeHandle) Submit(ctx context.Context, agentID, content string) error 
 type fakeStore struct {
 	mu        sync.Mutex
 	list      []*fakeHandle
+	channels  []sessions.Channel
 	createErr error
 	max       int
 	seq       int
@@ -191,6 +210,12 @@ func (s *fakeStore) List() []sessions.Handle {
 		out = append(out, handle)
 	}
 	return out
+}
+
+func (s *fakeStore) Channels() []sessions.Channel {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sessions.Channel(nil), s.channels...)
 }
 
 func (s *fakeStore) Lookup(id string) (sessions.Handle, bool) {
@@ -237,7 +262,7 @@ func (s *fakeStore) Create(ctx context.Context, name string) (sessions.Handle, e
 	created := &fakeHandle{
 		id: fmt.Sprintf("session-%d", s.seq), name: name, createdAt: time.Now(),
 		agent: newFakeAgent(), manager: source.manager, gate: approval.NewGate(approval.ModeAsk),
-		model: source.model, channel: source.channel,
+		model: source.model, channel: source.channel, channels: s.channels,
 	}
 	s.list = append(s.list, created)
 	s.mu.Unlock()
@@ -282,22 +307,36 @@ type harness struct {
 	gate   *approval.Gate
 }
 
-func newHarness(t *testing.T, token string, origins ...string) *harness {
+func newHarness(t *testing.T, _ string, origins ...string) *harness {
 	t.Helper()
+	authPath := testAuthFile(t)
 	a := newFakeAgent()
 	g := approval.NewGate(approval.ModeAsk)
-	store := &fakeStore{list: []*fakeHandle{{
-		id: "default", name: "Default", createdAt: time.Now(),
-		agent: a, gate: g, model: "model", channel: "channel",
-	}}}
+	store := &fakeStore{
+		channels: []sessions.Channel{{Name: "channel", Type: "ssh"}, {Name: "local", Type: "local"}},
+		list: []*fakeHandle{{
+			id: "default", name: "Default", createdAt: time.Now(),
+			agent: a, gate: g, model: "model", channel: "channel",
+			channels: []sessions.Channel{{Name: "channel", Type: "ssh"}, {Name: "local", Type: "local"}},
+		}},
+	}
 	s, err := New(Config{
-		Listen: "127.0.0.1:0", Token: token, AllowedOrigins: origins, Sessions: store,
+		Listen: "127.0.0.1:0", AuthFile: authPath, AllowedOrigins: origins, Sessions: store,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close(); _ = g.Close() })
 	return &harness{server: s, store: store, agent: a, gate: g}
+}
+
+func testAuthFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "users")
+	if err := authfile.Set(path, "alice", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 // addSession appends a second session with its own agent, manager, and gate.
@@ -308,6 +347,7 @@ func (h *harness) addSession(t *testing.T, id, name string) *fakeHandle {
 	handle := &fakeHandle{
 		id: id, name: name, createdAt: time.Now(),
 		agent: newFakeAgent(), gate: gate, model: "other-model", channel: "channel",
+		channels: h.store.channels,
 	}
 	h.store.mu.Lock()
 	h.store.list = append(h.store.list, handle)
@@ -321,15 +361,18 @@ func testServer(t *testing.T, token string, origins ...string) (*Server, *fakeAg
 	return h.server, h.agent, h.gate
 }
 
-func request(t *testing.T, s *Server, method, path, token string, body any) *httptest.ResponseRecorder {
+func request(t *testing.T, s *Server, method, path, password string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	var raw []byte
 	if body != nil {
 		raw, _ = json.Marshal(body)
 	}
 	r := httptest.NewRequest(method, path, bytes.NewReader(raw))
-	if token != "" {
-		r.Header.Set("Authorization", "Bearer "+token)
+	if password != "unauthenticated" {
+		if password == "" {
+			password = "secret"
+		}
+		r.SetBasicAuth("alice", password)
 	}
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -366,7 +409,7 @@ func TestSessionSnapshotAndAuthentication(t *testing.T) {
 		{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "hello"},
 		{Type: llm.ItemFunctionCall, CallID: "c1", Name: "execute_command", Args: `{"command":"pwd"}`},
 	}
-	if got := request(t, s, http.MethodGet, "/api/v1/session", "", nil).Code; got != http.StatusUnauthorized {
+	if got := request(t, s, http.MethodGet, "/api/v1/session", "unauthenticated", nil).Code; got != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated status = %d", got)
 	}
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
@@ -375,6 +418,16 @@ func TestSessionSnapshotAndAuthentication(t *testing.T) {
 	s.Handler().ServeHTTP(malformed, r)
 	if malformed.Code != http.StatusUnauthorized {
 		t.Fatalf("malformed authorization status = %d", malformed.Code)
+	}
+	if got := request(t, s, http.MethodGet, "/api/v1/session", "wrong", nil).Code; got != http.StatusUnauthorized {
+		t.Fatalf("wrong password status = %d", got)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	r.SetBasicAuth("unknown", "secret")
+	missingUser := httptest.NewRecorder()
+	s.Handler().ServeHTTP(missingUser, r)
+	if missingUser.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown user status = %d", missingUser.Code)
 	}
 	response := decodeSession(t, request(t, s, http.MethodGet, "/api/v1/session", "secret", nil))
 	if response.APIVersion != 1 || response.Session.AgentID != "main" || response.Session.Model != "model" {
@@ -496,7 +549,7 @@ func TestSessionMessagesCarryDelivery(t *testing.T) {
 		id: "default", name: "Default", createdAt: time.Now(),
 		agent: a, manager: mgr, gate: g, model: "model", channel: "channel",
 	}}}
-	srv, err := New(Config{Listen: "127.0.0.1:0", Sessions: store})
+	srv, err := New(Config{Listen: "127.0.0.1:0", AuthFile: testAuthFile(t), Sessions: store})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,6 +626,119 @@ func TestPendingAgentMessagesAlwaysPresent(t *testing.T) {
 	}
 }
 
+func TestSessionIncludesCompletedReasoning(t *testing.T) {
+	s, a, _ := testServer(t, "")
+	a.mu.Lock()
+	a.history = append(a.history,
+		llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "question"},
+		llm.Item{Type: llm.ItemReasoning, Content: "checking the answer"},
+		llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "answer"},
+	)
+	a.mu.Unlock()
+	w := request(t, s, http.MethodGet, "/api/v1/session", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Messages []struct{ Type, Content string } `json:"messages"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Messages) != 3 || body.Messages[1].Type != "reasoning" || body.Messages[1].Content != "checking the answer" {
+		t.Fatalf("messages = %+v", body.Messages)
+	}
+}
+
+type limitTestTool struct{}
+
+func (limitTestTool) Definition() llm.ToolDefinition                       { return llm.ToolDefinition{Name: "limit_test"} }
+func (limitTestTool) Run(context.Context, json.RawMessage) (string, error) { return "ok", nil }
+
+func TestWebToolLimitDecision(t *testing.T) {
+	h := newHarness(t, "")
+	reg := tools.New()
+	if err := reg.Register(limitTestTool{}); err != nil {
+		t.Fatal(err)
+	}
+	client := &testllm.FakeClient{Script: [][]llm.Event{
+		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemFunctionCall, CallID: "c1", Name: "limit_test", Args: "{}"}}}},
+		{{Type: llm.EventCompleted, Items: []llm.Item{{Type: llm.ItemFunctionCall, CallID: "c2", Name: "limit_test", Args: "{}"}}}},
+	}}
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client, Tools: reg, ToolcallsPerTurn: 1})
+	h.store.list[0].agent = a
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Turn(ctx, "go") }()
+	var pending *agent.ToolLimitRequest
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		pending = a.PendingToolLimit()
+		if pending != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if pending == nil {
+		t.Fatal("tool-limit prompt was not created")
+	}
+	w := request(t, h.server, http.MethodGet, "/api/v1/session", "", nil)
+	var snapshot struct {
+		Pending []agent.ToolLimitRequest `json:"pending_tool_limits"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil || len(snapshot.Pending) != 1 || snapshot.Pending[0].ID != pending.ID {
+		t.Fatalf("snapshot = %+v, err=%v", snapshot, err)
+	}
+	w = request(t, h.server, http.MethodPost, "/api/v1/tool-limits/"+pending.ID, "", map[string]any{
+		"agent_id": "main", "decision": "stop",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("decision status = %d: %s", w.Code, w.Body.String())
+	}
+	if err := <-done; err != nil || a.State() != agent.StateIdle {
+		t.Fatalf("turn err=%v state=%v", err, a.State())
+	}
+}
+
+type liveReasoningClient struct{}
+
+func (liveReasoningClient) Stream(ctx context.Context, _ llm.Request) (<-chan llm.Event, error) {
+	out := make(chan llm.Event, 1)
+	go func() {
+		defer close(out)
+		out <- llm.Event{Type: llm.EventReasoningDelta, Text: "working through it"}
+		<-ctx.Done()
+	}()
+	return out, nil
+}
+
+func TestSessionIncludesLiveReasoning(t *testing.T) {
+	h := newHarness(t, "")
+	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: liveReasoningClient{},
+		ThinkingTimeout: time.Second, RequestTimeout: time.Second})
+	h.store.list[0].agent = a
+	defer a.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Turn(ctx, "go") }()
+	defer func() { cancel(); <-done }()
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if status := a.LiveReasoning(); status != nil && status.Text != "" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	w := request(t, h.server, http.MethodGet, "/api/v1/session", "", nil)
+	var snapshot struct {
+		Live *agent.ReasoningStatus `json:"live_reasoning"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil || snapshot.Live == nil ||
+		!snapshot.Live.Active || snapshot.Live.Text != "working through it" {
+		t.Fatalf("live reasoning = %+v, err=%v", snapshot.Live, err)
+	}
+}
+
 func assertCapability(t *testing.T, caps []any, want string) {
 	t.Helper()
 	for _, c := range caps {
@@ -628,7 +794,7 @@ func TestSubagentSessionAndMessage(t *testing.T) {
 		id: "default", name: "Default", createdAt: time.Now(),
 		agent: top, manager: mgr, gate: gate, model: "main-model", channel: "local",
 	}}}
-	s, err := New(Config{Listen: "127.0.0.1:0", Sessions: store})
+	s, err := New(Config{Listen: "127.0.0.1:0", AuthFile: testAuthFile(t), Sessions: store})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,7 +947,7 @@ func TestSubagentNameFallsBackToID(t *testing.T) {
 		id: "default", name: "Default", createdAt: time.Now(),
 		agent: top, manager: mgr, gate: gate, model: "main-model", channel: "local",
 	}}}
-	s, err := New(Config{Listen: "127.0.0.1:0", Sessions: store})
+	s, err := New(Config{Listen: "127.0.0.1:0", AuthFile: testAuthFile(t), Sessions: store})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +1044,7 @@ func TestCORSIsExplicit(t *testing.T) {
 
 	r = httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
 	r.Header.Set("Origin", "https://evil.example")
-	r.Header.Set("Authorization", "Bearer secret")
+	r.SetBasicAuth("alice", "secret")
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {
@@ -886,13 +1052,13 @@ func TestCORSIsExplicit(t *testing.T) {
 	}
 }
 
-func TestRemoteListenRequiresToken(t *testing.T) {
+func TestAPIRequiresAuthFile(t *testing.T) {
 	s, err := New(Config{Listen: "0.0.0.0:7331", Sessions: &fakeStore{}})
 	if s != nil {
 		_ = s.Close()
 	}
 	if err == nil {
-		t.Fatal("expected token requirement")
+		t.Fatal("expected auth file requirement")
 	}
 	if _, err := New(Config{Listen: "127.0.0.1:0"}); err == nil {
 		t.Fatal("expected session store requirement")
@@ -1238,6 +1404,104 @@ func TestMessagesReflectClosedAndFullSessions(t *testing.T) {
 		"/api/v1/session?session_id=terminated", "", nil))
 	if snapshot.Session.State != "closed" {
 		t.Fatalf("state = %q", snapshot.Session.State)
+	}
+}
+
+func TestSessionChannelSwitchAndValidation(t *testing.T) {
+	h := newHarness(t, "")
+
+	// 1. GET /api/v1/session reports the configured channels, the channel_switch
+	// capability, and the active channel.
+	snapshot := decodeSession(t, request(t, h.server, http.MethodGet, "/api/v1/session", "", nil))
+	if snapshot.Session.Channel != "channel" {
+		t.Fatalf("channel = %q, want channel", snapshot.Session.Channel)
+	}
+	if len(snapshot.Channels) != 2 ||
+		snapshot.Channels[0] != (channelDescriptor{Name: "channel", Type: "ssh"}) ||
+		snapshot.Channels[1] != (channelDescriptor{Name: "local", Type: "local"}) {
+		t.Fatalf("channels = %+v", snapshot.Channels)
+	}
+	var rawCaps struct {
+		Capabilities []any `json:"capabilities"`
+	}
+	w := request(t, h.server, http.MethodGet, "/api/v1/session", "", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &rawCaps); err != nil {
+		t.Fatal(err)
+	}
+	assertCapability(t, rawCaps.Capabilities, "channel_switch")
+
+	// 2. POST /api/v1/session/channel switches the active channel and is echoed
+	// by the handle and by the next session snapshot.
+	w = request(t, h.server, http.MethodPost, "/api/v1/session/channel", "", map[string]string{"channel": "local"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("switch status = %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["channel"] != "local" {
+		t.Fatalf("response channel = %q, want local", payload["channel"])
+	}
+	if got := h.store.list[0].Channel(); got != "local" {
+		t.Fatalf("handle channel = %q, want local", got)
+	}
+	snapshot = decodeSession(t, request(t, h.server, http.MethodGet, "/api/v1/session", "", nil))
+	if snapshot.Session.Channel != "local" {
+		t.Fatalf("follow-up channel = %q, want local", snapshot.Session.Channel)
+	}
+
+	// 3. Validation and method/body handling.
+	validation := []struct {
+		name   string
+		method string
+		body   any
+		status int
+		errMsg string
+	}{
+		{"empty channel", http.MethodPost, map[string]string{"channel": ""},
+			http.StatusBadRequest, "channel must not be empty"},
+		{"unknown channel", http.MethodPost, map[string]string{"channel": "ghost"},
+			http.StatusNotFound, "channel not found"},
+		{"unknown session", http.MethodPost, map[string]string{"channel": "local", "session_id": "ghost"},
+			http.StatusNotFound, "session not found"},
+		{"get", http.MethodGet, nil,
+			http.StatusMethodNotAllowed, "method not allowed"},
+		{"unknown field", http.MethodPost, map[string]string{"channel": "local", "extra": "no"},
+			http.StatusBadRequest, "invalid JSON body"},
+	}
+	for _, tc := range validation {
+		t.Run(tc.name, func(t *testing.T) {
+			w := request(t, h.server, tc.method, "/api/v1/session/channel", "", tc.body)
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.status, w.Body.String())
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["error"] != tc.errMsg {
+				t.Fatalf("error = %q, want %q", payload["error"], tc.errMsg)
+			}
+		})
+	}
+
+	// 4. A closed session refuses the switch.
+	closed := h.addSession(t, "closed", "Closed")
+	closed.mu.Lock()
+	closed.closed = true
+	closed.mu.Unlock()
+	w = request(t, h.server, http.MethodPost, "/api/v1/session/channel", "",
+		map[string]string{"channel": "local", "session_id": "closed"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("closed session status = %d: %s", w.Code, w.Body.String())
+	}
+	var closedPayload map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &closedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if closedPayload["error"] != "session is closed" {
+		t.Fatalf("error = %q, want session is closed", closedPayload["error"])
 	}
 }
 

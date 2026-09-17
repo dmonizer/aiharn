@@ -14,6 +14,7 @@
 # from config.toml.example; neither config.toml nor *.local.toml is committed.
 /config.toml
 /.token
+/.aiharn-users
 *.local.toml
 
 # Editor/OS

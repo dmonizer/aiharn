@@ -122,6 +122,8 @@ type LimitsConfig struct {
 	ToolResultBytes    int64    `toml:"tool_result_bytes"`
 	InboxDepth         int      `toml:"inbox_depth"`
 	EventCapacity      int      `toml:"event_capacity"`
+	ToolcallsPerTurn   int      `toml:"toolcalls_per_turn"`
+	ThinkingTimeout    Duration `toml:"thinking_timeout"`
 	RequestTimeout     Duration `toml:"request_timeout"`
 	TranscriptMaxItems int      `toml:"transcript_max_items"`
 	TranscriptMaxBytes int64    `toml:"transcript_max_bytes"`
@@ -136,7 +138,7 @@ type ApprovalConfig struct {
 // the API disabled and keep the terminal UI enabled.
 type APIConfig struct {
 	Listen       string   `toml:"listen"`
-	Token        string   `toml:"token"`
+	AuthFile     string   `toml:"auth_file"`
 	AllowOrigins []string `toml:"allow_origins"`
 	Only         bool     `toml:"only"`
 	// MaxSessions bounds how many conversation sessions the process may hold,
@@ -175,6 +177,8 @@ const (
 	defaultToolResultBytes    = 65536  // 64 KiB
 	defaultInboxDepth         = 32
 	defaultEventCapacity      = 256
+	defaultToolcallsPerTurn   = 64
+	defaultThinkingTimeout    = 180 * time.Second
 	defaultRequestTimeout     = 60 * time.Second
 	defaultTranscriptMaxItems = 200
 	defaultTranscriptMaxBytes = 1048576 // 1 MiB
@@ -190,6 +194,8 @@ func DefaultLimits() LimitsConfig {
 		ToolResultBytes:    defaultToolResultBytes,
 		InboxDepth:         defaultInboxDepth,
 		EventCapacity:      defaultEventCapacity,
+		ToolcallsPerTurn:   defaultToolcallsPerTurn,
+		ThinkingTimeout:    Duration(defaultThinkingTimeout),
 		RequestTimeout:     Duration(defaultRequestTimeout),
 		TranscriptMaxItems: defaultTranscriptMaxItems,
 		TranscriptMaxBytes: defaultTranscriptMaxBytes,

@@ -200,6 +200,12 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 	if lim.EventCapacity < 0 {
 		errs = append(errs, "limits.event_capacity must be positive")
 	}
+	if lim.ToolcallsPerTurn < 0 {
+		errs = append(errs, "limits.toolcalls_per_turn must be positive")
+	}
+	if lim.ThinkingTimeout < 0 {
+		errs = append(errs, "limits.thinking_timeout must be positive")
+	}
 	if lim.RequestTimeout < 0 {
 		errs = append(errs, "limits.request_timeout must be positive")
 	}
@@ -259,16 +265,16 @@ func validateAPI(errs *[]string, api APIConfig) {
 		*errs = append(*errs, "api.max_sessions must not be negative")
 	}
 	if api.Listen != "" {
-		host, port, err := net.SplitHostPort(api.Listen)
+		if api.AuthFile == "" {
+			*errs = append(*errs, "api.auth_file is required when api.listen is set")
+		}
+		_, port, err := net.SplitHostPort(api.Listen)
 		if err != nil {
 			*errs = append(*errs, fmt.Sprintf("api.listen %q is not a valid host:port address", api.Listen))
 		} else {
 			number, err := strconv.Atoi(port)
 			if err != nil || number < 1 || number > 65535 {
 				*errs = append(*errs, "api.listen port must be between 1 and 65535")
-			}
-			if !isLoopbackHost(host) && api.Token == "" {
-				*errs = append(*errs, "api.token is required when api.listen binds beyond loopback")
 			}
 		}
 	}

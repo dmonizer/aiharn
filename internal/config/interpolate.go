@@ -102,10 +102,10 @@ func interpolate(cfg *Config) error {
 	} else {
 		cfg.API.Listen = v
 	}
-	if v, err := interpolateEnv(cfg.API.Token, lookup); err != nil {
-		return fmt.Errorf("api.token: %w", err)
+	if v, err := interpolateEnv(cfg.API.AuthFile, lookup); err != nil {
+		return fmt.Errorf("api.auth_file: %w", err)
 	} else {
-		cfg.API.Token = v
+		cfg.API.AuthFile = v
 	}
 	for i, origin := range cfg.API.AllowOrigins {
 		v, err := interpolateEnv(origin, lookup)

@@ -88,9 +88,16 @@ func (s *Session) CreatedAt() time.Time { return s.createdAt }
 // Model returns the model config name the session's agents were built with.
 func (s *Session) Model() string { return s.rt.Summary.Model }
 
-// Channel returns the execution channel name the session's agents were built
-// with.
-func (s *Session) Channel() string { return s.rt.Summary.Channel }
+// Channel returns the session's current execution channel name.
+func (s *Session) Channel() string { return s.rt.ChannelName() }
+
+// SetChannel switches the session's active execution channel.
+func (s *Session) SetChannel(ctx context.Context, name string) error {
+	if s.isClosed() {
+		return sessions.ErrClosed
+	}
+	return s.rt.SetChannel(ctx, name)
+}
 
 // Agent returns the session's top-level agent.
 func (s *Session) Agent() sessions.Agent { return s.rt.Agent }
@@ -287,6 +294,15 @@ func NewSessionManager(ctx context.Context, opts SessionManagerOptions) (*Sessio
 func (m *SessionManager) Default() sessions.Handle {
 	h, _ := m.Lookup(m.defaultID)
 	return h
+}
+
+// Channels returns every configured execution channel, in config order.
+func (m *SessionManager) Channels() []sessions.Channel {
+	out := make([]sessions.Channel, 0, len(m.cfg.Channels))
+	for _, c := range m.cfg.Channels {
+		out = append(out, sessions.Channel{Name: c.Name, Type: c.Type})
+	}
+	return out
 }
 
 // DefaultRuntime returns the default session's runtime, for the terminal UI

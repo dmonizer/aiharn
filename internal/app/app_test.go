@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/execution"
+	"aiharn/internal/sessions"
 	testexec "aiharn/internal/testutil/execution"
 	testllm "aiharn/internal/testutil/llm"
 	"aiharn/internal/tools"
@@ -200,6 +202,48 @@ func TestReadSystemPrompt(t *testing.T) {
 	}
 	if _, err := readSystemPrompt(filepath.Join(dir, "missing.md"), ""); err == nil {
 		t.Fatal("expected error for missing prompt")
+	}
+}
+
+func TestChannelControllerSwitch(t *testing.T) {
+	firstSess := testexec.NewSession(nil)
+	secondSess := testexec.NewSession(nil)
+	tc := &transportCache{transports: map[string]execution.Transport{
+		"first":  testexec.NewTransport(firstSess),
+		"second": testexec.NewTransport(secondSess),
+	}}
+	cfg := &config.Config{Channels: []config.ChannelConfig{
+		{Name: "first", Type: config.ChannelTypeLocal},
+		{Name: "second", Type: config.ChannelTypeLocal},
+	}}
+	c, err := newChannelController(context.Background(), cfg, tc, config.AgentConfig{}, "main", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if got := c.Name(); got != "first" {
+		t.Fatalf("initial name = %q, want first", got)
+	}
+	if firstSess.Closed() {
+		t.Fatal("first session closed before switch")
+	}
+
+	if err := c.Set(context.Background(), "second"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Name(); got != "second" {
+		t.Fatalf("name after switch = %q, want second", got)
+	}
+	if !firstSess.Closed() {
+		t.Fatal("first session not closed after switch")
+	}
+	if secondSess.Closed() {
+		t.Fatal("second session closed before use")
+	}
+
+	if err := c.Set(context.Background(), "missing"); !errors.Is(err, sessions.ErrChannelNotFound) {
+		t.Fatalf("Set(unknown) error = %v, want ErrChannelNotFound", err)
 	}
 }
 

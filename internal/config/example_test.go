@@ -35,7 +35,7 @@ func TestConfigExampleShowsDefaults(t *testing.T) {
 	if cfg.Approval.Mode != ApprovalModeAsk {
 		t.Errorf("approval.mode = %q, want %q", cfg.Approval.Mode, ApprovalModeAsk)
 	}
-	if cfg.API.Listen != "" || cfg.API.Token != "" || len(cfg.API.AllowOrigins) != 0 || cfg.API.Only {
+	if cfg.API.Listen != "" || cfg.API.AuthFile != "" || len(cfg.API.AllowOrigins) != 0 || cfg.API.Only {
 		t.Errorf("API should be disabled by default, got %+v", cfg.API)
 	}
 	ssh := cfg.Channels[0]

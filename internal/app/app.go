@@ -81,7 +81,24 @@ type Runtime struct {
 	Agent      *agent.Agent // the top-level agent
 	Gate       *approval.Gate
 	Summary    Summary
+	channel    *channelController
 	transports *transportCache
+}
+
+// ChannelName returns the session's current execution channel name.
+func (r *Runtime) ChannelName() string {
+	if r.channel == nil {
+		return r.Summary.Channel
+	}
+	return r.channel.Name()
+}
+
+// SetChannel switches the active execution channel.
+func (r *Runtime) SetChannel(ctx context.Context, name string) error {
+	if r.channel == nil {
+		return fmt.Errorf("app: session has no switchable execution channel")
+	}
+	return r.channel.Set(ctx, name)
 }
 
 // Close releases all agents (and their sessions), the transports, and the gate.
@@ -90,6 +107,12 @@ func (r *Runtime) Close() error {
 	var errs []error
 	if r.Manager != nil {
 		if err := r.Manager.Shutdown(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	// Close the top-level agent's switchable session before its transport.
+	if r.channel != nil {
+		if err := r.channel.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -102,6 +125,108 @@ func (r *Runtime) Close() error {
 		r.Gate.Close()
 	}
 	return errors.Join(errs...)
+}
+
+// channelController owns one session's switchable execution channel. The
+// top-level agent's execute_command tool delegates to it, so a channel switch
+// changes where future commands run without rebuilding the agent.
+type channelController struct {
+	cfg       *config.Config
+	tc        *transportCache
+	agentCfg  config.AgentConfig // top-level agent config, for working_dir resolution
+	agentType string             // top-level agent type; top-level IDs equal the type
+
+	mu      sync.RWMutex
+	name    string
+	session execution.Session
+	cwd     string
+}
+
+func newChannelController(ctx context.Context, cfg *config.Config, tc *transportCache, agentCfg config.AgentConfig, agentType, name string) (*channelController, error) {
+	c := &channelController{cfg: cfg, tc: tc, agentCfg: agentCfg, agentType: agentType}
+	if err := c.Set(ctx, name); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *channelController) Name() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.name
+}
+
+func (c *channelController) Cwd() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cwd
+}
+
+// Exec implements tools.Executor so the execute_command tool can run through
+// the switchable channel. It holds the read lock for the whole command so a
+// concurrent Set/Close cannot tear down the session mid-command.
+func (c *channelController) Exec(ctx context.Context, cmd string, opts execution.ExecOptions) (execution.Result, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.session == nil {
+		return execution.Result{}, fmt.Errorf("app: no active execution channel")
+	}
+	return c.session.Exec(ctx, cmd, opts)
+}
+
+// Set switches to name. It resolves and opens the new channel first; only on
+// success does it close the previous session, so a failed switch leaves the
+// current channel intact.
+func (c *channelController) Set(ctx context.Context, name string) error {
+	channel, err := selectChannel(c.cfg, "", name)
+	if err != nil {
+		return fmt.Errorf("%w: %v", sessions.ErrChannelNotFound, err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.name == name && c.session != nil {
+		return nil
+	}
+	return c.openLocked(ctx, channel)
+}
+
+// openLocked opens the channel, resolves the default working directory, and
+// swaps it in (closing the previous session). The caller holds the write lock.
+func (c *channelController) openLocked(ctx context.Context, channel config.ChannelConfig) error {
+	transport, err := c.tc.get(channel)
+	if err != nil {
+		return err
+	}
+	session, err := transport.NewSession(ctx)
+	if err != nil {
+		return fmt.Errorf("app: open channel %q session (%s): %w", channel.Name, channelTarget(channel), err)
+	}
+	cwd, err := resolveDefaultCwd(ctx, session, c.agentCfg, channel, c.agentType, c.agentType)
+	if err != nil {
+		session.Close()
+		return err
+	}
+	old := c.session
+	c.name = channel.Name
+	c.session = session
+	c.cwd = cwd
+	if old != nil {
+		_ = old.Close()
+	}
+	return nil
+}
+
+// Close closes the current session. It is idempotent in the sense that a
+// subsequent Close on a nil session returns nil.
+func (c *channelController) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil {
+		return nil
+	}
+	err := c.session.Close()
+	c.session = nil
+	return err
 }
 
 // Build resolves the selected agent, model, and channel; builds the Manager
@@ -166,11 +291,21 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		EventCapacity: cfg.Limits.EventCapacity,
 		SubagentTypes: configuredSubagentTypes(cfg),
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
-			return buildAgent(ctx, cfg, tc, mgr, gate, spec, agentOverrides{}, observer)
+			return buildAgent(ctx, cfg, tc, mgr, gate, spec, agentOverrides{}, observer, nil)
 		},
 	})
 
 	fmt.Fprintf(os.Stderr, "aiharn: connecting to channel %q (%s)...\n", channelCfg.Name, channelTarget(channelCfg))
+
+	controller, err := newChannelController(ctx, cfg, tc, agentCfg, agentType, channelCfg.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			controller.Close()
+		}
+	}()
 
 	top, err := buildAgent(ctx, cfg, tc, mgr, gate, agent.SpawnSpec{
 		ID:            agentType,
@@ -179,7 +314,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		CallerID:      "",
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
-	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel}, observer)
+	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel}, observer, controller)
 	if err != nil {
 		return nil, err
 	}
@@ -199,6 +334,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 			Channel:   channelCfg.Name,
 			Approval:  approvalMode,
 		},
+		channel:    controller,
 		transports: tc,
 	}, nil
 }
@@ -213,7 +349,7 @@ type agentOverrides struct {
 // buildAgent resolves an agent type, model, and channel; opens a dedicated
 // session; reads the system prompt; and constructs a fully-wired Agent whose
 // cleanup closes its session.
-func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver) (*agent.Agent, error) {
+func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController) (*agent.Agent, error) {
 	agentCfg, ok := cfg.Agents[spec.Type]
 	if !ok {
 		return nil, fmt.Errorf("app: agent type %q is not defined", spec.Type)
@@ -232,36 +368,51 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		return nil, err
 	}
 
-	channelCfg, err := selectChannel(cfg, agentCfg.Channel, o.Channel)
-	if err != nil {
-		return nil, err
-	}
-
-	transport, err := tc.get(channelCfg)
-	if err != nil {
-		return nil, err
-	}
-	session, err := transport.NewSession(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("app: open channel %q session (%s): %w", channelCfg.Name, channelTarget(channelCfg), err)
+	var (
+		executor   tools.Executor
+		defaultCwd string
+		cleanup    func()
+	)
+	if channel != nil {
+		executor = channel
+		defaultCwd = channel.Cwd()
+		cleanup = func() {}
+	} else {
+		channelCfg, err := selectChannel(cfg, agentCfg.Channel, o.Channel)
+		if err != nil {
+			return nil, err
+		}
+		transport, err := tc.get(channelCfg)
+		if err != nil {
+			return nil, err
+		}
+		session, err := transport.NewSession(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("app: open channel %q session (%s): %w", channelCfg.Name, channelTarget(channelCfg), err)
+		}
+		executor = session
+		defaultCwd, err = resolveDefaultCwd(ctx, session, agentCfg, channelCfg, spec.Type, spec.ID)
+		if err != nil {
+			session.Close()
+			return nil, err
+		}
+		cleanup = func() { session.Close() }
 	}
 
 	system, err := readSystemPrompt(agentCfg.SystemPrompt, o.PromptFile)
 	if err != nil {
-		session.Close()
+		if cleanup != nil {
+			cleanup()
+		}
 		return nil, err
 	}
 
-	defaultCwd, err := resolveDefaultCwd(ctx, session, agentCfg, channelCfg, spec.Type, spec.ID)
-	if err != nil {
-		session.Close()
-		return nil, err
-	}
-
-	reg, err := buildRegistry(session, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
+	reg, err := buildRegistry(executor, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
 		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, spec.ID, spec.Type)
 	if err != nil {
-		session.Close()
+		if cleanup != nil {
+			cleanup()
+		}
 		return nil, err
 	}
 
@@ -279,13 +430,15 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		CallerID:         spec.CallerID,
 		AllowSubagents:   agentCfg.AllowSubagents,
 		EventCapacity:    spec.EventCapacity,
+		ToolcallsPerTurn: cfg.Limits.ToolcallsPerTurn,
 		InboxCapacity:    spec.InboxCapacity,
 		RequestTimeout:   cfg.Limits.RequestTimeout.Std(),
+		ThinkingTimeout:  cfg.Limits.ThinkingTimeout.Std(),
 		ToolResultBytes:  cfg.Limits.ToolResultBytes,
 		TranscriptItems:  cfg.Limits.TranscriptMaxItems,
 		TranscriptBytes:  cfg.Limits.TranscriptMaxBytes,
 		Observer:         observer,
-		Cleanup:          func() { session.Close() },
+		Cleanup:          cleanup,
 	})
 	return a, nil
 }
@@ -474,11 +627,11 @@ func buildGate(mode string) (*approval.Gate, error) {
 // The session and gate are shared by all built-ins; backend (the Manager) and
 // callerID wire the subagent tools to the runtime. defaultCwd is the directory
 // execute_command falls back to when the model omits one.
-func buildRegistry(session execution.Session, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID, callerType string) (*tools.Registry, error) {
+func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID, callerType string) (*tools.Registry, error) {
 	reg := tools.New()
 	spawnToolEnabled := sel.Mode == config.ToolModeAll || (sel.Mode == config.ToolModeList && slices.Contains(sel.Names, tools.NameSpawnSubagent))
 	all := map[string]tools.Tool{
-		tools.NameExecuteCommand:      tools.ExecuteCommand(session, gate, maxOutput, defaultCwd, commandTimeout, callerID, callerType),
+		tools.NameExecuteCommand:      tools.ExecuteCommand(ex, gate, maxOutput, defaultCwd, commandTimeout, callerID, callerType),
 		tools.NameListSubagentTypes:   tools.ListSubagentTypes(backend, callerID, spawnToolEnabled),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID, callerType),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),

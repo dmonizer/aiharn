@@ -123,6 +123,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Limits.EventCapacity == 0 {
 		cfg.Limits.EventCapacity = d.EventCapacity
 	}
+	if cfg.Limits.ToolcallsPerTurn == 0 {
+		cfg.Limits.ToolcallsPerTurn = d.ToolcallsPerTurn
+	}
+	if cfg.Limits.ThinkingTimeout == 0 {
+		cfg.Limits.ThinkingTimeout = d.ThinkingTimeout
+	}
 	if cfg.Limits.RequestTimeout == 0 {
 		cfg.Limits.RequestTimeout = d.RequestTimeout
 	}

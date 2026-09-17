@@ -42,6 +42,7 @@ func resolveLocalPath(baseDir, p string) string {
 // independent of the process working directory.
 func resolvePaths(cfg *Config, baseDir string) {
 	cfg.AiharnHome = resolveLocalPath(baseDir, cfg.AiharnHome)
+	cfg.API.AuthFile = resolveLocalPath(baseDir, cfg.API.AuthFile)
 	for i := range cfg.Channels {
 		c := &cfg.Channels[i]
 		c.Auth.KeyFile = resolveLocalPath(baseDir, c.Auth.KeyFile)

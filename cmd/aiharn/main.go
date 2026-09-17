@@ -34,26 +34,32 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "add-user" {
+		return runAddUser(args[1:])
+	}
 	fs := flag.NewFlagSet("aiharn", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
 	var (
-		configPath = fs.String("config", "config.toml", "path to the TOML configuration file")
-		agentName  = fs.String("agent", "", "top-level agent type (default \"main\")")
-		promptFile = fs.String("prompt", "", "override the system prompt file")
-		channel    = fs.String("channel", "", "override the execution channel")
-		modelName  = fs.String("model", "", "override the model config")
-		approval   = fs.String("approval", "", "override approval mode (ask | allow-all)")
-		showVer    = fs.Bool("version", false, "print version and exit")
-		debug      = fs.Bool("debug", false, "enable debug logging to stderr")
-		logPath    = fs.String("log", "", "override the session transcript path (JSON Lines); empty disables logging")
-		apiListen  = fs.String("api-listen", "", "serve the current-session API on this address (for example 127.0.0.1:7331)")
-		apiToken   = fs.String("api-token", "", "API bearer token (prefer AIHARN_API_TOKEN)")
-		apiOrigins = fs.String("api-allow-origin", "", "comma-separated frontend origins allowed by CORS")
-		apiOnly    = fs.Bool("api-only", false, "run without the terminal UI (requires --api-listen)")
+		configPath  = fs.String("config", "config.toml", "path to the TOML configuration file")
+		agentName   = fs.String("agent", "", "top-level agent type (default \"main\")")
+		promptFile  = fs.String("prompt", "", "override the system prompt file")
+		channel     = fs.String("channel", "", "override the execution channel")
+		modelName   = fs.String("model", "", "override the model config")
+		approval    = fs.String("approval", "", "override approval mode (ask | allow-all)")
+		showVer     = fs.Bool("version", false, "print version and exit")
+		debug       = fs.Bool("debug", false, "enable debug logging to stderr")
+		logPath     = fs.String("log", "", "override the session transcript path (JSON Lines); empty disables logging")
+		apiListen   = fs.String("api-listen", "", "serve the current-session API on this address (for example 127.0.0.1:7331)")
+		apiAuthFile = fs.String("api-auth-file", "", "path to the API password file")
+		apiOrigins  = fs.String("api-allow-origin", "", "comma-separated frontend origins allowed by CORS")
+		apiOnly     = fs.Bool("api-only", false, "run without the terminal UI (requires --api-listen)")
 	)
 
 	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 	specified := make(map[string]bool)
@@ -76,14 +82,14 @@ func run(args []string) int {
 		return 1
 	}
 	apiCfg := cfg.API
-	if token := os.Getenv("AIHARN_API_TOKEN"); token != "" {
-		apiCfg.Token = token
+	if path := os.Getenv("AIHARN_AUTH_FILE"); path != "" {
+		apiCfg.AuthFile = path
 	}
 	if specified["api-listen"] {
 		apiCfg.Listen = *apiListen
 	}
-	if specified["api-token"] {
-		apiCfg.Token = *apiToken
+	if specified["api-auth-file"] {
+		apiCfg.AuthFile = *apiAuthFile
 	}
 	if specified["api-allow-origin"] {
 		apiCfg.AllowOrigins = commaList(*apiOrigins)
@@ -143,7 +149,7 @@ func run(args []string) int {
 	var api *webapi.Server
 	if apiCfg.Listen != "" {
 		api, err = webapi.New(webapi.Config{
-			Listen: apiCfg.Listen, Token: apiCfg.Token,
+			Listen: apiCfg.Listen, AuthFile: apiCfg.AuthFile,
 			AllowedOrigins: apiCfg.AllowOrigins,
 			Sessions:       sessionsMgr,
 		})

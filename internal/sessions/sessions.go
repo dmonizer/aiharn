@@ -22,6 +22,12 @@ import (
 	"aiharn/internal/llm"
 )
 
+// Channel is one configured execution channel exposed to clients.
+type Channel struct {
+	Name string
+	Type string
+}
+
 // Agent is the slice of a session's top-level agent needed by the remote API.
 // *agent.Agent satisfies it.
 type Agent interface {
@@ -52,6 +58,9 @@ type Handle interface {
 	Submit(ctx context.Context, agentID, content string) error
 	Queued() int
 	LastError() string
+	// SetChannel switches the session's active execution channel for subsequent
+	// commands. The change applies to the session's top-level agent.
+	SetChannel(ctx context.Context, name string) error
 }
 
 // Store owns every session in the process. Implemented by app.SessionManager.
@@ -62,6 +71,8 @@ type Store interface {
 	Lookup(id string) (Handle, bool)
 	Rename(id, name string) (Handle, error)
 	Close(ctx context.Context, id string) error
+	// Channels returns every configured execution channel, in config order.
+	Channels() []Channel
 }
 
 // Transcript is the per-session transcript sink: every history item appended by
@@ -80,13 +91,14 @@ type TranscriptMeta struct {
 // Sentinel errors returned by the session layer. They carry a "session: "
 // prefix, like the agent and webapi packages.
 var (
-	ErrNotFound      = errors.New("session: not found")
-	ErrLimitReached  = errors.New("session: limit reached")
-	ErrClosed        = errors.New("session: closed")
-	ErrQueueFull     = errors.New("session: message queue is full")
-	ErrDefault       = errors.New("session: default session cannot be closed")
-	ErrAgentNotFound = errors.New("session: agent not found")
-	ErrNameInvalid   = errors.New("session: invalid name")
+	ErrNotFound        = errors.New("session: not found")
+	ErrLimitReached    = errors.New("session: limit reached")
+	ErrClosed          = errors.New("session: closed")
+	ErrQueueFull       = errors.New("session: message queue is full")
+	ErrDefault         = errors.New("session: default session cannot be closed")
+	ErrAgentNotFound   = errors.New("session: agent not found")
+	ErrNameInvalid     = errors.New("session: invalid name")
+	ErrChannelNotFound = errors.New("session: channel not found")
 )
 
 // NameLimitBytes bounds a session name.

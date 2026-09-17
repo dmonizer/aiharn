@@ -9,7 +9,6 @@ package webapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,8 +21,11 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
+	"aiharn/internal/authfile"
 	"aiharn/internal/llm"
 	"aiharn/internal/logging"
 	"aiharn/internal/sessions"
@@ -40,7 +42,7 @@ const (
 // listener.
 type Config struct {
 	Listen         string
-	Token          string
+	AuthFile       string
 	AllowedOrigins []string
 	Sessions       sessions.Store
 }
@@ -51,6 +53,7 @@ type Server struct {
 	handler  http.Handler
 	server   *http.Server
 	listener net.Listener
+	users    map[string]string
 
 	wg sync.WaitGroup
 
@@ -67,21 +70,27 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Listen == "" {
 		return nil, errors.New("webapi: listen address is required")
 	}
-	if err := validateListen(cfg.Listen, cfg.Token); err != nil {
+	if err := validateListen(cfg.Listen, cfg.AuthFile); err != nil {
 		return nil, err
+	}
+	users, err := authfile.Load(cfg.AuthFile)
+	if err != nil {
+		return nil, fmt.Errorf("webapi: load API users: %w", err)
 	}
 	if err := validateOrigins(cfg.AllowedOrigins); err != nil {
 		return nil, err
 	}
 
-	s := &Server{cfg: cfg}
+	s := &Server{cfg: cfg, users: users}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/sessions", s.handleSessions)
 	mux.HandleFunc(sessionItemPrefix, s.handleSessionItem)
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
+	mux.HandleFunc("/api/v1/session/channel", s.handleSessionChannel)
 	mux.HandleFunc("/api/v1/messages", s.handleMessages)
 	mux.HandleFunc("/api/v1/approvals/", s.handleApproval)
+	mux.HandleFunc("/api/v1/tool-limits/", s.handleToolLimit)
 	s.handler = s.requestLog(s.securityHeaders(s.cors(s.authenticate(mux))))
 	return s, nil
 }
@@ -151,16 +160,24 @@ func (s *Server) Close() error {
 	return err
 }
 
+type channelDescriptor struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 type sessionResponse struct {
-	APIVersion int     `json:"api_version"`
-	Session    session `json:"session"`
+	APIVersion int                 `json:"api_version"`
+	Session    session             `json:"session"`
+	Channels   []channelDescriptor `json:"channels"`
 	// Agents is always present and always holds at least the top-level agent.
 	// A client must be able to tell "this session has no subagents" apart from
 	// "this server is too old to report agents at all": a stale binary that
 	// omitted this field is what made the web console show only the main agent.
-	Agents           []agentSummary    `json:"agents"`
-	Messages         []message         `json:"messages"`
-	PendingApprovals []approvalRequest `json:"pending_approvals"`
+	Agents            []agentSummary           `json:"agents"`
+	Messages          []message                `json:"messages"`
+	LiveReasoning     *agent.ReasoningStatus   `json:"live_reasoning,omitempty"`
+	PendingApprovals  []approvalRequest        `json:"pending_approvals"`
+	PendingToolLimits []agent.ToolLimitRequest `json:"pending_tool_limits"`
 	// PendingAgentMessages is always present (an empty array, never null): it
 	// lists agent-to-agent messages queued in inboxes but not yet injected into
 	// a history. A polling client has no event stream, so this is how it learns
@@ -293,13 +310,25 @@ const agentMessagesCapability = "agent_messages"
 // server reports a name per agent entry" apart from "this server is too old" and
 // fall back to rendering ids, rather than assuming the name and id match.
 const agentNamesCapability = "agent_names"
+const toolLimitsCapability = "tool_limits"
+const channelSwitchCapability = "channel_switch"
 
 // capabilities returns a fresh slice for each response. A shared backing array
 // would let one caller's mutation leak into another payload, and keeping the
 // list in one place stops GET /api/v1/session and the session descriptors from
 // drifting apart.
 func capabilities() []string {
-	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability}
+	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability}
+}
+
+// channelDescriptors renders every configured execution channel for the wire.
+func (s *Server) channelDescriptors() []channelDescriptor {
+	list := s.cfg.Sessions.Channels()
+	out := make([]channelDescriptor, 0, len(list))
+	for _, c := range list {
+		out = append(out, channelDescriptor{Name: c.Name, Type: c.Type})
+	}
+	return out
 }
 
 // resolve returns the session named by id, or the default session when id is
@@ -400,6 +429,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, sessionResponse{
 		APIVersion: 1,
+		Channels:   s.channelDescriptors(),
 		Session: session{
 			ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
 			AgentID: selected.ID(), AgentType: selected.Type(),
@@ -411,10 +441,81 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		AgentsError:          agentsErr,
 		Capabilities:         capabilities(),
 		Messages:             messagesFromHistory(selected.History()),
+		LiveReasoning:        liveReasoning(selected),
 		PendingApprovals:     approvalsFromGate(handle.Gate().PendingRequests()),
+		PendingToolLimits:    pendingToolLimits(handle, agents),
 		PendingAgentMessages: pendingAgentMessages(handle.Manager()),
 		QueuedMessages:       queued, LastError: lastError,
 	})
+}
+
+func pendingToolLimits(handle sessions.Handle, agents []agentSummary) []agent.ToolLimitRequest {
+	out := make([]agent.ToolLimitRequest, 0)
+	for _, summary := range agents {
+		var a interface {
+			PendingToolLimit() *agent.ToolLimitRequest
+		}
+		if summary.ID == handle.Agent().ID() {
+			a, _ = handle.Agent().(interface {
+				PendingToolLimit() *agent.ToolLimitRequest
+			})
+		} else if handle.Manager() != nil {
+			a = handle.Manager().Agent(summary.ID)
+		}
+		if a != nil {
+			if pending := a.PendingToolLimit(); pending != nil {
+				out = append(out, *pending)
+			}
+		}
+	}
+	return out
+}
+
+func liveReasoning(a sessions.Agent) *agent.ReasoningStatus {
+	if source, ok := a.(interface{ LiveReasoning() *agent.ReasoningStatus }); ok {
+		return source.LiveReasoning()
+	}
+	return nil
+}
+
+func (s *Server) handleToolLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/tool-limits/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "tool-call limit prompt not found")
+		return
+	}
+	var body struct {
+		Decision  string `json:"decision"`
+		SessionID string `json:"session_id"`
+		AgentID   string `json:"agent_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		return
+	}
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	var a interface{ DecideToolLimit(string, string) error }
+	if handle.Agent().ID() == body.AgentID {
+		a, _ = handle.Agent().(interface{ DecideToolLimit(string, string) error })
+	} else if handle.Manager() != nil {
+		a = handle.Manager().Agent(body.AgentID)
+	}
+	if a == nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	if err := a.DecideToolLimit(id, body.Decision); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"resolved": true})
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -648,6 +749,42 @@ func (s *Server) handleSessionApproval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"mode": gate.Mode().String()})
 }
 
+// handleSessionChannel switches a session's active execution channel.
+func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var body struct {
+		Channel   string `json:"channel"`
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		return
+	}
+	if body.Channel == "" {
+		writeError(w, http.StatusBadRequest, "channel must not be empty")
+		return
+	}
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if err := handle.SetChannel(r.Context(), body.Channel); err != nil {
+		switch {
+		case errors.Is(err, sessions.ErrChannelNotFound):
+			writeError(w, http.StatusNotFound, "channel not found")
+		case errors.Is(err, sessions.ErrClosed):
+			writeError(w, http.StatusConflict, "session is closed")
+		default:
+			writeError(w, http.StatusBadGateway, "cannot change channel: "+err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"channel": handle.Channel()})
+}
+
 // decodeOptionalJSON decodes an optional single JSON object. An empty body is
 // not an error, so POST /sessions needs no body.
 func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) error {
@@ -675,6 +812,8 @@ func messagesFromHistory(history []llm.Item) []message {
 			m.Type, m.Arguments = "tool_call", parseJSON(item.Args)
 		case llm.ItemFunctionCallOutput:
 			m.Type = "tool_result"
+		case llm.ItemReasoning:
+			m.Type = "reasoning"
 		default:
 			continue
 		}
@@ -739,15 +878,12 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.Token != "" {
-			authorization := r.Header.Get("Authorization")
-			provided := strings.TrimPrefix(authorization, "Bearer ")
-			if !strings.HasPrefix(authorization, "Bearer ") || len(provided) != len(s.cfg.Token) ||
-				subtle.ConstantTimeCompare([]byte(provided), []byte(s.cfg.Token)) != 1 {
-				w.Header().Set("WWW-Authenticate", "Bearer")
-				writeError(w, http.StatusUnauthorized, "authentication required")
-				return
-			}
+		username, password, ok := r.BasicAuth()
+		hash := s.users[username]
+		if !ok || hash == "" || bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Aiharn API", charset="UTF-8"`)
+			writeError(w, http.StatusUnauthorized, "invalid username or password")
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -835,17 +971,13 @@ func (s *Server) requestLog(next http.Handler) http.Handler {
 	})
 }
 
-func validateListen(address, token string) error {
-	host, _, err := net.SplitHostPort(address)
+func validateListen(address, authFile string) error {
+	_, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("webapi: invalid listen address %q: %w", address, err)
 	}
-	loopback := host == "localhost" || strings.HasSuffix(host, ".localhost")
-	if ip := net.ParseIP(host); ip != nil {
-		loopback = ip.IsLoopback()
-	}
-	if !loopback && token == "" {
-		return errors.New("webapi: a token is required when listening beyond loopback")
+	if authFile == "" {
+		return errors.New("webapi: an auth file is required when the API is enabled")
 	}
 	return nil
 }

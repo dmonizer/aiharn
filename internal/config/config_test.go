@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -232,13 +233,13 @@ func TestValidateReasoningOptions(t *testing.T) {
 func TestLoadAPIConfig(t *testing.T) {
 	t.Setenv("TEST_API_KEY", "model-secret")
 	t.Setenv("TEST_API_LISTEN", "127.0.0.1:7331")
-	t.Setenv("TEST_API_TOKEN", "remote-secret")
+	t.Setenv("TEST_API_AUTH_FILE", "users.txt")
 	t.Setenv("TEST_API_ORIGIN", "https://console.example")
 	path := setup(t, validConfig+`
 
 [api]
 listen = "${TEST_API_LISTEN}"
-token = "${TEST_API_TOKEN}"
+auth_file = "${TEST_API_AUTH_FILE}"
 allow_origins = ["${TEST_API_ORIGIN}", "https://backup.example"]
 only = true
 max_sessions = 4
@@ -251,8 +252,8 @@ max_sessions = 4
 	if cfg.API.Listen != "127.0.0.1:7331" {
 		t.Fatalf("API.Listen = %q", cfg.API.Listen)
 	}
-	if cfg.API.Token != "remote-secret" {
-		t.Fatalf("API.Token was not interpolated")
+	if cfg.API.AuthFile != filepath.Join(filepath.Dir(path), "users.txt") {
+		t.Fatalf("API.AuthFile = %q, want path relative to config", cfg.API.AuthFile)
 	}
 	if len(cfg.API.AllowOrigins) != 2 ||
 		cfg.API.AllowOrigins[0] != "https://console.example" {
@@ -311,6 +312,20 @@ func TestLoadInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestThinkingAndResponseTimeouts(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	body := strings.Replace(validConfig, `command_timeout = "45s"`, `command_timeout = "45s"
+thinking_timeout = "3m"
+request_timeout = "75s"`, 1)
+	cfg, err := Load(setup(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.ThinkingTimeout.Std() != 3*time.Minute || cfg.Limits.RequestTimeout.Std() != 75*time.Second {
+		t.Fatalf("timeouts = thinking %s, response %s", cfg.Limits.ThinkingTimeout.Std(), cfg.Limits.RequestTimeout.Std())
+	}
+}
+
 func TestDurationIntegerOverflow(t *testing.T) {
 	var d Duration
 	if err := d.UnmarshalTOML(int64(^uint64(0) >> 1)); err == nil {
@@ -329,11 +344,11 @@ func TestExpandTilde(t *testing.T) {
 }
 
 func TestLoadInvalidTools(t *testing.T) {
-	body := strings.Replace(validConfig, `tools = "all"`, `tools = "sometimes"`, 1)
+	body := strings.Replace(validConfig, `tools = "all"`, `tools = "execute_command,,spawn_subagent"`, 1)
 	path := setup(t, body)
 	t.Setenv("TEST_API_KEY", "x")
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "tools must be") {
+	if err == nil || !strings.Contains(err.Error(), "empty name") {
 		t.Fatalf("Load error = %v, want tools error", err)
 	}
 }
@@ -373,7 +388,7 @@ func TestValidateReferences(t *testing.T) {
 			return strings.Replace(s, `channel = "devbox"`, `channel = "nope"`, 1)
 		}, "is not defined"},
 		{"unknown tool", func(s string) string {
-			return strings.Replace(s, `tools = "all"`, `tools = ["mystery_tool"]`, 1)
+			return strings.Replace(s, `tools = "all"`, `tools = "execute_command,mystery_tool"`, 1)
 		}, "unknown tool"},
 		{"unsupported provider", func(s string) string {
 			return strings.Replace(s, `provider = "openai_responses"`, `provider = "anthropic"`, 1)
@@ -408,6 +423,7 @@ func TestValidateAPIConfig(t *testing.T) {
 			name: "loopback",
 			api: APIConfig{
 				Listen:       "127.0.0.1:7331",
+				AuthFile:     "users.txt",
 				AllowOrigins: []string{"https://console.example"},
 			},
 		},
@@ -422,22 +438,22 @@ func TestValidateAPIConfig(t *testing.T) {
 			wantErr: "api.listen",
 		},
 		{
-			name:    "remote without token",
+			name:    "remote without auth file",
 			api:     APIConfig{Listen: "0.0.0.0:7331"},
-			wantErr: "api.token is required",
+			wantErr: "api.auth_file is required",
 		},
 		{
 			name:    "negative max sessions",
-			api:     APIConfig{Listen: "127.0.0.1:7331", MaxSessions: -1},
+			api:     APIConfig{Listen: "127.0.0.1:7331", AuthFile: "users.txt", MaxSessions: -1},
 			wantErr: "api.max_sessions must not be negative",
 		},
 		{
 			name: "max sessions accepted",
-			api:  APIConfig{Listen: "127.0.0.1:7331", MaxSessions: 4},
+			api:  APIConfig{Listen: "127.0.0.1:7331", AuthFile: "users.txt", MaxSessions: 4},
 		},
 		{
 			name:    "invalid origin",
-			api:     APIConfig{Listen: "127.0.0.1:7331", AllowOrigins: []string{"https://console.example/path"}},
+			api:     APIConfig{Listen: "127.0.0.1:7331", AuthFile: "users.txt", AllowOrigins: []string{"https://console.example/path"}},
 			wantErr: "api.allow_origins[0]",
 		},
 	}
@@ -646,18 +662,14 @@ func TestRedacted(t *testing.T) {
 	agentCfg.WorkingDir = &wd
 	cfg.Agents["planner"] = agentCfg
 	cfg.API = APIConfig{
-		Token: "remote-secret", AllowOrigins: []string{"https://console.example"},
+		AuthFile: "users.txt", AllowOrigins: []string{"https://console.example"},
 	}
 	r := cfg.Redacted()
 	if got := r.Models["opus_via_openrouter"].APIKey; got == "supersecret" || got == "" {
 		t.Errorf("Redacted APIKey = %q, want masked marker", got)
 	}
-	if r.API.Token != "***" {
-		t.Errorf("Redacted API token = %q, want masked marker", r.API.Token)
-	}
 	if strings.Contains(strings.Join([]string{
 		r.Models["opus_via_openrouter"].APIKey,
-		r.API.Token,
 	}, ""), "secret") {
 		t.Errorf("Redacted config still contains secret")
 	}
@@ -707,5 +719,34 @@ func TestToolSelectionUnmarshal(t *testing.T) {
 	sel := cfg.Agents["planner"].Tools
 	if sel.Mode != ToolModeList || len(sel.Names) != 2 {
 		t.Errorf("ToolSelection = %+v, want list of 2", sel)
+	}
+}
+
+func TestToolSelectionStringAndArray(t *testing.T) {
+	for _, tc := range []struct {
+		value, mode string
+		names       []string
+	}{
+		{`"ALL"`, ToolModeAll, nil},
+		{`"NONE"`, ToolModeNone, nil},
+		{`["ALL"]`, ToolModeAll, nil},
+		{`["NONE"]`, ToolModeNone, nil},
+		{`"execute_command, spawn_subagent"`, ToolModeList, []string{"execute_command", "spawn_subagent"}},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("TEST_API_KEY", "x")
+			body := strings.Replace(validConfig, `tools = "all"`, `tools = `+tc.value, 1)
+			cfg, err := Load(setup(t, body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sel := cfg.Agents["planner"].Tools
+			if sel.Mode != tc.mode || !slices.Equal(sel.Names, tc.names) {
+				t.Fatalf("tools = %+v", sel)
+			}
+			if err := Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true, "spawn_subagent": true}}); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
 	}
 }
