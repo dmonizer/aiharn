@@ -72,6 +72,17 @@ func (m *Model) approvalPrompt() string {
 	if len(m.approvals) > 0 {
 		second += fmt.Sprintf(" (%d queued)", len(m.approvals))
 	}
+	// Both prompt rows must fit the terminal: the options row is a fixed
+	// string, so on a very narrow terminal it would otherwise render two
+	// columns wider than the screen. Clamping the preview line also drops the
+	// (now unaddressable) preview link.
+	if m.width > 0 {
+		if clamped := truncateToColumns(first, m.width); clamped != first {
+			m.approvalLinkHit = approvalHit{}
+			first = clamped
+		}
+		second = truncateToColumns(second, m.width)
+	}
 	return first + "\n" + second
 }
 
@@ -94,7 +105,9 @@ func (m *Model) approvalGeometry() (boxWidth, boxHeight, contentWidth, contentRo
 	if contentWidth < 1 {
 		contentWidth = 1
 	}
-	full := strings.ReplaceAll(sanitizeTerminalText(m.pending.Command), "\t", "    ")
+	// sanitizeTerminalText already expands tabs to tabWidth columns, so the
+	// preview measures exactly the columns it renders.
+	full := sanitizeTerminalText(m.pending.Command)
 	wrapped = wrapLine(full, contentWidth)
 	if len(wrapped) == 0 {
 		wrapped = []string{""}

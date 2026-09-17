@@ -7,7 +7,6 @@ import (
 
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/rivo/uniseg"
 
 	"aiharn/internal/llm"
 	"aiharn/internal/tools"
@@ -113,7 +112,9 @@ func (m *Model) rebuildShellFlat() {
 		m.shellFlat = append(m.shellFlat, "$ "+c.command+status)
 		m.shellRowCmd = append(m.shellRowCmd, i)
 		for _, ol := range strings.Split(c.output, "\n") {
-			m.shellFlat = append(m.shellFlat, ol)
+			// Command output is untrusted: strip control sequences and expand
+			// tabs so each row's measured width matches what it renders.
+			m.shellFlat = append(m.shellFlat, sanitizeTerminalText(ol))
 			m.shellRowCmd = append(m.shellRowCmd, -1)
 		}
 	}
@@ -493,22 +494,9 @@ func normalizeCommand(s string) string {
 }
 
 // truncateToColumns cuts s to at most max grapheme columns, appending an
-// ellipsis when truncated.
+// ellipsis when anything is dropped. The ellipsis is charged to the budget, so
+// the result never exceeds max; charging it afterwards is what let narrow roster
+// rows render one column too wide.
 func truncateToColumns(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	var b strings.Builder
-	w := 0
-	gr := uniseg.NewGraphemes(s)
-	for gr.Next() {
-		g := gr.Str()
-		gw := uniseg.StringWidth(g)
-		if w+gw > max {
-			return b.String() + "…"
-		}
-		b.WriteString(g)
-		w += gw
-	}
-	return b.String()
+	return truncateDisplay(s, max)
 }

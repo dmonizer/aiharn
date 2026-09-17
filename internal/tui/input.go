@@ -41,16 +41,38 @@ func newTextarea(shortcuts config.ShortcutsConfig) textarea.Model {
 	return ta
 }
 
+// tabWidth is the number of columns a tab is expanded to. Both uniseg and
+// lipgloss measure a tab as ZERO columns, while a terminal advances the cursor
+// to its next tab stop: a tab therefore makes measured and rendered widths
+// disagree, and the rendered width depends on the column the tab starts in,
+// which nothing here can know. Expanding tabs to a fixed width when text enters
+// the display makes the two agree for the transcript, streamed text, tool
+// output, the shell pane, and the approval preview alike. Four columns matches
+// the expansion the approval preview has always used, and the input widget
+// (bubbles' textarea) already expands tabs the same way before they are
+// displayed, so every row the TUI builds agrees with what the terminal shows.
+const tabWidth = 4
+
+// expandTabs replaces every tab with tabWidth spaces, preserving indentation as
+// visible columns instead of dropping it.
+func expandTabs(s string) string {
+	if !strings.ContainsRune(s, '\t') {
+		return s
+	}
+	return strings.ReplaceAll(s, "\t", strings.Repeat(" ", tabWidth))
+}
+
 // sanitizeTerminalText removes terminal control sequences from untrusted model,
-// tool, and remote-command text while preserving normal whitespace. In
-// particular ESC and C1 controls must never reach the user's terminal.
+// tool, and remote-command text while preserving normal whitespace, and expands
+// tabs so the display width of the result can be measured. In particular ESC and
+// C1 controls must never reach the user's terminal.
 func sanitizeTerminalText(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' || unicode.IsPrint(r) {
+	return expandTabs(strings.Map(func(r rune) rune {
+		if r == '\n' || unicode.IsPrint(r) {
 			return r
 		}
 		return -1
-	}, s)
+	}, s))
 }
 
 func sanitizeTerminalLine(s string) string {

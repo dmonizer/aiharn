@@ -153,6 +153,12 @@ func framePane(content []string, width, rows int) string {
 		if i-1 < len(content) {
 			text = content[i-1]
 		}
+		// A row must never be wider than the pane that frames it: an over-wide
+		// row soft-wraps in the terminal and corrupts the renderer's cursor
+		// accounting, which interleaves successive frames on the same rows.
+		if lipgloss.Width(text) > innerWidth {
+			text = truncateDisplay(text, innerWidth)
+		}
 		pad := innerWidth - lipgloss.Width(text)
 		if pad < 0 {
 			pad = 0
@@ -348,10 +354,15 @@ func truncateStatus(s string, width int) string {
 // wrapLine hard-wraps s into visual rows no wider than width grapheme columns,
 // preserving explicit newlines. Long lines never overflow the pane width, which
 // keeps the fixed-height layout intact and the newest output visible.
+//
+// Tabs are expanded first so a tab is measured as the columns a terminal will
+// actually use, and each row is trimmed as a last resort in case a single
+// grapheme cluster is wider than width: no returned row can exceed width.
 func wrapLine(s string, width int) []string {
 	if width <= 0 {
 		return strings.Split(s, "\n")
 	}
+	s = expandTabs(s)
 	var out []string
 	for _, para := range strings.Split(s, "\n") {
 		if para == "" {
@@ -365,14 +376,81 @@ func wrapLine(s string, width int) []string {
 			g := gr.Str()
 			gw := uniseg.StringWidth(g)
 			if curW+gw > width && curW > 0 {
-				out = append(out, cur.String())
+				out = append(out, truncateDisplay(cur.String(), width))
 				cur.Reset()
 				curW = 0
 			}
 			cur.WriteString(g)
 			curW += gw
 		}
-		out = append(out, cur.String())
+		out = append(out, truncateDisplay(cur.String(), width))
 	}
 	return out
+}
+
+// truncateDisplay cuts s to at most max display columns without splitting a
+// grapheme cluster, appending an ellipsis and, for styled input, a reset when
+// anything is dropped: the result is never wider than max. Unlike
+// uniseg.StringWidth it ignores ANSI escape sequences, which occupy no columns,
+// so it is safe on text that has already been through styleLine.
+func truncateDisplay(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= max {
+		return s
+	}
+	var b strings.Builder
+	used, limit := 0, max-1 // reserve one column for the ellipsis
+	styled, cut := false, false
+	for i := 0; i < len(s) && !cut; {
+		if s[i] == 0x1b {
+			end := ansiEnd(s, i)
+			b.WriteString(s[i:end])
+			styled = true
+			i = end
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] != 0x1b {
+			j++
+		}
+		gr := uniseg.NewGraphemes(s[i:j])
+		for gr.Next() {
+			g := gr.Str()
+			w := uniseg.StringWidth(g)
+			if used+w > limit {
+				cut = true
+				break
+			}
+			b.WriteString(g)
+			used += w
+		}
+		i = j
+	}
+	b.WriteString("\u2026")
+	if styled {
+		b.WriteString("\x1b[0m")
+	}
+	return b.String()
+}
+
+// ansiEnd returns the index just past the ANSI escape sequence starting at i,
+// or the end of the string when the sequence is unterminated.
+func ansiEnd(s string, i int) int {
+	j := i + 1
+	if j >= len(s) {
+		return len(s)
+	}
+	if s[j] != '[' {
+		return j + 1
+	}
+	j++
+	for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+		j++
+	}
+	if j < len(s) {
+		j++
+	}
+	return j
 }
