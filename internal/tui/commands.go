@@ -22,13 +22,13 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 	case "/quit", "/exit":
 		m.cancel()
 		return tea.Quit
-	case "/skill":
+	case "/skill", "/skills":
 		return m.handleSkill(fields)
 	case "/help", "/":
 		m.appendLine(kindPlain, "available commands:")
 		m.appendLine(kindPlain, "  /help - show this help")
 		m.appendLine(kindPlain, "  /quit - quit")
-		m.appendLine(kindPlain, "  /skill - list installed skills; /skill install <url> to install one")
+		m.appendLine(kindPlain, "  /skill (or /skills) - list installed skills; /skill install <url> to install one")
 		m.appendLine(kindPlain, "keys:")
 		m.appendLine(kindPlain, "  up/down - previous prompts")
 		m.appendLine(kindPlain, "  esc (including ctrl+esc) - stop all requests while active; double esc clears input while idle")

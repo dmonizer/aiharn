@@ -181,3 +181,34 @@ func TestSkillCommandUsage(t *testing.T) {
 		t.Fatalf("expected usage message, last line = %q", m.lines[len(m.lines)-1].text)
 	}
 }
+
+func TestSkillCommandPluralAlias(t *testing.T) {
+	m := newTestModel(t)
+	home := t.TempDir()
+	m.aiharnHome = home
+	path := filepath.Join(home, "skills", "a", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/skills")})
+	m, cmd := upd(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || m.running || len(m.queue) != 0 {
+		t.Fatalf("/skills leaked a turn: running=%v cmd=%v queue=%v", m.running, cmd != nil, m.queue)
+	}
+	header, a := false, false
+	for _, ln := range m.lines {
+		if strings.Contains(ln.text, "installed skills:") {
+			header = true
+		}
+		if strings.Contains(ln.text, "  a") {
+			a = true
+		}
+	}
+	if !header || !a {
+		t.Fatalf("expected /skills to list installed skills: %+v", m.lines)
+	}
+}
