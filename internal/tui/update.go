@@ -357,8 +357,14 @@ func (m *Model) submitInput() tea.Cmd {
 	}
 	m.pushHistory(line)
 	m.draft = ""
+	return m.sendToCurrentAgent(line)
+}
+
+// sendToCurrentAgent routes one human-authored line to the focused agent. When
+// a subagent is focused the line is forwarded to it directly; otherwise it is
+// queued for the top-level agent's next turn.
+func (m *Model) sendToCurrentAgent(line string) tea.Cmd {
 	if m.agent != nil && m.focusedID != "" && m.focusedID != m.agent.ID() {
-		// A person typed this line into the focused subagent, so it is human-authored.
 		if err := m.manager.SendSubagentMessage(m.ctx, m.agent.ID(), m.focusedID, line, llm.OriginHuman); err != nil {
 			m.appendLine(kindError, "send to subagent: "+err.Error())
 		} else {

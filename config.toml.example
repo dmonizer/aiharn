@@ -10,7 +10,9 @@
 # Skills live under <aiharn_home>/skills/. A system prompt file may reference
 # ${SKILLS_INDEX}, which is replaced with the contents of
 # <aiharn_home>/skills/index.md (capped at 4 MiB). The skills/ directory is
-# optional and only needed if you reference it.
+# optional and only needed if you reference it. The /skill install TUI command
+# reads <aiharn_home>/prompts/skill-install.md, expands ${URL} and
+# ${SKILLS_DIR}, and sends the result to the focused agent.
 
 # TUI shortcut defaults. Change any value to remap that action.
 # Keys: f1-f12, ctrl+letter, alt+letter, or ctrl+arrow. Ctrl+C is reserved.

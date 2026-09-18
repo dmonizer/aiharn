@@ -173,11 +173,12 @@ func run(args []string) int {
 	}
 
 	p := tea.NewProgram(tui.New(rt.Manager, rt.Agent, rt.Gate, tui.Status{
-		Model:     rt.Summary.Model,
-		AgentType: rt.Summary.AgentType,
-		Channel:   rt.Summary.Channel,
-		Approval:  rt.Summary.Approval,
-		Shortcuts: cfg.Shortcuts,
+		Model:      rt.Summary.Model,
+		AgentType:  rt.Summary.AgentType,
+		Channel:    rt.Summary.Channel,
+		Approval:   rt.Summary.Approval,
+		Shortcuts:  cfg.Shortcuts,
+		AiharnHome: cfg.AiharnHome,
 	}), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)

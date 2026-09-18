@@ -23,11 +23,12 @@ import (
 
 // Status is the immutable startup-banner content shown in the status bar.
 type Status struct {
-	Model     string // model config name
-	AgentType string
-	Channel   string
-	Approval  string // initial approval mode
-	Shortcuts config.ShortcutsConfig
+	Model      string // model config name
+	AgentType  string
+	Channel    string
+	Approval   string // initial approval mode
+	Shortcuts  config.ShortcutsConfig
+	AiharnHome string // local data directory for skills and prompts
 }
 
 // lineKind discriminates a transcript line for color styling.
@@ -55,11 +56,12 @@ type line struct {
 
 // Model is the Bubbletea root model.
 type Model struct {
-	manager   *agent.Manager
-	agent     *agent.Agent // top-level agent; focusedID selects the displayed context
-	gate      *approval.Gate
-	status    Status
-	shortcuts config.ShortcutsConfig
+	manager    *agent.Manager
+	agent      *agent.Agent // top-level agent; focusedID selects the displayed context
+	gate       *approval.Gate
+	status     Status
+	shortcuts  config.ShortcutsConfig
+	aiharnHome string // local data directory for skills and prompts
 
 	lines    []line // flushed transcript lines, oldest first
 	curText  []byte // streamed text not yet flushed to a line
@@ -129,18 +131,19 @@ type Model struct {
 func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Model{
-		manager:   mgr,
-		agent:     top,
-		gate:      g,
-		status:    status,
-		shortcuts: status.Shortcuts.WithDefaults(),
-		ctx:       ctx,
-		cancel:    cancel,
-		inputMax:  defaultInputHeight,
-		views:     make(map[string]agentView),
-		bridged:   make(map[string]bool),
-		hoverX:    -1,
-		hoverY:    -1,
+		manager:    mgr,
+		agent:      top,
+		gate:       g,
+		status:     status,
+		shortcuts:  status.Shortcuts.WithDefaults(),
+		aiharnHome: status.AiharnHome,
+		ctx:        ctx,
+		cancel:     cancel,
+		inputMax:   defaultInputHeight,
+		views:      make(map[string]agentView),
+		bridged:    make(map[string]bool),
+		hoverX:     -1,
+		hoverY:     -1,
 	}
 	if top != nil {
 		m.focusedID = top.ID()
