@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"slices"
 	"sort"
@@ -25,6 +24,7 @@ import (
 	"aiharn/internal/llm/chatcompletions"
 	"aiharn/internal/llm/responses"
 	"aiharn/internal/sessions"
+	"aiharn/internal/skills"
 	"aiharn/internal/tools"
 )
 
@@ -399,7 +399,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		cleanup = func() { session.Close() }
 	}
 
-	system, err := readSystemPrompt(agentCfg.SystemPrompt, o.PromptFile)
+	system, err := readSystemPrompt(agentCfg.SystemPrompt, o.PromptFile, cfg.AiharnHome)
 	if err != nil {
 		if cleanup != nil {
 			cleanup()
@@ -687,23 +687,22 @@ func configuredSubagentTypes(cfg *config.Config) []tools.SubagentType {
 	return types
 }
 
-func readSystemPrompt(configPath, overridePath string) (string, error) {
+func readSystemPrompt(configPath, overridePath, aiharnHome string) (string, error) {
 	p := configPath
 	if overridePath != "" {
 		p = overridePath
 	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return "", fmt.Errorf("app: read system prompt %s: %w", p, err)
+	}
+	expanded, err := skills.Expand(string(raw), aiharnHome)
+	if err != nil {
+		return "", fmt.Errorf("app: expand system prompt %s: %w", p, err)
+	}
 	const maxSystemPromptBytes = 4 << 20
-	f, err := os.Open(p)
-	if err != nil {
-		return "", fmt.Errorf("app: read system prompt %s: %w", p, err)
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, maxSystemPromptBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("app: read system prompt %s: %w", p, err)
-	}
-	if len(b) > maxSystemPromptBytes {
+	if len(expanded) > maxSystemPromptBytes {
 		return "", fmt.Errorf("app: system prompt %s exceeds %d-byte limit", p, maxSystemPromptBytes)
 	}
-	return string(b), nil
+	return expanded, nil
 }

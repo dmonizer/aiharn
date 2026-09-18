@@ -7,6 +7,10 @@
 # Default: the user's home directory (~). Transcripts go under ~/transcripts/.
 # aiharn_home = "~"
 # Example override: aiharn_home = "~/.local/share/aiharn"
+# Skills live under <aiharn_home>/skills/. A system prompt file may reference
+# ${SKILLS_INDEX}, which is replaced with the contents of
+# <aiharn_home>/skills/index.md (capped at 4 MiB). The skills/ directory is
+# optional and only needed if you reference it.
 
 # TUI shortcut defaults. Change any value to remap that action.
 # Keys: f1-f12, ctrl+letter, alt+letter, or ctrl+arrow. Ctrl+C is reserved.
@@ -74,6 +78,7 @@ default_shell = "/bin/bash"
 model = "zai_glm"     # required; validated at startup
 # description = "" # default: empty; shown by list_subagent_types when provided
 description = "General coordinator; delegates planning and operator tasks"
+# This file may contain ${SKILLS_INDEX}, expanded from <aiharn_home>/skills/index.md.
 system_prompt = "prompts/main_pentester.md"
 # channel = "" # default: first channel; explicit "sf" is equivalent here
 channel = "sf"

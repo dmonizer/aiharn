@@ -192,16 +192,38 @@ func TestReadSystemPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := readSystemPrompt(cfgPrompt, "")
+	got, err := readSystemPrompt(cfgPrompt, "", dir)
 	if err != nil || got != "from config" {
 		t.Fatalf("config path: %q, %v", got, err)
 	}
-	got, err = readSystemPrompt(cfgPrompt, overridePrompt)
+	got, err = readSystemPrompt(cfgPrompt, overridePrompt, dir)
 	if err != nil || got != "from override" {
 		t.Fatalf("override path: %q, %v", got, err)
 	}
-	if _, err := readSystemPrompt(filepath.Join(dir, "missing.md"), ""); err == nil {
+	if _, err := readSystemPrompt(filepath.Join(dir, "missing.md"), "", dir); err == nil {
 		t.Fatal("expected error for missing prompt")
+	}
+}
+
+func TestReadSystemPromptExpandsSkillsIndex(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "skills"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skills", "index.md"), []byte("index contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prompt := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(prompt, []byte("before ${SKILLS_INDEX} after"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readSystemPrompt(prompt, "", dir)
+	if err != nil {
+		t.Fatalf("readSystemPrompt: %v", err)
+	}
+	if want := "before index contents after"; got != want {
+		t.Fatalf("readSystemPrompt = %q, want %q", got, want)
 	}
 }
 
