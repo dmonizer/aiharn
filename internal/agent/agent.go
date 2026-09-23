@@ -69,6 +69,10 @@ const (
 	EventAgentMessage
 	EventTimeout
 	EventToolLimit
+	// EventToolLimitResolved reports that a tool-call-limit prompt was decided
+	// (by any client). It is appended last so existing EventType values stay
+	// stable.
+	EventToolLimitResolved
 )
 
 // Event is a single streamed event emitted by an agent for live display.
@@ -1109,9 +1113,10 @@ func (a *Agent) emit(e Event) {
 	select {
 	case a.events <- e:
 	default:
-		if e.Type == EventToolLimit {
-			// A full stream buffer must not hide the decision that unblocks this
-			// turn. Drop one older display event to make room for the prompt.
+		if e.Type == EventToolLimit || e.Type == EventToolLimitResolved {
+			// A full stream buffer must not hide a decision that unblocks this
+			// turn (or the notice that another client already unblocked it).
+			// Drop one older display event to make room for the prompt.
 			select {
 			case <-a.events:
 			default:

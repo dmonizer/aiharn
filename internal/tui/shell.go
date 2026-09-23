@@ -54,8 +54,13 @@ var (
 	styleShellBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
 )
 
+// toolCallText renders a non-execute tool call as a single transcript line.
+func toolCallText(call llm.Item) string {
+	return sanitizeTerminalText(fmt.Sprintf("[tool] %s %s", call.Name, call.Args))
+}
+
 // appendToolCall records a tool call. execute_command becomes a clickable shell
-// command; every other tool is rendered as a plain tool line.
+// command; every other tool call is coalesced into a collapsible tool-call group line.
 func (m *Model) appendToolCall(call llm.Item) {
 	if call.Name == tools.NameExecuteCommand {
 		cmd := shellCmd{id: call.CallID, command: normalizeCommand(extractCommand(call.Args))}
@@ -70,7 +75,32 @@ func (m *Model) appendToolCall(call llm.Item) {
 		m.followShell()
 		return
 	}
-	m.appendLine(kindTool, fmt.Sprintf("[tool] %s %s", call.Name, call.Args))
+	m.appendToolCallLine(call)
+}
+
+// appendToolCallLine records a non-execute tool call, coalescing a
+// consecutive run into a single collapsible group line.
+func (m *Model) appendToolCallLine(call llm.Item) {
+	m.flushText()
+	if n := len(m.lines); n > 0 {
+		last := &m.lines[n-1]
+		if last.kind == kindToolGroup {
+			last.calls = append(last.calls, call)
+			m.trimLines()
+			return
+		}
+	}
+	m.nextToolGroupID++
+	m.lines = append(m.lines, line{kind: kindToolGroup, groupID: m.nextToolGroupID, calls: []llm.Item{call}})
+	m.trimLines()
+}
+
+// toggleToolGroup flips the expanded/collapsed state of a tool-call group.
+func (m *Model) toggleToolGroup(id int) {
+	if m.expandedToolGroups == nil {
+		m.expandedToolGroups = make(map[int]bool)
+	}
+	m.expandedToolGroups[id] = !m.expandedToolGroups[id]
 }
 
 // appendToolResult attaches a tool result to its command, updating the shell view.
@@ -252,6 +282,12 @@ func (m *Model) clickTranscript(x, y int) {
 	}
 	if idx := m.clickRows[r]; idx >= 0 {
 		m.openShellFocus(idx)
+		return
+	}
+	if r < len(m.groupHitRows) {
+		if gid := m.groupHitRows[r]; gid > 0 {
+			m.toggleToolGroup(gid)
+		}
 	}
 }
 
@@ -299,6 +335,27 @@ func (m *Model) clickShellScrollbar(x, y int) bool {
 	return true
 }
 
+// wheelOverApprovalPrompt reports whether a mouse-wheel event at screen row y
+// lands on the two-line approval prompt shown below the body. Wheel events
+// there should neither page the input nor scroll the chat behind it.
+func (m *Model) wheelOverApprovalPrompt(y int) bool {
+	return m.pending != nil && y >= m.rows() && y < m.height-1
+}
+
+// wheelOverShellPane reports whether a wheel event at screen row y lands on the
+// open shell pane (the lower body rows) so it scrolls the shell, not the chat.
+func (m *Model) wheelOverShellPane(y int) bool {
+	switch m.shellMode {
+	case shellMaximized:
+		return true
+	case shellOpen:
+		top := m.rows() - m.shellOpenRows()
+		return y >= top && y < m.rows()
+	default:
+		return false
+	}
+}
+
 func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if m.pending == nil {
 		m.approvalPopover = false
@@ -326,21 +383,31 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
+		if m.wheelOverApprovalPrompt(msg.Y) {
+			return nil
+		}
 		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
 			m.scrollInput(-3)
 			return nil
 		}
-		if m.shellMode != shellClosed {
+		if m.wheelOverShellPane(msg.Y) {
 			m.scrollShell(-3)
+			return nil
 		}
+		m.scrollChat(-3)
 	case tea.MouseButtonWheelDown:
+		if m.wheelOverApprovalPrompt(msg.Y) {
+			return nil
+		}
 		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
 			m.scrollInput(3)
 			return nil
 		}
-		if m.shellMode != shellClosed {
+		if m.wheelOverShellPane(msg.Y) {
 			m.scrollShell(3)
+			return nil
 		}
+		m.scrollChat(3)
 	case tea.MouseButtonLeft:
 		if msg.Action == tea.MouseActionPress {
 			if m.pending != nil && m.approvalLinkHit.contains(msg.X, msg.Y) {

@@ -67,12 +67,15 @@ func expandTabs(s string) string {
 // tabs so the display width of the result can be measured. In particular ESC and
 // C1 controls must never reach the user's terminal.
 func sanitizeTerminalText(s string) string {
-	return expandTabs(strings.Map(func(r rune) rune {
+	// Expand before filtering: tab is a control rune and would otherwise be
+	// removed by unicode.IsPrint before expandTabs ever sees it.
+	s = expandTabs(s)
+	return strings.Map(func(r rune) rune {
 		if r == '\n' || unicode.IsPrint(r) {
 			return r
 		}
 		return -1
-	}, s))
+	}, s)
 }
 
 func sanitizeTerminalLine(s string) string {

@@ -131,6 +131,11 @@ func (m *Model) transcriptAndSubagents(rows int) string {
 		click[i] = -1
 	}
 	m.clickRows = append(click, m.clickRows...)
+	groupHit := make([]int, rosterRows)
+	for i := range groupHit {
+		groupHit[i] = -1
+	}
+	m.groupHitRows = append(groupHit, m.groupHitRows...)
 	return roster + "\n" + chat
 }
 
@@ -189,6 +194,15 @@ func (m *Model) renderChatPane(rows, width int) string {
 			m.clickRows[at] = command
 		}
 	}
+	m.groupHitRows = make([]int, rows)
+	for i := range m.groupHitRows {
+		m.groupHitRows[i] = -1
+	}
+	for i, gid := range m.chatGroupHits {
+		if at := start + i; at < len(m.groupHitRows) {
+			m.groupHitRows[at] = gid
+		}
+	}
 	return framePane(content, width, rows)
 }
 
@@ -207,9 +221,17 @@ func (m *Model) renderRosterPane(rows, x, width, topY int) string {
 	return framePane(strings.Split(content, "\n"), width, rows)
 }
 
-// transcriptRows returns the wrapped transcript as visual rows, bottom-pinned to
-// `rows`, plus a parallel per-row clickable-command index (-1 for non-command).
+// transcriptRows returns the wrapped transcript as a scrollable viewport of
+// `rows` visual rows, plus a parallel per-row clickable-command index (-1 for
+// non-command). The viewport is pinned to the newest content while chatFollow
+// is set; scrolling away disables following and a return to the bottom re-arms
+// it, mirroring the shell pane.
 func (m *Model) transcriptRows(width, rows int) ([]string, []int) {
+	if rows <= 0 {
+		m.chatMaxScroll = 0
+		m.chatGroupHits = nil
+		return nil, nil
+	}
 	logical := make([]line, 0, len(m.lines))
 	for _, ln := range m.lines {
 		if (ln.kind == kindReasoning && !m.showReasoning) ||
@@ -218,38 +240,143 @@ func (m *Model) transcriptRows(width, rows int) ([]string, []int) {
 		}
 		logical = append(logical, ln)
 	}
-	if rows <= 0 {
-		logical = nil
-	} else if len(logical) > rows {
-		logical = logical[len(logical)-rows:]
+	if len(m.curText) != 0 && (m.curKind != kindReasoning || m.showReasoning) {
+		logical = append(logical, line{text: string(m.curText), kind: m.curKind, cmd: -1})
+	}
+	if m.thinking && !m.showReasoning {
+		logical = append(logical, line{
+			text: fmt.Sprintf("thinking ... (%s)", formatThinkingElapsed(time.Since(m.thinkingStarted))),
+			kind: kindReasoningStatus, cmd: -1,
+		})
 	}
 
 	var visual []string
 	var click []int
-	for _, ln := range logical {
+	var groupHit []int
+	for i := 0; i < len(logical); {
+		ln := logical[i]
+		if ln.kind == kindAssistant {
+			// Assistant deltas are stored as plain logical lines so transcript
+			// history remains resizeable. Reassemble each contiguous response and
+			// let markdown-go perform the Markdown-aware wrapping and styling for
+			// the current pane width.
+			var source strings.Builder
+			for i < len(logical) && logical[i].kind == kindAssistant {
+				if source.Len() > 0 {
+					source.WriteByte('\n')
+				}
+				source.WriteString(logical[i].text)
+				i++
+			}
+			for _, rendered := range renderMarkdownRows(source.String(), width) {
+				visual = append(visual, rendered)
+				click = append(click, -1)
+				groupHit = append(groupHit, -1)
+			}
+			continue
+		}
+		if ln.kind == kindToolGroup && len(ln.calls) > 0 {
+			calls := ln.calls
+			if len(calls) == 1 {
+				for _, wl := range wrapLine(toolCallText(calls[0]), width) {
+					visual = append(visual, styleLine(kindTool, wl))
+					click = append(click, -1)
+					groupHit = append(groupHit, -1)
+				}
+				i++
+				continue
+			}
+			header := fmt.Sprintf("[tool] tool calls (%d)", len(calls))
+			for _, wl := range wrapLine(header, width) {
+				visual = append(visual, styleLine(kindTool, wl))
+				click = append(click, -1)
+				groupHit = append(groupHit, ln.groupID)
+			}
+			if m.expandedToolGroups[ln.groupID] {
+				for _, call := range calls {
+					for _, wl := range wrapLine("  "+toolCallText(call), width) {
+						visual = append(visual, styleLine(kindTool, wl))
+						click = append(click, -1)
+						groupHit = append(groupHit, -1)
+					}
+				}
+			}
+			i++
+			continue
+		}
 		for _, wl := range wrapLine(ln.text, width) {
 			visual = append(visual, styleLine(ln.kind, wl))
 			click = append(click, ln.cmd)
+			groupHit = append(groupHit, -1)
 		}
+		i++
 	}
-	if len(m.curText) != 0 && (m.curKind != kindReasoning || m.showReasoning) {
-		for _, wl := range wrapLine(string(m.curText), width) {
-			visual = append(visual, styleLine(m.curKind, wl))
-			click = append(click, -1)
-		}
+
+	max := len(visual) - rows
+	if max < 0 {
+		max = 0
 	}
-	if m.thinking && !m.showReasoning {
-		status := fmt.Sprintf("thinking ... (%s)", formatThinkingElapsed(time.Since(m.thinkingStarted)))
-		for _, wl := range wrapLine(status, width) {
-			visual = append(visual, styleLine(kindReasoningStatus, wl))
-			click = append(click, -1)
-		}
+	m.chatMaxScroll = max
+	m.followChat(max)
+
+	start := m.chatScroll
+	if start > max {
+		start = max
 	}
-	if rows > 0 && len(visual) > rows {
-		visual = visual[len(visual)-rows:]
-		click = click[len(click)-rows:]
+	if start < 0 {
+		start = 0
 	}
-	return visual, click
+	end := start + rows
+	if end > len(visual) {
+		end = len(visual)
+	}
+	m.chatGroupHits = groupHit[start:end]
+	return visual[start:end], click[start:end]
+}
+
+// followChat keeps the transcript viewport pinned to the newest content while
+// chatFollow is set, and clamps a scrolled-away viewport to the available range.
+func (m *Model) followChat(max int) {
+	if m.chatFollow {
+		m.chatScroll = max
+		return
+	}
+	if m.chatScroll > max {
+		m.chatScroll = max
+	}
+	if m.chatScroll < 0 {
+		m.chatScroll = 0
+	}
+}
+
+// setChatScroll sets the transcript scroll offset and updates chatFollow so the
+// view follows new content again once the user scrolls back to the bottom. It
+// clamps directly (rather than via followChat) so an explicit scroll-away is
+// not immediately snapped back to the bottom by a still-set chatFollow flag.
+func (m *Model) setChatScroll(n int) {
+	m.chatScroll = n
+	max := m.chatMaxScroll
+	if m.chatScroll > max {
+		m.chatScroll = max
+	}
+	if m.chatScroll < 0 {
+		m.chatScroll = 0
+	}
+	m.chatFollow = m.chatScroll >= max
+}
+
+func (m *Model) scrollChat(delta int) {
+	m.setChatScroll(m.chatScroll + delta)
+}
+
+// chatPageSize is the number of transcript rows scrolled by pgup/pgdown. It
+// matches the focused chat pane's content height when the shell is closed.
+func (m *Model) chatPageSize() int {
+	n := m.rows() - 2
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // rows is the number of body rows available, or 0 when unknown. The input box
@@ -440,6 +567,20 @@ func truncateDisplay(s string, max int) string {
 func ansiEnd(s string, i int) int {
 	j := i + 1
 	if j >= len(s) {
+		return len(s)
+	}
+	if s[j] == ']' {
+		// OSC sequences (including markdown-go's OSC 8 hyperlinks) end in
+		// BEL or ST. Treat the whole sequence as zero-width so truncation never
+		// displays or splits its control payload.
+		for j = j + 1; j < len(s); j++ {
+			if s[j] == '\a' {
+				return j + 1
+			}
+			if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+				return j + 2
+			}
+		}
 		return len(s)
 	}
 	if s[j] != '[' {

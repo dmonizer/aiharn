@@ -13,13 +13,14 @@ import (
 // Message types bridging agent/gate/manager activity into the Bubbletea event
 // loop. They are unexported; Update switches on them.
 type (
-	agentEventMsg     struct{ ev agent.Event }
-	approvalReqMsg    struct{ req approval.Request }
-	turnDoneMsg       struct{ err error }
-	rosterMsg         struct{}
-	bridgeStoppedMsg  struct{}
-	thinkingTickMsg   struct{}
-	subagentClosedMsg struct {
+	agentEventMsg       struct{ ev agent.Event }
+	approvalReqMsg      struct{ req approval.Request }
+	approvalResolvedMsg struct{ id string }
+	turnDoneMsg         struct{ err error }
+	rosterMsg           struct{}
+	bridgeStoppedMsg    struct{}
+	thinkingTickMsg     struct{}
+	subagentClosedMsg   struct {
 		id  string
 		err error
 	}
@@ -50,6 +51,20 @@ func waitApprovalContext(ctx context.Context, g *approval.Gate) tea.Cmd {
 		select {
 		case req := <-g.Pending():
 			return approvalReqMsg{req: req}
+		case <-ctx.Done():
+			return bridgeStoppedMsg{}
+		}
+	}
+}
+
+// waitApprovalResolved blocks until the gate reports a request was resolved by
+// any client. The TUI uses it to clear a prompt the web console has already
+// decided, so a stale prompt can never stay active across the two UIs.
+func waitApprovalResolvedContext(ctx context.Context, g *approval.Gate) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case id := <-g.Resolved():
+			return approvalResolvedMsg{id: id}
 		case <-ctx.Done():
 			return bridgeStoppedMsg{}
 		}

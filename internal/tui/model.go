@@ -18,6 +18,7 @@ import (
 	"aiharn/internal/agent"
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
+	"aiharn/internal/llm"
 	"aiharn/internal/tools"
 )
 
@@ -41,17 +42,21 @@ const (
 	kindReasoning
 	kindReasoningStatus
 	kindTool
+	kindToolGroup
 	kindCommand
 	kindError
 	kindAgentMessage
 )
 
 // line is one flushed transcript line with its presentation kind. cmd indexes
-// into the shell command list for clickable command lines, or -1.
+// into the shell command list for clickable command lines, or -1. calls and
+// groupID carry a collapsible run of tool calls for kindToolGroup lines.
 type line struct {
-	text string
-	kind lineKind
-	cmd  int
+	text    string
+	kind    lineKind
+	cmd     int
+	calls   []llm.Item
+	groupID int
 }
 
 // Model is the Bubbletea root model.
@@ -106,6 +111,17 @@ type Model struct {
 	clickRows  []int // per transcript row: shellCmds index or -1
 	clickWidth int   // transcript pane width; 0 = no column constraint
 
+	// collapsible tool-call group state
+	expandedToolGroups map[int]bool
+	nextToolGroupID    int
+	chatGroupHits      []int
+	groupHitRows       []int
+
+	// chat transcript scroll state
+	chatScroll    int  // visual-row offset into the wrapped transcript
+	chatFollow    bool // autoscroll to newest content while pinned to the bottom
+	chatMaxScroll int  // derived during render; 0 when content fits the pane
+
 	// input history
 	history []string
 	histIdx int    // -1 = not navigating (draft/empty area)
@@ -131,19 +147,20 @@ type Model struct {
 func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Model{
-		manager:    mgr,
-		agent:      top,
-		gate:       g,
-		status:     status,
-		shortcuts:  status.Shortcuts.WithDefaults(),
-		aiharnHome: status.AiharnHome,
-		ctx:        ctx,
-		cancel:     cancel,
-		inputMax:   defaultInputHeight,
-		views:      make(map[string]agentView),
-		bridged:    make(map[string]bool),
-		hoverX:     -1,
-		hoverY:     -1,
+		manager:            mgr,
+		agent:              top,
+		gate:               g,
+		status:             status,
+		shortcuts:          status.Shortcuts.WithDefaults(),
+		aiharnHome:         status.AiharnHome,
+		ctx:                ctx,
+		cancel:             cancel,
+		inputMax:           defaultInputHeight,
+		views:              make(map[string]agentView),
+		bridged:            make(map[string]bool),
+		expandedToolGroups: make(map[int]bool),
+		hoverX:             -1,
+		hoverY:             -1,
 	}
 	if top != nil {
 		m.focusedID = top.ID()
@@ -153,6 +170,7 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 	m.resizeInput()
 	m.shellFocus = -1
 	m.shellFollow = true
+	m.chatFollow = true
 	m.histIdx = -1
 	m.appendLine(kindPlain, fmt.Sprintf("aiharn: agent %s · model %s · channel %s · approval %s",
 		status.AgentType, status.Model, status.Channel, status.Approval))
@@ -162,7 +180,7 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 
 // Init starts the agent-event, approval, and roster bridges.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager), m.startSubagentBridges(), m.textarea.Focus())
+	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitApprovalResolvedContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager), m.startSubagentBridges(), m.textarea.Focus())
 }
 
 // refreshSubagents re-reads the subagent roster from the manager.

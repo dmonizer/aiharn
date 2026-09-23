@@ -75,6 +75,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitApprovalContext(m.ctx, m.gate)
 
+	case approvalResolvedMsg:
+		m.removeApproval(msg.id)
+		return m, waitApprovalResolvedContext(m.ctx, m.gate)
+
 	case rosterMsg:
 		m.refreshSubagents()
 		return m, tea.Batch(waitRosterContext(m.ctx, m.manager), m.startSubagentBridges())
@@ -145,19 +149,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		req := m.toolLimit
-		a := m.manager.Agent(req.AgentID)
+		a := m.agentByID(req.AgentID)
 		if a == nil {
 			m.appendLine(kindPlain, "warning: agent for tool-call limit is no longer available")
 		} else if err := a.DecideToolLimit(req.ID, decision); err != nil {
 			m.appendLine(kindPlain, "warning: tool-call limit prompt expired: "+err.Error())
 		}
 		m.toolLimit = nil
-		if len(m.toolLimitQueue) > 0 {
-			next := m.toolLimitQueue[0]
-			m.toolLimitQueue = m.toolLimitQueue[1:]
-			m.toolLimit = &next
-			m.focusAgent(next.AgentID)
-		}
+		m.promoteToolLimit()
 		return m, nil
 	}
 	if m.approvalPopover && m.pending == nil {
@@ -273,6 +272,21 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.setShellScroll(0)
 			case "end":
 				m.setShellScroll(m.shellMaxScroll())
+			}
+			return m, nil
+		}
+		// With the shell closed these keys scroll the transcript when it
+		// overflows; otherwise they keep their historical input-paging role.
+		if m.chatMaxScroll > 0 {
+			switch msg.String() {
+			case "pgup":
+				m.scrollChat(-m.chatPageSize())
+			case "pgdown":
+				m.scrollChat(m.chatPageSize())
+			case "home":
+				m.setChatScroll(0)
+			case "end":
+				m.setChatScroll(m.chatMaxScroll)
 			}
 			return m, nil
 		}
@@ -404,6 +418,80 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+// removeApproval drops a resolved approval from the visible prompt and promotes
+// the next still-pending request. It is a no-op when the id is not currently
+// shown (for example after this TUI decided it locally and the gate's resolved
+// notification arrived later).
+func (m *Model) removeApproval(id string) {
+	if m.pending != nil && m.pending.ID == id {
+		m.pending = nil
+		if len(m.approvals) > 0 {
+			next := m.approvals[0]
+			m.approvals = m.approvals[1:]
+			m.pending = &next
+		} else {
+			m.approvalPopover = false
+		}
+		return
+	}
+	for i := range m.approvals {
+		if m.approvals[i].ID == id {
+			m.approvals = append(m.approvals[:i], m.approvals[i+1:]...)
+			return
+		}
+	}
+}
+
+// agentByID returns the agent with the given id, preferring the cached top-level
+// agent and falling back to the manager for subagents.
+func (m *Model) agentByID(id string) *agent.Agent {
+	if m.agent != nil && id == m.agent.ID() {
+		return m.agent
+	}
+	if m.manager != nil {
+		return m.manager.Agent(id)
+	}
+	return nil
+}
+
+// removeToolLimit drops a resolved tool-call-limit prompt from the visible
+// prompt or the waiting queue and promotes the next queued prompt.
+func (m *Model) removeToolLimit(req *agent.ToolLimitRequest) {
+	if req == nil {
+		return
+	}
+	if m.toolLimit != nil && m.toolLimit.ID == req.ID && m.toolLimit.AgentID == req.AgentID {
+		m.toolLimit = nil
+		m.promoteToolLimit()
+		return
+	}
+	for i := range m.toolLimitQueue {
+		tl := m.toolLimitQueue[i]
+		if tl.ID == req.ID && tl.AgentID == req.AgentID {
+			m.toolLimitQueue = append(m.toolLimitQueue[:i], m.toolLimitQueue[i+1:]...)
+			return
+		}
+	}
+}
+
+// promoteToolLimit shows the next queued tool-call-limit prompt, dropping any
+// whose agent is no longer available.
+func (m *Model) promoteToolLimit() {
+	if m.toolLimit != nil {
+		return
+	}
+	for len(m.toolLimitQueue) > 0 {
+		next := m.toolLimitQueue[0]
+		m.toolLimitQueue = m.toolLimitQueue[1:]
+		if m.agentByID(next.AgentID) == nil {
+			continue
+		}
+		m.toolLimit = &next
+		m.focusAgent(next.AgentID)
+		return
+	}
+}
+
 // nextTurn starts the next queued input if the agent is idle and a turn is not
 // already running.
 func (m *Model) nextTurn() tea.Cmd {
@@ -482,6 +570,8 @@ func (m *Model) appendEvent(ev agent.Event) {
 			m.flushText()
 			m.appendLine(kindPlain, fmt.Sprintf("%d tool calls this turn. [s]top  [c]ontinue without limit  [d]ouble to %d", ev.ToolLimit.Count, ev.ToolLimit.Limit*2))
 		}
+	case agent.EventToolLimitResolved:
+		m.removeToolLimit(ev.ToolLimit)
 	case agent.EventToolCall:
 		m.finishThinking(time.Now())
 		m.appendToolCall(ev.Call)

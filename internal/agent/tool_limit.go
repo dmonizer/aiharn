@@ -47,6 +47,9 @@ func (a *Agent) DecideToolLimit(id, decision string) error {
 	a.pendingToolLimit = nil
 	pending.decision <- decision
 	a.mu.Unlock()
+	// Publish the resolution so every attached UI can clear the prompt, even the
+	// one that did not decide it (for example the TUI when the web console did).
+	a.emit(Event{Type: EventToolLimitResolved, ToolLimit: &pending.request})
 	return nil
 }
 

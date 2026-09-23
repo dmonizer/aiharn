@@ -60,12 +60,13 @@ var (
 
 // Gate holds the current mode and coordinates pending approvals.
 type Gate struct {
-	mu      sync.Mutex
-	mode    Mode
-	closed  bool
-	seq     int
-	pending chan Request
-	byID    map[string]pendingRequest
+	mu       sync.Mutex
+	mode     Mode
+	closed   bool
+	seq      int
+	pending  chan Request
+	resolved chan string
+	byID     map[string]pendingRequest
 }
 
 type pendingRequest struct {
@@ -76,9 +77,10 @@ type pendingRequest struct {
 // NewGate returns a Gate in the given mode.
 func NewGate(mode Mode) *Gate {
 	return &Gate{
-		mode:    mode,
-		pending: make(chan Request, 16),
-		byID:    make(map[string]pendingRequest),
+		mode:     mode,
+		pending:  make(chan Request, 16),
+		resolved: make(chan string, 16),
+		byID:     make(map[string]pendingRequest),
 	}
 }
 
@@ -129,6 +131,11 @@ func (g *Gate) Check(ctx context.Context, req Request) (Decision, error) {
 // the canonical, non-consuming view of requests awaiting a decision.
 func (g *Gate) Pending() <-chan Request { return g.pending }
 
+// Resolved delivers best-effort notifications of request ids that were
+// resolved by any client (the TUI, the web console, or a context cancellation).
+// It lets a second UI clear a prompt that another UI has already decided.
+func (g *Gate) Resolved() <-chan string { return g.resolved }
+
 // PendingRequests returns a stable snapshot of every request still awaiting a
 // decision. Unlike Pending, it does not consume notifications, so multiple
 // user interfaces can inspect the same approval queue safely.
@@ -162,6 +169,7 @@ func (g *Gate) Decide(id string, d Decision) error {
 	delete(g.byID, id)
 	pending.decision <- d
 	g.mu.Unlock()
+	g.notifyResolved(id)
 	return nil
 }
 
@@ -178,6 +186,7 @@ func (g *Gate) ApproveAll(id string) error {
 	g.mode = ModeAllowAll
 	pending.decision <- DecisionApproved
 	g.mu.Unlock()
+	g.notifyResolved(id)
 	return nil
 }
 
@@ -226,4 +235,15 @@ func (g *Gate) unregister(id string) {
 	g.mu.Lock()
 	delete(g.byID, id)
 	g.mu.Unlock()
+	g.notifyResolved(id)
+}
+
+// notifyResolved publishes a resolved id without blocking. A full buffer means
+// a UI is behind and may clear the prompt on its next reconciliation; it is a
+// hint, not the canonical state (PendingRequests remains authoritative).
+func (g *Gate) notifyResolved(id string) {
+	select {
+	case g.resolved <- id:
+	default:
+	}
 }

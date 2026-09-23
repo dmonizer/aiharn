@@ -30,6 +30,8 @@ type agentView struct {
 	shellScroll     int
 	shellFocus      int
 	shellFollow     bool
+	chatScroll      int
+	chatFollow      bool
 	thinking        bool
 	thinkingStarted time.Time
 }
@@ -42,6 +44,7 @@ func (m *Model) currentView() agentView {
 		shellCmds: m.shellCmds, shellFlat: m.shellFlat, shellStart: m.shellStart,
 		shellRowCmd: m.shellRowCmd, shellMode: m.shellMode, shellScroll: m.shellScroll,
 		shellFocus: m.shellFocus, shellFollow: m.shellFollow,
+		chatScroll: m.chatScroll, chatFollow: m.chatFollow,
 		thinking: m.thinking, thinkingStarted: m.thinkingStarted,
 	}
 }
@@ -53,6 +56,7 @@ func (m *Model) loadView(v agentView) {
 	m.shellCmds, m.shellFlat, m.shellStart = v.shellCmds, v.shellFlat, v.shellStart
 	m.shellRowCmd, m.shellMode, m.shellScroll = v.shellRowCmd, v.shellMode, v.shellScroll
 	m.shellFocus, m.shellFollow = v.shellFocus, v.shellFollow
+	m.chatScroll, m.chatFollow = v.chatScroll, v.chatFollow
 	m.thinking, m.thinkingStarted = v.thinking, v.thinkingStarted
 }
 
@@ -64,7 +68,7 @@ func (m *Model) focusAgent(id string) {
 	if v, ok := m.views[id]; ok {
 		m.loadView(v)
 	} else {
-		m.loadView(agentView{textarea: newTextarea(m.shortcuts), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true})
+		m.loadView(agentView{textarea: newTextarea(m.shortcuts), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true, chatFollow: true})
 		m.textarea.Focus()
 		m.appendLine(kindPlain, fmt.Sprintf("agent %s (%s)", id, m.manager.Agent(id).Type()))
 	}
@@ -84,7 +88,7 @@ func (m *Model) appendAgentEvent(ev agent.Event) {
 	if v, ok := m.views[ev.AgentID]; ok {
 		m.loadView(v)
 	} else {
-		m.loadView(agentView{textarea: newTextarea(m.shortcuts), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true})
+		m.loadView(agentView{textarea: newTextarea(m.shortcuts), inputMax: defaultInputHeight, histIdx: -1, shellFocus: -1, shellFollow: true, chatFollow: true})
 		m.appendLine(kindPlain, fmt.Sprintf("agent %s (%s)", ev.AgentID, m.manager.Agent(ev.AgentID).Type()))
 	}
 	m.appendEvent(ev)
