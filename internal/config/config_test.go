@@ -76,7 +76,7 @@ func TestLoadValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := home; cfg.AiharnHome != want {
+	if want := filepath.Join(home, ".aiharn"); cfg.AiharnHome != want {
 		t.Fatalf("AiharnHome = %q, want default %q", cfg.AiharnHome, want)
 	}
 
@@ -125,6 +125,28 @@ func TestLoadValid(t *testing.T) {
 
 	if err := Validate(cfg, ValidateOptions{KnownTools: map[string]bool{"execute_command": true}}); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestDefaultPaths(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHome := filepath.Join(home, ".aiharn")
+	gotHome, err := DefaultAiharnHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHome != wantHome {
+		t.Fatalf("DefaultAiharnHome() = %q, want %q", gotHome, wantHome)
+	}
+	gotConfig, err := DefaultConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(wantHome, "config.toml"); gotConfig != want {
+		t.Fatalf("DefaultConfigPath() = %q, want %q", gotConfig, want)
 	}
 }
 

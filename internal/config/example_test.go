@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +13,13 @@ func TestConfigExampleShowsDefaults(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "example-test-key")
 	t.Setenv("ZAI_API_KEY", "example-test-key")
 	path := filepath.Join("..", "..", "config.toml.example")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read example: %v", err)
+	}
+	if !strings.Contains(string(data), `aiharn_home = "~/.aiharn"`) {
+		t.Fatal(`example must explicitly contain aiharn_home = "~/.aiharn"`)
+	}
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load example: %v", err)
@@ -23,8 +31,8 @@ func TestConfigExampleShowsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AiharnHome != home {
-		t.Errorf("aiharn_home = %q, want default %q", cfg.AiharnHome, home)
+	if want := filepath.Join(home, ".aiharn"); cfg.AiharnHome != want {
+		t.Errorf("aiharn_home = %q, want %q", cfg.AiharnHome, want)
 	}
 	if cfg.Shortcuts != DefaultShortcuts() {
 		t.Errorf("shortcuts = %+v, want %+v", cfg.Shortcuts, DefaultShortcuts())

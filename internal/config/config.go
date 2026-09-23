@@ -43,7 +43,7 @@ func (d *Duration) UnmarshalTOML(v interface{}) error {
 
 // Config is the fully materialized configuration.
 type Config struct {
-	AiharnHome string `toml:"aiharn_home"` // local data directory; default is the user's home directory
+	AiharnHome string `toml:"aiharn_home"` // local data directory; default is $HOME/.aiharn
 	Models     map[string]ModelConfig
 	Channels   []ChannelConfig
 	Agents     map[string]AgentConfig

@@ -41,7 +41,7 @@ func run(args []string) int {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		configPath  = fs.String("config", "config.toml", "path to the TOML configuration file")
+		configPath  = fs.String("config", "", "path to the TOML configuration file (default $HOME/.aiharn/config.toml)")
 		agentName   = fs.String("agent", "", "top-level agent type (default \"main\")")
 		promptFile  = fs.String("prompt", "", "override the system prompt file")
 		channel     = fs.String("channel", "", "override the execution channel")
@@ -74,6 +74,22 @@ func run(args []string) int {
 	if fs.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "aiharn: unexpected argument %q\n", fs.Arg(0))
 		return 2
+	}
+	if !specified["config"] {
+		var err error
+		*configPath, err = config.DefaultConfigPath()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "aiharn: resolve default config path: %v\n", err)
+			return 1
+		}
+		created, err := config.EnsureDefaultConfig(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "aiharn: initialize default config: %v\n", err)
+			return 1
+		}
+		if created {
+			fmt.Fprintf(os.Stderr, "aiharn: created starter config at %s\n", *configPath)
+		}
 	}
 
 	cfg, err := config.Load(*configPath)

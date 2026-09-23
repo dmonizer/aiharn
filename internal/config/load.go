@@ -10,6 +10,26 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// DefaultAiharnHome returns the local directory used for Aiharn's config,
+// skills, prompts, and transcripts when aiharn_home is not configured.
+func DefaultAiharnHome() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".aiharn"), nil
+}
+
+// DefaultConfigPath returns the configuration file used when --config is not
+// supplied.
+func DefaultConfigPath() (string, error) {
+	home, err := DefaultAiharnHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "config.toml"), nil
+}
+
 // Load reads, parses, interpolates, resolves, and defaults the configuration at
 // path. It performs the mechanical steps only; call Validate for semantic
 // checks. Secret-bearing fields are never embedded in returned errors.
@@ -38,7 +58,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: resolve base dir: %w", err)
 	}
 	if cfg.AiharnHome == "" {
-		home, err := os.UserHomeDir()
+		home, err := DefaultAiharnHome()
 		if err != nil {
 			return nil, fmt.Errorf("config: resolve user home directory for aiharn_home: %w", err)
 		}

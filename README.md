@@ -10,8 +10,14 @@ the contents of `<aiharn_home>/skills/index.md` (capped at 4 MiB).
 <aiharn_home>/skills/<skill-name>/SKILL.md
 ```
 
-`aiharn_home` defaults to your home directory. The `skills/` directory is
-optional unless a prompt references `${SKILLS_INDEX}`.
+`aiharn_home` defaults to `~/.aiharn`, and the default configuration path is
+`~/.aiharn/config.toml`. The `skills/` directory is optional unless a prompt
+references `${SKILLS_INDEX}`.
+
+On first run, if the default configuration does not exist, Aiharn creates a
+private starter config and `~/.aiharn/prompts/main.md`. It then reports the
+blank API key through normal configuration validation. An explicit `--config`
+path is never created automatically.
 
 The TUI also provides skill commands:
 

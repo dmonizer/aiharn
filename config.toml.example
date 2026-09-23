@@ -4,9 +4,9 @@
 # for LOCAL paths. Secret-bearing fields (api_key, password) are redacted from
 # all error/log output.
 
-# Default: the user's home directory (~). Transcripts go under ~/transcripts/.
-# aiharn_home = "~"
-# Example override: aiharn_home = "~/.local/share/aiharn"
+# Default: ~/.aiharn. This explicit setting documents the directory used for
+# config, skills, prompts, and transcripts.
+aiharn_home = "~/.aiharn"
 # Skills live under <aiharn_home>/skills/. A system prompt file may reference
 # ${SKILLS_INDEX}, which is replaced with the contents of
 # <aiharn_home>/skills/index.md (capped at 4 MiB). The skills/ directory is
