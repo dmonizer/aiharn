@@ -765,6 +765,85 @@
     strip.append(head, items);
   }
 
+  const markdownTags = new Set([
+    "A", "BLOCKQUOTE", "BR", "CODE", "DEL", "EM", "H1", "H2", "H3",
+    "H4", "H5", "H6", "HR", "IMG", "INPUT", "LI", "OL", "P", "PRE",
+    "STRONG", "TABLE", "TBODY", "TD", "TH", "THEAD", "TR", "UL"
+  ]);
+
+  function safeMarkdownURL(raw, image) {
+    if (!raw) return null;
+    if (image && /^data:image\/(?:gif|jpe?g|png|webp);base64,/i.test(raw)) return raw;
+    let parsed;
+    try {
+      parsed = new URL(raw, window.location.href);
+    } catch (_) {
+      return null;
+    }
+    if (image) return parsed.origin === window.location.origin ? raw : null;
+    return ["http:", "https:", "mailto:"].includes(parsed.protocol) ? raw : null;
+  }
+
+  // API endpoints are user-configurable, so even server-rendered Markdown is
+  // treated as untrusted. markdown-go already escapes raw HTML; this second
+  // pass limits the DOM shape and URL schemes before insertion.
+  function markdownFragment(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    for (const node of Array.from(template.content.querySelectorAll("*")).reverse()) {
+      if (!markdownTags.has(node.tagName)) {
+        node.replaceWith(document.createTextNode(node.textContent || ""));
+        continue;
+      }
+      const attributes = Array.from(node.attributes);
+      for (const attribute of attributes) node.removeAttribute(attribute.name);
+      if (node.tagName === "A") {
+        const href = attributes.find((attribute) => attribute.name.toLowerCase() === "href")?.value;
+        const title = attributes.find((attribute) => attribute.name.toLowerCase() === "title")?.value;
+        const safe = safeMarkdownURL(href, false);
+        if (safe) {
+          node.setAttribute("href", safe);
+          node.setAttribute("target", "_blank");
+          node.setAttribute("rel", "noopener noreferrer");
+        }
+        if (title) node.setAttribute("title", title);
+      } else if (node.tagName === "IMG") {
+        const src = attributes.find((attribute) => attribute.name.toLowerCase() === "src")?.value;
+        const alt = attributes.find((attribute) => attribute.name.toLowerCase() === "alt")?.value;
+        const title = attributes.find((attribute) => attribute.name.toLowerCase() === "title")?.value;
+        const safe = safeMarkdownURL(src, true);
+        if (safe) node.setAttribute("src", safe);
+        if (alt) node.setAttribute("alt", alt);
+        if (title) node.setAttribute("title", title);
+      } else if (node.tagName === "CODE") {
+        const name = attributes.find((attribute) => attribute.name.toLowerCase() === "class")?.value;
+        if (/^language-[a-z0-9_+.-]+$/i.test(name || "")) node.className = name;
+      } else if (node.tagName === "OL") {
+        const start = attributes.find((attribute) => attribute.name.toLowerCase() === "start")?.value;
+        if (/^-?\d+$/.test(start || "")) node.setAttribute("start", start);
+      } else if (node.tagName === "TD" || node.tagName === "TH") {
+        const align = attributes.find((attribute) => attribute.name.toLowerCase() === "align")?.value;
+        if (["left", "center", "right"].includes(align)) node.setAttribute("align", align);
+      } else if (node.tagName === "INPUT") {
+        node.setAttribute("type", "checkbox");
+        node.setAttribute("disabled", "");
+        if (attributes.some((attribute) => attribute.name.toLowerCase() === "checked")) {
+          node.setAttribute("checked", "");
+        }
+      }
+    }
+    return template.content;
+  }
+
+  function appendMessageContent(body, message) {
+    if (typeof message.html === "string" && message.html) {
+      body.classList.add("markdown");
+      body.append(markdownFragment(message.html));
+      return;
+    }
+    body.append(document.createTextNode(message.content || ""));
+  }
+
   function renderMessages(messages, liveReasoning) {
     const previousTop = elements.transcript.scrollTop;
     const nearBottom = elements.transcript.scrollHeight - previousTop -
@@ -783,7 +862,11 @@
     }
 
     let thinkingIndex = 0;
-    for (const entry of groupMessages(messages)) {
+    for (const entry of groupSequentialToolCalls(groupMessages(messages))) {
+      if (entry.group) {
+        elements.transcript.append(renderToolGroup(entry, expandedTools));
+        continue;
+      }
       const message = entry.message;
       if (message.type === "reasoning") {
         const key = "thinking-" + thinkingIndex++;
@@ -830,7 +913,7 @@
             body.append(role);
           }
         }
-        body.append(document.createTextNode(message.content || ""));
+        appendMessageContent(body, message);
         row.append(body);
         elements.transcript.append(row);
       } else {
@@ -887,12 +970,100 @@
     return entries;
   }
 
+  function toolStatusFor(call, result) {
+    const resultText = result?.content || "";
+    if (!result) return "pending";
+    if (resultText.trim().toLowerCase() === "denied by user") return "denied";
+    if (resultText.startsWith("error:")) return "error";
+    return "executed";
+  }
+  function toolStatusIcon(status) {
+    return { pending: "…", denied: "🛑", error: "!", executed: "✓" }[status];
+  }
+  function toolStatusRank(status) {
+    return { executed: 0, pending: 1, denied: 2, error: 3 }[status] ?? 0;
+  }
+  function aggregateToolStatus(calls) {
+    let worst = "executed";
+    for (const call of calls) {
+      const status = toolStatusFor(call.message, call.result);
+      if (toolStatusRank(status) > toolStatusRank(worst)) worst = status;
+    }
+    return worst;
+  }
+
+  function groupSequentialToolCalls(entries) {
+    const grouped = [];
+    let run = [];
+    const flush = () => {
+      if (!run.length) return;
+      if (run.length === 1) {
+        grouped.push(run[0]);
+      } else {
+        grouped.push({
+          group: true,
+          calls: run,
+          key: "group:" + run.map((c) => c.key).join(","),
+        });
+      }
+      run = [];
+    };
+    for (const entry of entries) {
+      if (entry.message?.type === "tool_call") {
+        run.push(entry);
+      } else {
+        flush();
+        grouped.push(entry);
+      }
+    }
+    flush();
+    return grouped;
+  }
+
+  function renderToolGroup(group, expandedTools) {
+    const calls = group.calls;
+    const status = aggregateToolStatus(calls);
+    const details = document.createElement("details");
+    details.className = "tool-block tool-group " + status;
+    details.dataset.toolKey = group.key;
+    details.open = expandedTools.has(group.key);
+
+    const summary = document.createElement("summary");
+    summary.setAttribute("aria-label", status + " · " + calls.length + " tool calls");
+    const icon = document.createElement("span");
+    icon.className = "tool-status-icon " + status;
+    icon.textContent = toolStatusIcon(status);
+    icon.title = status;
+    icon.setAttribute("aria-hidden", "true");
+    const title = document.createElement("span");
+    title.textContent = "tool calls (" + calls.length + ")";
+    summary.append(icon, title);
+    details.append(summary);
+
+    for (const call of calls) {
+      const callStatus = toolStatusFor(call.message, call.result);
+      const item = document.createElement("div");
+      item.className = "tool-group-call";
+      const head = document.createElement("div");
+      head.className = "tool-group-call-head";
+      const callIcon = document.createElement("span");
+      callIcon.className = "tool-status-icon " + callStatus;
+      callIcon.textContent = toolStatusIcon(callStatus);
+      callIcon.title = callStatus;
+      callIcon.setAttribute("aria-hidden", "true");
+      head.append(callIcon, document.createTextNode("tool · " + (call.message.name || "unknown")));
+      item.append(head);
+      appendToolSection(item, "Call", call.message.arguments);
+      if (call.result) appendToolSection(item, "Result", call.result.content);
+      details.append(item);
+    }
+    return details;
+  }
+
   function renderToolBlock(entry, expandedTools) {
     const call = entry.message.type === "tool_call" ? entry.message : null;
     const result = entry.result || (call ? null : entry.message);
-    const resultText = result?.content || "";
-    const status = !result ? "pending" : resultText.trim().toLowerCase() === "denied by user"
-      ? "denied" : resultText.startsWith("error:") ? "error" : "executed";
+    const status = toolStatusFor(call, result);
     const details = document.createElement("details");
     details.className = "tool-block " + status;
     details.dataset.toolKey = entry.key;
@@ -902,7 +1073,7 @@
     summary.setAttribute("aria-label", status + " · " + (call?.name || "tool result"));
     const icon = document.createElement("span");
     icon.className = "tool-status-icon " + status;
-    icon.textContent = { pending: "…", denied: "🛑", error: "!", executed: "✓" }[status];
+    icon.textContent = toolStatusIcon(status);
     icon.title = status;
     icon.setAttribute("aria-hidden", "true");
     const title = document.createElement("span");
