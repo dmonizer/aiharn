@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/codewandler/markdown v0.46.3
 	github.com/kevinburke/ssh_config v1.2.0
 	github.com/muesli/termenv v0.16.0
 	github.com/rivo/uniseg v0.4.7
@@ -17,6 +18,7 @@ require (
 )
 
 require (
+	github.com/alecthomas/chroma/v2 v2.23.1 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
@@ -26,6 +28,7 @@ require (
 	github.com/clipperhouse/displaywidth v0.9.0 // indirect
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.5.0 // indirect
+	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -37,3 +40,6 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 )
+
+// markdown-go still declares the module's pre-rename import path.
+replace github.com/codewandler/markdown => github.com/codewandler/markdown-go v0.46.3

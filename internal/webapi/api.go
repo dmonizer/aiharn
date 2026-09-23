@@ -21,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	markdown "github.com/codewandler/markdown"
+	markdownhtml "github.com/codewandler/markdown/html"
 	"golang.org/x/crypto/bcrypt"
 
 	"aiharn/internal/agent"
@@ -254,11 +256,14 @@ type message struct {
 	// Delivery is set only on message items another agent injected, describing
 	// who sent what to whom, in which direction (relative to the sender), and
 	// why. It is omitted on assistant messages and on tool items.
-	Delivery  *delivery `json:"delivery,omitempty"`
-	Content   string    `json:"content,omitempty"`
-	CallID    string    `json:"call_id,omitempty"`
-	Name      string    `json:"name,omitempty"`
-	Arguments any       `json:"arguments,omitempty"`
+	Delivery *delivery `json:"delivery,omitempty"`
+	Content  string    `json:"content,omitempty"`
+	// HTML is the sanitized markdown-go rendering of assistant-authored text.
+	// Content remains the canonical source and keeps the API backward compatible.
+	HTML      string `json:"html,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments any    `json:"arguments,omitempty"`
 }
 
 // delivery mirrors llm.Delivery in the wire payload. direction is relative to
@@ -312,13 +317,14 @@ const agentMessagesCapability = "agent_messages"
 const agentNamesCapability = "agent_names"
 const toolLimitsCapability = "tool_limits"
 const channelSwitchCapability = "channel_switch"
+const markdownHTMLCapability = "markdown_html"
 
 // capabilities returns a fresh slice for each response. A shared backing array
 // would let one caller's mutation leak into another payload, and keeping the
 // list in one place stops GET /api/v1/session and the session descriptors from
 // drifting apart.
 func capabilities() []string {
-	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability}
+	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability}
 }
 
 // channelDescriptors renders every configured execution channel for the wire.
@@ -802,6 +808,11 @@ func messagesFromHistory(history []llm.Item) []message {
 		case llm.ItemMessage:
 			m.Type, m.Role = "message", string(item.Role)
 			m.Origin = string(item.Origin)
+			if item.Role == llm.RoleAssistant || item.Origin == llm.OriginAgent {
+				// The browser performs a second allow-list pass because API
+				// endpoints are user-configurable.
+				m.HTML = renderMarkdownHTML(item.Content)
+			}
 			if item.Delivery != nil {
 				m.Delivery = &delivery{
 					From: item.Delivery.From, To: item.Delivery.To,
@@ -820,6 +831,60 @@ func messagesFromHistory(history []llm.Item) []message {
 		messages = append(messages, m)
 	}
 	return messages
+}
+
+// renderMarkdownHTML renders model-authored Markdown while forcing inline raw
+// HTML to remain literal and removing active URL schemes. markdown-go's default
+// safe mode escapes HTML blocks, but v0.46.3 intentionally passes inline HTML
+// through, so the event stream needs this small hardening pass before render.
+func renderMarkdownHTML(source string) string {
+	events, err := markdown.ParseBytes([]byte(source))
+	if err != nil {
+		return ""
+	}
+	for i := range events {
+		events[i].Style.RawHTML = false
+		if events[i].Style.LinkData == nil {
+			continue
+		}
+		links := *events[i].Style.LinkData
+		if !safeMarkdownURL(links.Link, events[i].Style.Image) {
+			links.Link = ""
+			links.HasLink = false
+		}
+		if !safeMarkdownURL(links.ImageLink, false) {
+			links.ImageLink = ""
+		}
+		events[i].Style.LinkData = &links
+	}
+	html, err := markdownhtml.RenderString(events, markdownhtml.WithHTML5())
+	if err != nil {
+		return ""
+	}
+	return html
+}
+
+func safeMarkdownURL(raw string, image bool) bool {
+	if raw == "" {
+		return true
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme == "" || scheme == "http" || scheme == "https" || (!image && scheme == "mailto") {
+		return true
+	}
+	if image && scheme == "data" {
+		lower := strings.ToLower(raw)
+		for _, prefix := range []string{"data:image/gif;base64,", "data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,"} {
+			if strings.HasPrefix(lower, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pendingAgentMessages renders a session's queued agent messages. It always

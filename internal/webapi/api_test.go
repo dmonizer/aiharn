@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -488,6 +489,34 @@ func TestSessionMessagesCarryOrigin(t *testing.T) {
 		if _, ok := raw.Messages[i]["delivery"]; ok {
 			t.Fatalf("message %d must omit delivery: %+v", i, raw.Messages[i])
 		}
+	}
+}
+
+func TestMessagesIncludeSafeMarkdownHTMLForAgentText(t *testing.T) {
+	messages := messagesFromHistory([]llm.Item{
+		{Type: llm.ItemMessage, Role: llm.RoleUser, Origin: llm.OriginHuman, Content: "**literal human input**"},
+		{Type: llm.ItemMessage, Role: llm.RoleUser, Origin: llm.OriginAgent, Content: "## Report\n\n- done"},
+		{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "**bold** <script>alert(1)</script> [bad](javascript:alert(1))"},
+	})
+	if len(messages) != 3 {
+		t.Fatalf("messages = %+v", messages)
+	}
+	if messages[0].HTML != "" {
+		t.Fatalf("human-authored text must remain literal, html = %q", messages[0].HTML)
+	}
+	if !strings.Contains(messages[1].HTML, "<h2>Report</h2>") ||
+		!strings.Contains(messages[1].HTML, "<li>done</li>") {
+		t.Fatalf("agent Markdown was not rendered: %q", messages[1].HTML)
+	}
+	if !strings.Contains(messages[2].HTML, "<strong>bold</strong>") {
+		t.Fatalf("assistant Markdown was not rendered: %q", messages[2].HTML)
+	}
+	if strings.Contains(messages[2].HTML, "<script>") ||
+		!strings.Contains(messages[2].HTML, "&lt;script&gt;") {
+		t.Fatalf("raw HTML was not escaped in safe mode: %q", messages[2].HTML)
+	}
+	if strings.Contains(strings.ToLower(messages[2].HTML), "javascript:") {
+		t.Fatalf("active link scheme survived sanitization: %q", messages[2].HTML)
 	}
 }
 
@@ -1640,10 +1669,11 @@ func TestCapabilitiesKeyIsAlwaysPresent(t *testing.T) {
 		if !ok {
 			t.Fatalf("capabilities key missing: %v", payload)
 		}
-		// Every response form must keep advertising the approval-mode route and
-		// must advertise the agent-names guarantee.
+		// Every response form must keep advertising the approval-mode route,
+		// agent-name guarantee, and Markdown message representation.
 		assertCapability(t, caps, "approval_mode")
 		assertCapability(t, caps, "agent_names")
+		assertCapability(t, caps, "markdown_html")
 	}
 
 	// GET /api/v1/session advertises the approval-mode route and agent names.
