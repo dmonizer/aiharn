@@ -434,6 +434,146 @@ func TestSessionSubmitRecordsLastError(t *testing.T) {
 	}
 }
 
+func TestSessionCancelStopsTurnAndClearsQueue(t *testing.T) {
+	bc := newBlockingClient()
+	b := &fakeBuild{client: func() llm.Client { return bc }}
+	m := newTestManager(t, SessionManagerOptions{BuildRuntime: b.build, ID: counterIDs()})
+	ctx := context.Background()
+	d := m.Default()
+
+	if err := d.Submit(ctx, "", "first"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	select {
+	case <-bc.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first turn never started")
+	}
+	for i := range 3 {
+		if err := d.Submit(ctx, "", fmt.Sprintf("queued %d", i)); err != nil {
+			t.Fatalf("Submit %d: %v", i, err)
+		}
+	}
+	if got := d.Queued(); got != 3 {
+		t.Fatalf("Queued = %d, want 3", got)
+	}
+
+	affected, err := d.Cancel(ctx)
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if affected < 4 {
+		t.Fatalf("Cancel affected = %d, want at least the active turn and 3 queued prompts", affected)
+	}
+	if got := d.Queued(); got != 0 {
+		t.Fatalf("Queued after Cancel = %d, want 0", got)
+	}
+	waitFor(t, "the cancelled turn to return the agent to idle", func() bool {
+		return d.Agent().State() == agent.StateIdle
+	})
+	if got := d.LastError(); got != "" {
+		t.Fatalf("LastError after Cancel = %q, want empty", got)
+	}
+
+	// The session stays usable after a stop.
+	close(bc.release)
+	if err := d.Submit(ctx, "", "after"); err != nil {
+		t.Fatalf("Submit after Cancel: %v", err)
+	}
+	waitFor(t, "a new turn after Cancel", func() bool {
+		return historyContains(d.Agent().History(), "after")
+	})
+	if got := d.LastError(); got != "" {
+		t.Fatalf("LastError after post-cancel turn = %q, want empty", got)
+	}
+}
+
+func TestSessionCancelDoesNotDropLaterMessages(t *testing.T) {
+	m := newTestManager(t, SessionManagerOptions{ID: counterIDs()})
+	ctx := context.Background()
+	d := m.Default()
+
+	if _, err := d.Cancel(ctx); err != nil {
+		t.Fatalf("Cancel on an idle session: %v", err)
+	}
+	if err := d.Submit(ctx, "", "later"); err != nil {
+		t.Fatalf("Submit after Cancel: %v", err)
+	}
+	waitFor(t, "the post-cancel turn to run", func() bool {
+		return historyContains(d.Agent().History(), "later") && historyContains(d.Agent().History(), "reply 1")
+	})
+	if got := d.LastError(); got != "" {
+		t.Fatalf("LastError = %q, want empty", got)
+	}
+}
+
+func TestSessionCancelDeniesPendingApproval(t *testing.T) {
+	m := newTestManager(t, SessionManagerOptions{ID: counterIDs()})
+	d := m.Default()
+	gate := d.Gate()
+	gate.SetMode(approval.ModeAsk)
+
+	decision := make(chan approval.Decision, 1)
+	go func() {
+		d, _ := gate.Check(context.Background(), approval.Request{
+			AgentID: "main", AgentType: "main",
+			ToolName: "execute_command", Command: "whoami",
+		})
+		decision <- d
+	}()
+
+	var req approval.Request
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		pending := gate.PendingRequests()
+		if len(pending) > 0 {
+			req = pending[0]
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if req.ID == "" {
+		t.Fatal("approval request never became pending")
+	}
+
+	if _, err := d.Cancel(context.Background()); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	select {
+	case got := <-decision:
+		if got != approval.DecisionDenied {
+			t.Fatalf("decision = %v, want denied", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel did not deny the pending approval")
+	}
+	if got := gate.PendingRequests(); len(got) != 0 {
+		t.Fatalf("pending approvals after Cancel = %v, want none", got)
+	}
+}
+
+func TestSessionBeginTurnRejectsStaleEpoch(t *testing.T) {
+	var s Session
+	s.turnMu.Lock()
+	s.turnEpoch = 5
+	s.turnMu.Unlock()
+
+	if s.beginTurn(4, func() {}) {
+		t.Fatal("beginTurn accepted a prompt stamped before the stop")
+	}
+	if !s.beginTurn(5, func() {}) {
+		t.Fatal("beginTurn rejected a prompt stamped at the current epoch")
+	}
+	if s.turnCancel == nil {
+		t.Fatal("beginTurn did not publish the turn-cancel handle")
+	}
+	s.endTurn(nil)
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turnCancel != nil {
+		t.Fatal("endTurn did not clear the turn-cancel handle")
+	}
+}
+
 func TestSessionSubmitQueueFull(t *testing.T) {
 	bc := newBlockingClient()
 	b := &fakeBuild{client: func() llm.Client { return bc }}

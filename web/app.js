@@ -381,7 +381,7 @@
     const entry = (snapshot?.agents || []).find((agent) => agent && agent.id === id);
     elements.agentTitle.textContent = label === id ? id : label + (entry?.type ? " · " + entry.type : "");
     elements.message.disabled = true;
-    elements.send.disabled = true;
+    resetSendButton();
     elements.transcript.replaceChildren(emptyState("Loading agent…", id));
     renderPendingAgentMessages();
     poll();
@@ -448,7 +448,7 @@
     elements.approvals.replaceChildren();
     renderPendingAgentMessages();
     elements.message.disabled = true;
-    elements.send.disabled = true;
+    resetSendButton();
     elements.queue.textContent = "";
     state.connected = false;
     elements.transcript.replaceChildren(emptyState(
@@ -700,7 +700,8 @@
       : "";
     const unavailable = session.state === "closed" || session.state === "errored";
     elements.message.disabled = unavailable;
-    elements.send.disabled = unavailable || !elements.message.value.trim();
+    state.connected = true;
+    updateComposer();
     renderApprovals(snapshot.pending_approvals || [], snapshot.pending_tool_limits || []);
     renderMessages(snapshot.messages || [], snapshot.live_reasoning);
     renderPendingAgentMessages(snapshot.pending_agent_messages);
@@ -709,7 +710,6 @@
     else if (snapshot.agents_error) showConnection(snapshot.agents_error);
     else if (snapshot.last_error) showConnection(snapshot.last_error);
     else hideConnection();
-    state.connected = true;
   }
 
   // Agent messages still queued in an inbox are not part of the transcript
@@ -1285,7 +1285,7 @@
           state.fingerprint = "";
           state.connected = false;
           elements.message.disabled = true;
-          elements.send.disabled = true;
+          resetSendButton();
           showConnection("Selected agent is no longer available; returning to main.");
         } else {
           state.sessionId = state.defaultSessionId || "";
@@ -1301,7 +1301,7 @@
       state.fingerprint = "";
       state.connected = false;
       elements.message.disabled = true;
-      elements.send.disabled = true;
+      resetSendButton();
       showConnection(error.status === 401
         ? "Invalid username or password. Open settings to log in."
         : error.message);
@@ -1317,10 +1317,38 @@
     }
   }
 
+  async function stopRequests() {
+    if (!state.endpoint) return;
+    if (!state.connected) {
+      showConnection("Not connected to the API.");
+      return;
+    }
+    const payload = {};
+    if (state.sessionSupport === true && state.sessionId) {
+      payload.session_id = state.sessionId;
+    }
+    elements.send.disabled = true;
+    try {
+      await apiCall("/session/cancel", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      await poll(true);
+    } catch (error) {
+      showConnection(error.message || "Could not stop requests.");
+    } finally {
+      updateComposer();
+    }
+  }
+
   async function sendMessage(event) {
     event?.preventDefault();
-    const agentID = selectedAgentID();
     const snapshot = state.snapshots.get(state.sessionId);
+    if (state.connected && canCancel(snapshot) && sessionBusy(snapshot)) {
+      await stopRequests();
+      return;
+    }
+    const agentID = selectedAgentID();
     const rootID = snapshot?.agents?.[0]?.id || snapshot?.session?.agent_id || "";
     const content = elements.message.value;
     if (!state.endpoint || !state.connected || elements.message.disabled || !content.trim()) return;
@@ -1339,8 +1367,7 @@
     } catch (error) {
       showConnection(error.message);
     } finally {
-      elements.send.disabled = !state.connected || elements.message.disabled ||
-        !elements.message.value.trim();
+      updateComposer();
     }
   }
 
@@ -1400,9 +1427,60 @@
     }, 0);
   }
 
+  function resetSendButton() {
+    elements.send.textContent = "↑";
+    elements.send.classList.remove("stop");
+    elements.send.setAttribute("aria-label", "Send message");
+    elements.send.disabled = true;
+  }
+
+  // sessionBusy reports whether any LLM request, queued prompt, or pending
+  // approval is still active. This is the web console's equivalent of the TUI's
+  // "there is work to stop" test. "starting" is deliberately NOT treated as
+  // busy: a fresh, never-used agent reports "starting" while it is really idle.
+  function sessionBusy(snapshot) {
+    if (!snapshot) return false;
+    const session = snapshot.session || {};
+    const agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
+    const agentBusy = agents.some((agent) => agent && agent.state === "running");
+    const stateBusy = session.state === "running";
+    const queued = Number(snapshot.queued_messages) > 0;
+    const approvals = Array.isArray(snapshot.pending_approvals) &&
+      snapshot.pending_approvals.length > 0;
+    const toolLimits = Array.isArray(snapshot.pending_tool_limits) &&
+      snapshot.pending_tool_limits.length > 0;
+    const pendingAgentMessages = Array.isArray(snapshot.pending_agent_messages) &&
+      snapshot.pending_agent_messages.length > 0;
+    return Boolean(stateBusy || agentBusy || queued || approvals || toolLimits ||
+      pendingAgentMessages);
+  }
+
+  function canCancel(snapshot) {
+    return Array.isArray(snapshot?.capabilities) &&
+      snapshot.capabilities.indexOf("session_cancel") !== -1;
+  }
+
   function updateComposer() {
-    elements.send.disabled = !state.connected || elements.message.disabled ||
-      !elements.message.value.trim();
+    const snapshot = state.snapshots.get(state.sessionId);
+    const session = snapshot?.session || {};
+    const unavailable = session.state === "closed" || session.state === "errored";
+
+    // Stop availability is driven by connection state and actual work, not by
+    // the selected agent's state: a user can still stop the whole session even
+    // while viewing a subagent that already errored or closed.
+    if (state.connected && canCancel(snapshot) && sessionBusy(snapshot)) {
+      elements.send.textContent = "Stop";
+      elements.send.classList.add("stop");
+      elements.send.setAttribute("aria-label", "Stop all requests");
+      elements.send.disabled = false;
+      return;
+    }
+
+    elements.send.textContent = "↑";
+    elements.send.classList.remove("stop");
+    elements.send.setAttribute("aria-label", "Send message");
+    elements.send.disabled = !state.connected || !snapshot || unavailable ||
+      elements.message.disabled || !elements.message.value.trim();
   }
 
   function refreshAfterEndpointChange() {

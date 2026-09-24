@@ -90,6 +90,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
 	mux.HandleFunc("/api/v1/session/channel", s.handleSessionChannel)
+	mux.HandleFunc("/api/v1/session/cancel", s.handleSessionCancel)
 	mux.HandleFunc("/api/v1/messages", s.handleMessages)
 	mux.HandleFunc("/api/v1/approvals/", s.handleApproval)
 	mux.HandleFunc("/api/v1/tool-limits/", s.handleToolLimit)
@@ -318,13 +319,14 @@ const agentNamesCapability = "agent_names"
 const toolLimitsCapability = "tool_limits"
 const channelSwitchCapability = "channel_switch"
 const markdownHTMLCapability = "markdown_html"
+const sessionCancelCapability = "session_cancel"
 
 // capabilities returns a fresh slice for each response. A shared backing array
 // would let one caller's mutation leak into another payload, and keeping the
 // list in one place stops GET /api/v1/session and the session descriptors from
 // drifting apart.
 func capabilities() []string {
-	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability}
+	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability, sessionCancelCapability}
 }
 
 // channelDescriptors renders every configured execution channel for the wire.
@@ -789,6 +791,41 @@ func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"channel": handle.Channel()})
+}
+
+// handleSessionCancel stops every active and queued request in the addressed
+// session without closing it. This is the web console's equivalent of the TUI's
+// Esc stop-everything behaviour.
+func (s *Server) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		return
+	}
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	affected, err := handle.Cancel(r.Context())
+	if err != nil {
+		switch {
+		case errors.Is(err, sessions.ErrClosed):
+			writeError(w, http.StatusConflict, "session is closed")
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// The client is gone; there is nothing left to write.
+			return
+		default:
+			writeError(w, http.StatusBadGateway, "cannot cancel requests: "+err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stopped": true, "affected": affected})
 }
 
 // decodeOptionalJSON decodes an optional single JSON object. An empty body is

@@ -630,6 +630,14 @@ body.resizing .composer-resize::before { background: var(--accent); }
   font-weight: 800;
 }
 .send-button:disabled { cursor: not-allowed; opacity: .25; }
+.send-button.stop {
+  width: auto;
+  padding: 0 13px;
+  color: #2a0808;
+  background: var(--danger);
+  font-size: 12px;
+  font-weight: 800;
+}
 .composer-hint { display: flex; grid-column: 1 / -1; justify-content: space-between; color: var(--faint); font-size: 9px; }
 
 .primary-button {

@@ -56,6 +56,11 @@ type Handle interface {
 	// Submit enqueues content for this session. An empty agentID addresses the
 	// top-level agent; otherwise agentID must name a subagent of this session.
 	Submit(ctx context.Context, agentID, content string) error
+	// Cancel stops this session's active and queued work: it cancels every
+	// agent turn, discards queued top-level prompts and subagent tasks, and
+	// denies any pending approval requests. It leaves the session open and
+	// reusable. The returned count is a best-effort count of affected work items.
+	Cancel(ctx context.Context) (int, error)
 	Queued() int
 	LastError() string
 	// SetChannel switches the session's active execution channel for subsequent

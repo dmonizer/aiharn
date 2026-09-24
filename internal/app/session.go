@@ -29,6 +29,15 @@ const (
 	defaultSessionName = "Default"
 )
 
+// queuedPrompt is one top-level prompt waiting for the queue worker, stamped
+// with the stop epoch that was current when it was enqueued. beginTurn rejects
+// a prompt whose stamp no longer matches, which is what makes Cancel drop
+// exactly the prompts queued before the stop without discarding later ones.
+type queuedPrompt struct {
+	content string
+	epoch   uint64
+}
+
 // Session is one conversation session: its own Runtime (agent tree, approval
 // gate, transports), its own transcript, and its own message queue.
 type Session struct {
@@ -36,7 +45,7 @@ type Session struct {
 	name       string
 	createdAt  time.Time
 	rt         *Runtime
-	queue      chan string
+	queue      chan queuedPrompt
 	transcript sessions.Transcript // nil when transcripts are disabled
 
 	ctx    context.Context
@@ -46,6 +55,13 @@ type Session struct {
 	mu        sync.Mutex
 	lastError string
 	closed    bool
+
+	// turnMu guards the queue worker's active-turn handle and the stop epoch.
+	// Every enqueued prompt carries the epoch current at Submit time, so Cancel
+	// can advance the epoch and drop exactly the prompts queued before it.
+	turnMu     sync.Mutex
+	turnCancel context.CancelFunc
+	turnEpoch  uint64
 }
 
 var (
@@ -62,7 +78,7 @@ func newSession(id, name string, rt *Runtime, transcript sessions.Transcript) *S
 		name:       name,
 		createdAt:  time.Now(),
 		rt:         rt,
-		queue:      make(chan string, defaultQueueSize),
+		queue:      make(chan queuedPrompt, defaultQueueSize),
 		transcript: transcript,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -138,8 +154,9 @@ func (s *Session) Submit(ctx context.Context, agentID, content string) error {
 		return sessions.ErrClosed
 	default:
 	}
+	prompt := queuedPrompt{content: content, epoch: s.turnEpochNow()}
 	select {
-	case s.queue <- content:
+	case s.queue <- prompt:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -152,6 +169,98 @@ func (s *Session) Submit(ctx context.Context, agentID, content string) error {
 
 // Queued returns the number of messages waiting in the session queue.
 func (s *Session) Queued() int { return len(s.queue) }
+
+// Cancel stops every active and queued piece of work in this session without
+// closing it. It mirrors the TUI's stop-everything Esc behaviour: agent turns
+// are cancelled, queued top-level prompts and subagent tasks are discarded, and
+// pending approval requests are denied so no agent remains blocked. The
+// returned count is a best-effort count of affected work items.
+func (s *Session) Cancel(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s.isClosed() {
+		return 0, sessions.ErrClosed
+	}
+
+	// Advance the epoch first so any prompt enqueued after this point is
+	// stamped for the new epoch and will survive the drain below.
+	s.turnMu.Lock()
+	s.turnEpoch++
+	turnCancel := s.turnCancel
+	s.turnMu.Unlock()
+
+	affected := 0
+	// Manager.CancelAll cancels the active top-level turn and every subagent
+	// turn, and discards queued subagent tasks; its count is authoritative for
+	// agent work.
+	if s.rt.Manager != nil {
+		n, err := s.rt.Manager.CancelAll()
+		affected += n
+		if err != nil {
+			return affected, err
+		}
+	}
+	// turnCancel covers the narrow window where a prompt passed beginTurn but
+	// the agent has not yet installed its own turn-cancel handle. It is not
+	// counted separately: the agent turn, when already started, is part of the
+	// Manager.CancelAll count above.
+	if turnCancel != nil {
+		turnCancel()
+	}
+
+	// Discard every top-level prompt still waiting in the queue. A prompt that
+	// already left the queue carries a pre-stop epoch and is dropped by
+	// beginTurn before its turn starts.
+	for {
+		select {
+		case <-s.queue:
+			affected++
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	if s.rt.Gate != nil {
+		for _, req := range s.rt.Gate.PendingRequests() {
+			affected++
+			_ = s.rt.Gate.Decide(req.ID, approval.DecisionDenied)
+		}
+	}
+	return affected, nil
+}
+
+// turnEpochNow returns the current stop epoch, stamped onto a prompt when it is
+// enqueued. beginTurn rejects a prompt whose stamp no longer matches, so Cancel
+// drops exactly the prompts queued before the stop and keeps later ones.
+func (s *Session) turnEpochNow() uint64 {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	return s.turnEpoch
+}
+
+// beginTurn publishes the queue worker's turn cancel handle unless a stop has
+// happened since the prompt was enqueued. It returns false when the prompt must
+// be discarded.
+func (s *Session) beginTurn(epoch uint64, cancel context.CancelFunc) bool {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if epoch != s.turnEpoch {
+		return false
+	}
+	s.turnCancel = cancel
+	return true
+}
+
+// endTurn clears the queue worker's turn cancel handle once the turn finishes.
+// The queue worker runs one turn at a time, so the current handle is always the
+// one being cleared.
+func (s *Session) endTurn(_ context.CancelFunc) {
+	s.turnMu.Lock()
+	s.turnCancel = nil
+	s.turnMu.Unlock()
+}
 
 // LastError returns the error of the most recent failed turn, or "".
 func (s *Session) LastError() string {
@@ -189,9 +298,21 @@ func (s *Session) runQueue() {
 	defer s.wg.Done()
 	for {
 		select {
-		case content := <-s.queue:
+		case prompt := <-s.queue:
 			s.setLastError("")
-			if err := s.rt.Agent.Turn(s.ctx, content); err != nil && s.ctx.Err() == nil {
+			turnCtx, cancel := context.WithCancel(s.ctx)
+			if !s.beginTurn(prompt.epoch, cancel) {
+				// Cancel advanced the epoch after this prompt was enqueued; drop
+				// it rather than starting a doomed turn.
+				cancel()
+				continue
+			}
+			err := s.rt.Agent.Turn(turnCtx, prompt.content)
+			cancel()
+			s.endTurn(cancel)
+			// A cancellation caused by Cancel or session shutdown is not an
+			// error; a genuine turn failure still surfaces through LastError.
+			if err != nil && s.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 				s.setLastError(err.Error())
 			}
 		case <-s.ctx.Done():

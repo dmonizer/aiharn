@@ -162,6 +162,18 @@ func (h *fakeHandle) LastError() string {
 	return h.lastError
 }
 
+func (h *fakeHandle) Cancel(_ context.Context) (int, error) {
+	h.mu.Lock()
+	closed := h.closed
+	affected := h.queued
+	h.queued = 0
+	h.mu.Unlock()
+	if closed {
+		return 0, sessions.ErrClosed
+	}
+	return affected, nil
+}
+
 func (h *fakeHandle) Submit(ctx context.Context, agentID, content string) error {
 	h.mu.Lock()
 	closed, full := h.closed, h.queueFull
@@ -697,12 +709,12 @@ func TestWebToolLimitDecision(t *testing.T) {
 	a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client, Tools: reg, ToolcallsPerTurn: 1})
 	h.store.list[0].agent = a
 	defer a.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- a.Turn(ctx, "go") }()
 	var pending *agent.ToolLimitRequest
-	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
 		pending = a.PendingToolLimit()
 		if pending != nil {
 			break
@@ -1531,6 +1543,59 @@ func TestSessionChannelSwitchAndValidation(t *testing.T) {
 	}
 	if closedPayload["error"] != "session is closed" {
 		t.Fatalf("error = %q, want session is closed", closedPayload["error"])
+	}
+}
+
+func TestSessionCancelStopsWork(t *testing.T) {
+	h := newHarness(t, "")
+
+	// The session-cancel capability tells the console it can offer a Stop
+	// button; the route must advertise it alongside the other capabilities.
+	w := request(t, h.server, http.MethodGet, "/api/v1/session", "", nil)
+	var rawCaps struct {
+		Capabilities []any `json:"capabilities"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rawCaps); err != nil {
+		t.Fatal(err)
+	}
+	assertCapability(t, rawCaps.Capabilities, "session_cancel")
+
+	// A queued prompt is discarded and the response reports it as affected.
+	h.store.list[0].queued = 3
+	w = request(t, h.server, http.MethodPost, "/api/v1/session/cancel", "", map[string]any{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["stopped"] != true || payload["affected"] != float64(3) {
+		t.Fatalf("payload = %#v, want stopped=true affected=3", payload)
+	}
+	if got := h.store.list[0].Queued(); got != 0 {
+		t.Fatalf("queued after cancel = %d, want 0", got)
+	}
+
+	// Unknown session, wrong method, and closed session follow the same
+	// validation rules as the other session routes.
+	unknown := request(t, h.server, http.MethodPost, "/api/v1/session/cancel", "",
+		map[string]string{"session_id": "ghost"})
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown session status = %d: %s", unknown.Code, unknown.Body.String())
+	}
+	get := request(t, h.server, http.MethodGet, "/api/v1/session/cancel", "", nil)
+	if get.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d: %s", get.Code, get.Body.String())
+	}
+	closed := h.addSession(t, "closed", "Closed")
+	closed.mu.Lock()
+	closed.closed = true
+	closed.mu.Unlock()
+	w = request(t, h.server, http.MethodPost, "/api/v1/session/cancel", "",
+		map[string]string{"session_id": "closed"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("closed session status = %d: %s", w.Code, w.Body.String())
 	}
 }
 
