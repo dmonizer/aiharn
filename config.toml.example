@@ -82,8 +82,11 @@ model = "zai_glm"     # required; validated at startup
 description = "General coordinator; delegates planning and operator tasks"
 # This file may contain ${SKILLS_INDEX}, expanded from <aiharn_home>/skills/index.md.
 system_prompt = "prompts/main_pentester.md"
-# channel = "" # default: first channel; explicit "sf" is equivalent here
+# channel = "" # main agent default: first channel; explicit "sf" is equivalent here
 channel = "sf"
+# Subagent types without a channel inherit the main agent's channel instead of
+# defaulting to the first channel, so a top-level --channel or runtime switch
+# also applies to subagents spawned afterwards.
 # working_dir is unset by default; an agent override takes precedence over its channel's.
 # working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"
 # tools = "none" # default; accepts "ALL", "NONE", "execute_command,spawn_subagent", or a TOML array (including ["ALL"] or ["NONE"])

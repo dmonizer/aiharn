@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/crypto/ssh"
@@ -32,6 +33,9 @@ type Server struct {
 	procs  map[*exec.Cmd]struct{}
 	closed bool
 	wg     sync.WaitGroup
+
+	// sessions counts accepted "exec" requests (one per open persistent shell).
+	sessions int64
 
 	errs chan error
 }
@@ -110,6 +114,10 @@ func (s *Server) WriteKnownHosts(path string) error {
 
 // Errors returns server-side errors (buffered; non-blocking to publish).
 func (s *Server) Errors() <-chan error { return s.errs }
+
+// SessionCount returns the number of shell sessions opened so far. It is used
+// by tests to prove which transport a command actually used.
+func (s *Server) SessionCount() int64 { return atomic.LoadInt64(&s.sessions) }
 
 func (s *Server) publishErr(err error) {
 	select {
@@ -229,6 +237,7 @@ func (s *Server) handleChannel(newCh ssh.NewChannel) {
 		for req := range reqs {
 			switch req.Type {
 			case "exec":
+				atomic.AddInt64(&s.sessions, 1)
 				var p struct{ Command string }
 				if err := ssh.Unmarshal(req.Payload, &p); err != nil {
 					req.Reply(false, nil)

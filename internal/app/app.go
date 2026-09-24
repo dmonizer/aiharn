@@ -284,20 +284,31 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 
 	var mgr *agent.Manager
 	observer := opts.Observer
+	var controller *channelController
+	// mainChannel reports the main agent's current channel. It is read when a
+	// subagent is actually spawned (not at Build time), so a later channel
+	// switch also applies to subagents spawned afterwards.
+	mainChannel := func() string {
+		if controller != nil {
+			return controller.Name()
+		}
+		return channelCfg.Name
+	}
 	mgr = agent.NewManager(agent.ManagerOptions{
 		MaxDepth:      cfg.Limits.MaxAgentDepth,
 		MaxAgents:     cfg.Limits.MaxOpenAgents,
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
-		SubagentTypes: configuredSubagentTypes(cfg),
+		SubagentTypes: configuredSubagentTypes(cfg, channelCfg.Name),
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
-			return buildAgent(ctx, cfg, tc, mgr, gate, spec, agentOverrides{}, observer, nil)
+			return buildAgent(ctx, cfg, tc, mgr, gate, spec,
+				agentOverrides{Channel: subagentChannel(cfg, spec.Type, mainChannel())}, observer, nil)
 		},
 	})
 
 	fmt.Fprintf(os.Stderr, "aiharn: connecting to channel %q (%s)...\n", channelCfg.Name, channelTarget(channelCfg))
 
-	controller, err := newChannelController(ctx, cfg, tc, agentCfg, agentType, channelCfg.Name)
+	controller, err = newChannelController(ctx, cfg, tc, agentCfg, agentType, channelCfg.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -668,10 +679,20 @@ func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defa
 	return reg, nil
 }
 
-func configuredSubagentTypes(cfg *config.Config) []tools.SubagentType {
+// subagentChannel resolves the channel a subagent type uses. A type with no
+// explicit channel inherits the main agent's current channel; an explicitly
+// configured channel still wins.
+func subagentChannel(cfg *config.Config, agentType, mainChannel string) string {
+	if a, ok := cfg.Agents[agentType]; ok && a.Channel != "" {
+		return a.Channel
+	}
+	return mainChannel
+}
+
+func configuredSubagentTypes(cfg *config.Config, mainChannel string) []tools.SubagentType {
 	types := make([]tools.SubagentType, 0, len(cfg.Agents))
 	for name, agentCfg := range cfg.Agents {
-		channel := agentCfg.Channel
+		channel := subagentChannel(cfg, name, mainChannel)
 		if channel == "" && len(cfg.Channels) > 0 {
 			channel = cfg.Channels[0].Name
 		}

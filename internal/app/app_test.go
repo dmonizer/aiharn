@@ -122,9 +122,11 @@ func TestConfiguredSubagentTypes(t *testing.T) {
 			"alpha": {Model: "model-a", Channel: "other"},
 		},
 	}
-	types := configuredSubagentTypes(cfg)
+	// A subagent with no explicit channel inherits the main agent's channel;
+	// one with an explicit channel keeps it.
+	types := configuredSubagentTypes(cfg, "ssh-main")
 	if len(types) != 2 || types[0].Name != "alpha" || types[0].Channel != "other" ||
-		types[1].Name != "zeta" || types[1].Channel != "first" ||
+		types[1].Name != "zeta" || types[1].Channel != "ssh-main" ||
 		types[1].Description != "Delegator" || !types[1].AllowSubagents {
 		t.Fatalf("configured types = %+v", types)
 	}
