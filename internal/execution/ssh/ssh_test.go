@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"os"
@@ -21,7 +22,12 @@ import (
 
 func newServer(t *testing.T) *harness.Server {
 	t.Helper()
-	srv, err := harness.New("/bin/bash")
+	return newServerWithHostKeys(t)
+}
+
+func newServerWithHostKeys(t *testing.T, extra ...ssh.Signer) *harness.Server {
+	t.Helper()
+	srv, err := harness.New("/bin/bash", extra...)
 	if err != nil {
 		t.Fatalf("harness.New: %v", err)
 	}
@@ -345,5 +351,31 @@ func TestNewTransportValidation(t *testing.T) {
 				t.Fatalf("got %v, want containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestHostKeyAlgorithmPrefersEd25519(t *testing.T) {
+	rsaPriv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	rsaSigner, err := ssh.NewSignerFromKey(rsaPriv)
+	if err != nil {
+		t.Fatalf("ssh.NewSignerFromKey: %v", err)
+	}
+
+	srv := newServerWithHostKeys(t, rsaSigner)
+
+	kh := filepath.Join(t.TempDir(), "known_hosts")
+	if err := srv.WriteKnownHosts(kh); err != nil {
+		t.Fatalf("WriteKnownHosts: %v", err)
+	}
+
+	tr := newTransport(t, srv, execssh.Options{KnownHosts: kh})
+	s := openSession(t, tr)
+
+	r := execCmd(t, s, "printf 'ed25519'")
+	if r.Stdout != "ed25519" {
+		t.Fatalf("stdout = %q, want %q", r.Stdout, "ed25519")
 	}
 }

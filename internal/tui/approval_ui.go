@@ -17,6 +17,7 @@ func (h approvalHit) contains(x, y int) bool {
 var (
 	styleApprovalLink = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Underline(true).Bold(true)
 	styleApprovalFull = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	styleApprovalPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 )
 
 // previewCommand limits the entire visible command preview, including the
@@ -58,20 +59,23 @@ func (m *Model) approvalPrompt() string {
 		limit = 3
 	}
 	short, truncated := previewCommand(command, limit)
-	first := "approve " + short
+	lead := "approve " + short
+	var first string
 	if truncated {
-		m.approvalLinkHit = approvalHit{x: uniseg.StringWidth(first), y: m.rows(), width: 3}
+		m.approvalLinkHit = approvalHit{x: uniseg.StringWidth(lead), y: m.rows(), width: 3}
 		link := styleApprovalLink
 		if m.approvalLinkHit.contains(m.hoverX, m.hoverY) {
 			link = link.Reverse(true)
 		}
-		first += link.Render("...")
+		first = styleApprovalPrompt.Render(lead) + link.Render("...") + styleApprovalPrompt.Render("?")
+	} else {
+		first = styleApprovalPrompt.Render(lead + "?")
 	}
-	first += "?"
-	second := "[y]es [n]o [a]llow-all"
+	secondText := "[y]es [n]o [a]llow-all"
 	if len(m.approvals) > 0 {
-		second += fmt.Sprintf(" (%d queued)", len(m.approvals))
+		secondText += fmt.Sprintf(" (%d queued)", len(m.approvals))
 	}
+	second := styleApprovalPrompt.Render(secondText)
 	// Both prompt rows must fit the terminal: the options row is a fixed
 	// string, so on a very narrow terminal it would otherwise render two
 	// columns wider than the screen. Clamping the preview line also drops the

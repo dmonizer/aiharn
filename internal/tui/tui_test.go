@@ -472,6 +472,21 @@ func TestQuitOnCtrlC(t *testing.T) {
 	}
 }
 
+func TestQuitOnCtrlD(t *testing.T) {
+	m := newTestModel(t)
+	_, cmd := upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlD})
+	if cmd == nil {
+		t.Fatal("expected quit command")
+	}
+	msg := runCmd(cmd)
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("cmd() = %T, want tea.QuitMsg", msg)
+	}
+	if m.ctx.Err() == nil {
+		t.Fatal("expected context cancelled on ctrl+d")
+	}
+}
+
 func TestQuitCommand(t *testing.T) {
 	m := New(nil, nil, nil, Status{})
 	cmd := m.handleCommand("/quit")
@@ -506,7 +521,7 @@ func TestStyleLineColors(t *testing.T) {
 		{kindPlain, ""},
 		{kindAssistant, ""},
 		{kindUser, "36"},
-		{kindTool, "33"},
+		{kindTool, "93"},
 		{kindError, "31"},
 	}
 	for _, c := range cases {

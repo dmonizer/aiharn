@@ -45,8 +45,10 @@ type Options struct {
 	// resolution). A rejected or malformed entry is ignored, matching OpenSSH.
 	Env []string
 
-	// SSHConfigAlias, when true, treats Host as an OpenSSH ~/.ssh/config alias
-	// and resolves HostName, Port, User, IdentityFile, and KnownHosts from it.
+	// SSHConfigAlias, when true, resolves Host through ~/.ssh/config whenever
+	// Host is not an IP literal: a matching alias is applied if present, and the
+	// explicit fields are used otherwise. IP literals always use the explicit
+	// fields directly.
 	SSHConfigAlias bool
 }
 
@@ -68,14 +70,24 @@ func NewTransport(opts Options) (*Transport, error) {
 	if opts.Host == "" {
 		return nil, errors.New("ssh: host is required")
 	}
-	if opts.SSHConfigAlias {
+	if opts.SSHConfigAlias && !isIPLiteral(opts.Host) {
 		configPath, err := defaultSSHConfigPath()
 		if err != nil {
 			return nil, err
 		}
-		opts, err = resolveAlias(opts, configPath)
-		if err != nil {
-			return nil, err
+		if aliasOnly(opts) {
+			opts, err = resolveAlias(opts, configPath)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			resolved, found, err := tryResolveAlias(opts, configPath)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				opts = resolved
+			}
 		}
 	}
 	if opts.Port == 0 {
@@ -268,6 +280,29 @@ func dial(ctx context.Context, opts Options) (*ssh.Client, error) {
 	return ssh.NewClient(conn, chans, reqs), nil
 }
 
+// preferredHostKeyAlgorithms mirrors OpenSSH's default hostkeyalgorithms
+// order (see `ssh -Q key` / `ssh -G host | grep hostkeyalgorithms`).
+// x/crypto's default puts Ed25519 last among plain keys, so a server that
+// offers both RSA and Ed25519 would negotiate RSA and then fail against an
+// Ed25519-only known_hosts entry ("knownhosts: key mismatch").
+var preferredHostKeyAlgorithms = []string{
+	ssh.CertAlgoED25519v01,
+	ssh.CertAlgoECDSA256v01,
+	ssh.CertAlgoECDSA384v01,
+	ssh.CertAlgoECDSA521v01,
+	ssh.CertAlgoRSASHA512v01,
+	ssh.CertAlgoRSASHA256v01,
+	ssh.KeyAlgoED25519,
+	ssh.KeyAlgoECDSA256,
+	ssh.KeyAlgoECDSA384,
+	ssh.KeyAlgoECDSA521,
+	ssh.KeyAlgoRSASHA512,
+	ssh.KeyAlgoRSASHA256,
+	// Legacy ssh-rsa-only servers; OpenSSH disables this by default, but
+	// x/crypto supports it. Keep it last as a compatibility fallback.
+	ssh.KeyAlgoRSA,
+}
+
 // buildClientConfig assembles the SSH client config for one of three auth
 // methods: password, key file, or (when neither is set) the SSH agent. The
 // returned release func closes any agent connection and must be called after
@@ -327,6 +362,9 @@ func buildClientConfigContext(ctx context.Context, opts Options) (*ssh.ClientCon
 	cfg := &ssh.ClientConfig{
 		User: opts.User,
 		Auth: []ssh.AuthMethod{auth},
+		// Prefer OpenSSH's host-key algorithm order so Ed25519 beats RSA/ECDSA
+		// when a server offers both.
+		HostKeyAlgorithms: preferredHostKeyAlgorithms,
 	}
 	if opts.Insecure {
 		cfg.HostKeyCallback = ssh.InsecureIgnoreHostKey()

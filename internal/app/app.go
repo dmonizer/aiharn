@@ -600,7 +600,7 @@ func buildTransport(c config.ChannelConfig) (execution.Transport, error) {
 			KeepAlive:      c.KeepAliveEnabled(),
 			DefaultShell:   c.DefaultShell,
 			RemoteCommand:  c.RemoteCommand,
-			SSHConfigAlias: c.IsSSHConfigAlias(),
+			SSHConfigAlias: true,
 		})
 	case config.ChannelTypeLocal:
 		return execlocal.NewTransport(execlocal.Options{

@@ -38,7 +38,7 @@ type Server struct {
 
 // New starts a server on 127.0.0.1:0 accepting any client and running shell for
 // remote commands. Call Close when done.
-func New(shell string) (*Server, error) {
+func New(shell string, extraHostKeys ...ssh.Signer) (*Server, error) {
 	if shell == "" {
 		shell = "/bin/bash"
 	}
@@ -62,6 +62,9 @@ func New(shell string) (*Server, error) {
 		},
 	}
 	config.AddHostKey(signer)
+	for _, k := range extraHostKeys {
+		config.AddHostKey(k)
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

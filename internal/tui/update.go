@@ -129,7 +129,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "ctrl+c" {
+	if msg.String() == "ctrl+c" || msg.String() == "ctrl+d" {
 		m.cancel()
 		return m, tea.Quit
 	}

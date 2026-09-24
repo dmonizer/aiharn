@@ -17,7 +17,7 @@ var (
 	styleUser      = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	styleAssistant = lipgloss.NewStyle()
 	styleReasoning = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	styleTool      = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	// Agent-to-agent traffic gets its own magenta so it is never mistaken for
 	// human input (cyan) or assistant output (default).
