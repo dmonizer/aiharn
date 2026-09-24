@@ -110,47 +110,44 @@ meaning:
   never uses the word for the conversation; its "session" mentions are all about
   the execution-shell pane.)
 
-There is exactly one conversation session per process today, and that is
-load-bearing:
+There is one default conversation session per process (id `default`, name
+`Default`) plus as many additional sessions as the API creates, bounded by
+`api.max_sessions` (default 8). Each session owns its own `Runtime` (its own
+`agent.Manager`, approval `Gate`, and transport cache), transcript, and message
+queue.
 
-- `Manager.RegisterTop` rejects a second depth-0 agent, so one `Manager` means
-  one top-level agent means one conversation session.
-- Exactly three routes exist, registered in `internal/webapi/api.go`: `GET
-  /api/v1/session` (optional `?agent_id=` addresses a subagent), `POST
-  /api/v1/messages`, and `POST /api/v1/approvals/{id}`. There is no session
-  list, create, switch, or delete.
-- `webapi` binds one `Agent` + `Manager` + `Gate` at construction
-  (`cmd/aiharn/main.go`) and owns the single message queue (`chan string` plus a
-  worker goroutine), so `queued_messages` and `last_error` are server-global
-  rather than per-agent, and are reported only when the top-level agent is
-  selected.
-- `cmd/aiharn/main.go` creates one `recorder` per process and passes it as every
-  agent's observer, so the top-level agent and all subagents append to a single
-  transcript file. Approval ids are sequential per `Gate`, so they are unique
-  only within that gate.
-- `docs/remote.md` records the MVP boundary: previous-session discovery and
-  selection are deliberately deferred to a later API version.
-
-Planned and awaiting approval; none of the following exists yet:
-
-- a session layer in `internal/app` where each session owns its own `Runtime`
-  (own `Manager`, `Gate`, transports, recorder, and message queue);
-- `GET`/`POST /api/v1/sessions` plus `PATCH`/`DELETE /api/v1/sessions/{id}`;
-- an optional `session_id` on the three existing routes, defaulting to the
-  default session (the one the TUI drives), so v1 clients keep working;
-- a new `[api] max_sessions` cap;
-- a web sidebar that lists session names, with API endpoint and token
-  configuration moved into a settings dialog.
+- `internal/sessions` declares the `Handle` and `Store` interfaces;
+  `internal/app` implements them as `Session` and `SessionManager`. The default
+  session is the one the terminal UI drives (`SessionManager.DefaultRuntime`).
+- `webapi` binds a `sessions.Store` at construction (`cmd/aiharn/main.go`), so
+  `queued_messages` and `last_error` are per-session (not server-global) and are
+  reported only when the top-level agent is selected.
+- Routes registered in `internal/webapi/api.go`: `GET /api/v1/session` (optional
+  `?session_id=` and `?agent_id=`), `POST /api/v1/messages`,
+  `POST /api/v1/approvals/{id}`, `POST /api/v1/session/approval`,
+  `POST /api/v1/session/channel`, `POST /api/v1/session/cancel` (the web
+  equivalent of the TUI's Esc stop-everything), `POST /api/v1/tool-limits/{id}`,
+  and `GET`/`POST /api/v1/sessions` plus `GET`/`PATCH`/`DELETE
+  /api/v1/sessions/{id}`. The `session_id` field defaults to the default session
+  on every route, so v1 clients keep working.
+- Approval ids are sequential per `Gate` (each session has its own gate), so
+  they are unique only within that gate.
+- Transcripts are per-session by default (`recorder.NewSessionFile`); `--log`
+  switches to one shared per-process recorder, and an overridden empty `--log`
+  disables transcripts. `docs/remote.md` records the current API surface.
 
 ### Web console (`web/`)
 
 `web/app.js` is a single IIFE and `web/index.html` carries no inline script or
 style plus a strict CSP (`script-src 'self'`, so no inline handlers and no
 `eval`); new UI must be `addEventListener`-based code in `app.js`/`styles.css`.
-State lives in memory plus `localStorage` (endpoint list and active selection)
-and `sessionStorage` (bearer token, keyed per endpoint). The transcript is
-rendered from a full `GET /api/v1/session` snapshot polled once per second —
-there is no streaming, and the client keeps no history of its own.
+State lives in memory plus `localStorage` (endpoint and active session
+selection) and `sessionStorage` (HTTP Basic credentials, keyed per endpoint).
+The composer's send button becomes a Stop button while a session has active or
+queued work, and posts `POST /api/v1/session/cancel` to mirror the TUI's Esc
+stop-everything. The transcript is rendered from a full `GET /api/v1/session`
+snapshot polled once per second — there is no streaming, and the client keeps no
+history of its own.
 
 ### Test doubles
 
