@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 	"aiharn/internal/sessions"
 )
 
@@ -85,6 +87,13 @@ func newSession(id, name string, rt *Runtime, transcript sessions.Transcript) *S
 	}
 	s.wg.Add(1)
 	go s.runQueue()
+	if s.rt.Manager != nil {
+		if err := s.rt.Manager.StartTopLoop(s.rt.Agent.ID()); err != nil {
+			// A failure here is unexpected: the default/created session is always
+			// interactive. Surface it rather than silently leaving the loop off.
+			logging.Debug("app: start main loop", slog.String("session_id", id), slog.Any("err", err))
+		}
+	}
 	return s
 }
 

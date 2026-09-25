@@ -29,15 +29,16 @@ type fakeAgent struct {
 	name string
 	typ  string
 	mu   sync.Mutex
-	// history, turns, state and turnErr are mutable and guarded by mu.
-	history []llm.Item
-	turns   chan string
-	state   agent.State
-	turnErr error
+	// history, turns, state, loopActive and turnErr are mutable and guarded by mu.
+	history    []llm.Item
+	turns      chan string
+	state      agent.State
+	loopActive bool
+	turnErr    error
 }
 
 func newFakeAgent() *fakeAgent {
-	return &fakeAgent{id: "main", typ: "main", turns: make(chan string, 8), state: agent.StateIdle}
+	return &fakeAgent{id: "main", typ: "main", turns: make(chan string, 8), state: agent.StateIdle, loopActive: true}
 }
 
 func (a *fakeAgent) ID() string { return a.id }
@@ -67,6 +68,22 @@ func (a *fakeAgent) State() agent.State {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.state
+}
+
+func (a *fakeAgent) MainLoopActive() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.loopActive
+}
+
+func (a *fakeAgent) SetMainLoopActive(active bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == agent.StateClosed {
+		return agent.ErrAgentClosed
+	}
+	a.loopActive = active
+	return nil
 }
 
 func (a *fakeAgent) History() []llm.Item {
@@ -455,6 +472,9 @@ func TestSessionSnapshotAndAuthentication(t *testing.T) {
 	if response.Session.Channel != "channel" {
 		t.Fatalf("channel = %q", response.Session.Channel)
 	}
+	if !response.Session.LoopActive {
+		t.Fatalf("loop_active = %v, want true", response.Session.LoopActive)
+	}
 	if len(response.Messages) != 2 || response.Messages[1].Name != "execute_command" {
 		t.Fatalf("messages = %#v", response.Messages)
 	}
@@ -637,6 +657,9 @@ func TestSessionMessagesCarryDelivery(t *testing.T) {
 	pm := raw.PendingAgentMessages[0]
 	if pm["from"] != subID || pm["to"] != "main" || pm["direction"] != "up" || pm["kind"] != "message" || pm["content"] != "status?" {
 		t.Fatalf("pending message = %+v", pm)
+	}
+	if _, ok := pm["seq"].(float64); !ok {
+		t.Fatalf("pending message missing numeric seq: %+v", pm)
 	}
 
 	assertCapability(t, raw.Capabilities, "agent_messages")
@@ -1157,6 +1180,9 @@ func TestSessionsListAndDescriptors(t *testing.T) {
 		if len(descriptor.Agents) != 1 || descriptor.Agents[0].ID != "main" {
 			t.Fatalf("descriptor roster = %+v", descriptor.Agents)
 		}
+		if !descriptor.LoopActive {
+			t.Fatalf("descriptor %q loop_active = false, want true", descriptor.ID)
+		}
 	}
 	// The descriptor roster must match GET /session's roster exactly, or the
 	// sidebar and the agent panel would disagree.
@@ -1178,6 +1204,9 @@ func TestSessionsListAndDescriptors(t *testing.T) {
 	}
 	if single.Code != http.StatusOK || descriptor.ID != "ab12cd34" {
 		t.Fatalf("descriptor = %d %+v", single.Code, descriptor)
+	}
+	if !descriptor.LoopActive {
+		t.Fatalf("single descriptor loop_active = false, want true")
 	}
 	if got := request(t, h.server, http.MethodGet, "/api/v1/sessions/nope", "", nil); got.Code != http.StatusNotFound {
 		t.Fatalf("unknown descriptor status = %d", got.Code)
@@ -1470,6 +1499,7 @@ func TestSessionChannelSwitchAndValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCapability(t, rawCaps.Capabilities, "channel_switch")
+	assertCapability(t, rawCaps.Capabilities, "main_loop")
 
 	// 2. POST /api/v1/session/channel switches the active channel and is echoed
 	// by the handle and by the next session snapshot.
@@ -1716,6 +1746,136 @@ func TestSessionApprovalValidation(t *testing.T) {
 	}
 }
 
+func TestSessionLoopToggleReflectsInSession(t *testing.T) {
+	h := newHarness(t, "")
+
+	snapshot := decodeSession(t, request(t, h.server, http.MethodGet, "/api/v1/session", "", nil))
+	if !snapshot.Session.LoopActive {
+		t.Fatalf("initial loop_active = false, want true")
+	}
+
+	w := request(t, h.server, http.MethodPost, "/api/v1/session/loop", "", map[string]any{"active": false})
+	if w.Code != http.StatusOK {
+		t.Fatalf("disable status = %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["loop_active"] != false {
+		t.Fatalf("loop_active = %#v, want false", payload["loop_active"])
+	}
+
+	snapshot = decodeSession(t, request(t, h.server, http.MethodGet, "/api/v1/session", "", nil))
+	if snapshot.Session.LoopActive {
+		t.Fatalf("loop_active after disable = true, want false")
+	}
+
+	w = request(t, h.server, http.MethodPost, "/api/v1/session/loop", "", map[string]any{"active": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("enable status = %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["loop_active"] != true {
+		t.Fatalf("loop_active = %#v, want true", payload["loop_active"])
+	}
+
+	snapshot = decodeSession(t, request(t, h.server, http.MethodGet, "/api/v1/session", "", nil))
+	if !snapshot.Session.LoopActive {
+		t.Fatalf("loop_active after enable = false, want true")
+	}
+
+	var rawCaps struct {
+		Capabilities []any `json:"capabilities"`
+	}
+	raw := request(t, h.server, http.MethodGet, "/api/v1/session", "", nil)
+	if err := json.Unmarshal(raw.Body.Bytes(), &rawCaps); err != nil {
+		t.Fatal(err)
+	}
+	assertCapability(t, rawCaps.Capabilities, "main_loop")
+}
+
+func TestSessionLoopValidation(t *testing.T) {
+	h := newHarness(t, "")
+	h.addSession(t, "other", "Other")
+	tests := []struct {
+		name   string
+		method string
+		body   any
+		status int
+		errMsg string
+	}{
+		{"unknown session", http.MethodPost,
+			map[string]any{"active": true, "session_id": "ghost"},
+			http.StatusNotFound, "session not found"},
+		{"unknown field", http.MethodPost, map[string]any{"active": true, "extra": "no"},
+			http.StatusBadRequest, "invalid JSON body"},
+		{"get", http.MethodGet, nil,
+			http.StatusMethodNotAllowed, "method not allowed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := request(t, h.server, tc.method, "/api/v1/session/loop", "", tc.body)
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.status, w.Body.String())
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["error"] != tc.errMsg {
+				t.Fatalf("error = %q, want %q", payload["error"], tc.errMsg)
+			}
+		})
+	}
+}
+
+func TestSessionLoopClosedReturnsConflict(t *testing.T) {
+	h := newHarness(t, "")
+	closed := h.addSession(t, "closed", "Closed")
+	closed.agent.(*fakeAgent).setState(agent.StateClosed)
+
+	w := request(t, h.server, http.MethodPost, "/api/v1/session/loop", "",
+		map[string]any{"active": false, "session_id": "closed"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["error"] != "session is closed" {
+		t.Fatalf("error = %q, want session is closed", payload["error"])
+	}
+}
+
+func TestSessionLoopInDescriptors(t *testing.T) {
+	h := newHarness(t, "")
+	h.addSession(t, "other", "Other")
+
+	list := decodeList(t, request(t, h.server, http.MethodGet, "/api/v1/sessions", "", nil))
+	for _, descriptor := range list.Sessions {
+		if !descriptor.LoopActive {
+			t.Fatalf("descriptor %q loop_active = false, want true", descriptor.ID)
+		}
+	}
+
+	w := request(t, h.server, http.MethodPost, "/api/v1/session/loop", "", map[string]any{"active": false})
+	if w.Code != http.StatusOK {
+		t.Fatalf("toggle status = %d: %s", w.Code, w.Body.String())
+	}
+
+	list = decodeList(t, request(t, h.server, http.MethodGet, "/api/v1/sessions", "", nil))
+	for _, descriptor := range list.Sessions {
+		want := descriptor.ID != "default"
+		if descriptor.LoopActive != want {
+			t.Fatalf("descriptor %q loop_active = %v, want %v", descriptor.ID, descriptor.LoopActive, want)
+		}
+	}
+}
+
 func TestCapabilitiesKeyIsAlwaysPresent(t *testing.T) {
 	h := newHarness(t, "")
 	h.addSession(t, "other", "Other")
@@ -1739,6 +1899,7 @@ func TestCapabilitiesKeyIsAlwaysPresent(t *testing.T) {
 		assertCapability(t, caps, "approval_mode")
 		assertCapability(t, caps, "agent_names")
 		assertCapability(t, caps, "markdown_html")
+		assertCapability(t, caps, "main_loop")
 	}
 
 	// GET /api/v1/session advertises the approval-mode route and agent names.

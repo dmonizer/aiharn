@@ -11,6 +11,7 @@ import (
 type ShortcutsConfig struct {
 	ToggleActions  string `toml:"toggle_actions"`
 	ToggleThinking string `toml:"toggle_thinking"`
+	ToggleLoop     string `toml:"toggle_loop"`
 	CycleShell     string `toml:"cycle_shell"`
 	GrowInput      string `toml:"grow_input"`
 	ShrinkInput    string `toml:"shrink_input"`
@@ -21,6 +22,7 @@ func DefaultShortcuts() ShortcutsConfig {
 	return ShortcutsConfig{
 		ToggleActions:  "f9",
 		ToggleThinking: "f10",
+		ToggleLoop:     "ctrl+l",
 		CycleShell:     "ctrl+s",
 		GrowInput:      "ctrl+up",
 		ShrinkInput:    "ctrl+down",
@@ -40,6 +42,7 @@ func (s ShortcutsConfig) WithDefaults() ShortcutsConfig {
 	}
 	s.ToggleActions = fill(s.ToggleActions, d.ToggleActions)
 	s.ToggleThinking = fill(s.ToggleThinking, d.ToggleThinking)
+	s.ToggleLoop = fill(s.ToggleLoop, d.ToggleLoop)
 	s.CycleShell = fill(s.CycleShell, d.CycleShell)
 	s.GrowInput = fill(s.GrowInput, d.GrowInput)
 	s.ShrinkInput = fill(s.ShrinkInput, d.ShrinkInput)
@@ -52,6 +55,7 @@ func validateShortcuts(errs *[]string, s ShortcutsConfig) {
 	bindings := []struct{ name, key string }{
 		{"toggle_actions", s.ToggleActions},
 		{"toggle_thinking", s.ToggleThinking},
+		{"toggle_loop", s.ToggleLoop},
 		{"cycle_shell", s.CycleShell},
 		{"grow_input", s.GrowInput},
 		{"shrink_input", s.ShrinkInput},

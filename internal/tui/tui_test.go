@@ -606,6 +606,21 @@ func TestF9TogglesActionsAllowed(t *testing.T) {
 	}
 }
 
+func TestToggleLoop(t *testing.T) {
+	m := newTestModel(t)
+	if !strings.Contains(m.statusLine(), "loop active") {
+		t.Fatalf("initial status = %q", m.statusLine())
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlL})
+	if m.agent.MainLoopActive() || !strings.Contains(m.statusLine(), "loop inactive") {
+		t.Fatalf("after first ctrl+l: active=%v status=%q", m.agent.MainLoopActive(), m.statusLine())
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyCtrlL})
+	if !m.agent.MainLoopActive() || !strings.Contains(m.statusLine(), "loop active") {
+		t.Fatalf("after second ctrl+l: active=%v status=%q", m.agent.MainLoopActive(), m.statusLine())
+	}
+}
+
 func TestF9LeavesExistingApprovalPending(t *testing.T) {
 	m := newTestModel(t)
 	req := approval.Request{ID: "1", ToolName: "execute_command", Command: "ls"}
@@ -620,7 +635,7 @@ func TestStatusBarItemsFitWidth(t *testing.T) {
 	m := newTestModel(t)
 	m.width = 80
 	line := m.statusLine()
-	if !strings.Contains(line, "actions allowed ask │ thinking hidden") || uniseg.StringWidth(line) > m.width {
+	if !strings.Contains(line, "actions allowed ask │ loop active │ thinking hidden") || uniseg.StringWidth(line) > m.width {
 		t.Fatalf("status line = %q", line)
 	}
 	m.width = 10

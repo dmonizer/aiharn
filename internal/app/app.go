@@ -299,10 +299,15 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		MaxAgents:     cfg.Limits.MaxOpenAgents,
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
-		SubagentTypes: configuredSubagentTypes(cfg, channelCfg.Name),
+		// The catalog is resolved on demand so list_subagent_types reports the
+		// main agent's current channel even after a runtime switch, matching the
+		// channel a spawned subagent will actually use.
+		ResolveSubagentTypes: func() []tools.SubagentType {
+			return configuredSubagentTypes(cfg, mainChannel())
+		},
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
 			return buildAgent(ctx, cfg, tc, mgr, gate, spec,
-				agentOverrides{Channel: subagentChannel(cfg, spec.Type, mainChannel())}, observer, nil)
+				agentOverrides{Channel: mainChannel()}, observer, nil)
 		},
 	})
 
@@ -679,28 +684,14 @@ func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defa
 	return reg, nil
 }
 
-// subagentChannel resolves the channel a subagent type uses. A type with no
-// explicit channel inherits the main agent's current channel; an explicitly
-// configured channel still wins.
-func subagentChannel(cfg *config.Config, agentType, mainChannel string) string {
-	if a, ok := cfg.Agents[agentType]; ok && a.Channel != "" {
-		return a.Channel
-	}
-	return mainChannel
-}
-
 func configuredSubagentTypes(cfg *config.Config, mainChannel string) []tools.SubagentType {
 	types := make([]tools.SubagentType, 0, len(cfg.Agents))
 	for name, agentCfg := range cfg.Agents {
-		channel := subagentChannel(cfg, name, mainChannel)
-		if channel == "" && len(cfg.Channels) > 0 {
-			channel = cfg.Channels[0].Name
-		}
 		types = append(types, tools.SubagentType{
 			Name:           name,
 			Description:    agentCfg.Description,
 			Model:          agentCfg.Model,
-			Channel:        channel,
+			Channel:        mainChannel,
 			AllowSubagents: agentCfg.AllowSubagents,
 		})
 	}

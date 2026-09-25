@@ -411,6 +411,10 @@ func fill(s string, n int) string {
 }
 
 func (m *Model) statusLine() string {
+	loop := "inactive"
+	if m.agent != nil && m.agent.MainLoopActive() {
+		loop = "active"
+	}
 	actions := "ask"
 	if m.status.Approval == approval.ModeAllowAll.String() {
 		actions = "all"
@@ -428,6 +432,7 @@ func (m *Model) statusLine() string {
 	}
 	items := []statusItem{
 		{"actions allowed", actions},
+		{"loop", loop},
 		{"thinking", reasoningDisplay},
 		{"view", m.focusedID},
 		{"model", m.status.Model},

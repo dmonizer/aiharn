@@ -58,6 +58,45 @@ func (blockingClient) Stream(ctx context.Context, req llm.Request) (<-chan llm.E
 	return out, nil
 }
 
+// concurrencyProbe blocks each turn until release is closed and records the
+// maximum number of overlapping Stream calls, so a test can assert turns are
+// serialized by turnMu.
+type concurrencyProbe struct {
+	mu      sync.Mutex
+	active  int
+	max     int
+	release chan struct{}
+	started chan struct{}
+}
+
+func (c *concurrencyProbe) Stream(ctx context.Context, _ llm.Request) (<-chan llm.Event, error) {
+	c.mu.Lock()
+	c.active++
+	if c.active > c.max {
+		c.max = c.active
+	}
+	c.mu.Unlock()
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	out := make(chan llm.Event, 1)
+	go func() {
+		defer close(out)
+		select {
+		case <-c.release:
+			out <- llm.Event{Type: llm.EventCompleted, Items: []llm.Item{
+				{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "ok"},
+			}}
+		case <-ctx.Done():
+		}
+		c.mu.Lock()
+		c.active--
+		c.mu.Unlock()
+	}()
+	return out, nil
+}
+
 func builderBlocking() agent.Builder {
 	return func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
 		return agent.New(agent.Spec{
@@ -164,6 +203,45 @@ func TestListSubagentTypesCatalogAndSpawnConstraints(t *testing.T) {
 	}
 	if _, err := manager.ListSubagentTypes(ctx, "missing"); !errors.Is(err, agent.ErrCallerNotFound) {
 		t.Fatalf("missing caller error = %v", err)
+	}
+}
+
+func TestListSubagentTypesUsesDynamicResolver(t *testing.T) {
+	// When a resolver is configured it wins over the static list and is read on
+	// every call, so a runtime channel switch is reflected immediately.
+	current := "local"
+	manager := agent.NewManager(agent.ManagerOptions{
+		SubagentTypes: []tools.SubagentType{{Name: "coder", Channel: "static"}},
+		ResolveSubagentTypes: func() []tools.SubagentType {
+			return []tools.SubagentType{{Name: "coder", Channel: current}}
+		},
+		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
+			return agent.New(agent.Spec{
+				ID: spec.ID, Type: spec.Type, Depth: spec.Depth, CallerID: spec.CallerID,
+				AllowSubagents: true, Client: blockingClient{},
+			}), nil
+		},
+	})
+	t.Cleanup(func() { _ = manager.Shutdown() })
+	if err := manager.RegisterTop(newTop(t, true)); err != nil {
+		t.Fatal(err)
+	}
+
+	catalog, err := manager.ListSubagentTypes(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Types) != 1 || catalog.Types[0].Channel != "local" {
+		t.Fatalf("catalog before switch = %+v", catalog)
+	}
+
+	current = "ssh"
+	catalog, err = manager.ListSubagentTypes(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Types) != 1 || catalog.Types[0].Channel != "ssh" {
+		t.Fatalf("catalog after switch = %+v, want channel ssh", catalog)
 	}
 }
 
@@ -379,7 +457,7 @@ func TestSendAgentMessageUp(t *testing.T) {
 	if err := mgr.SendAgentMessage(context.Background(), id, "main", "progress report", llm.KindMessage); err != nil {
 		t.Fatal(err)
 	}
-	// It waits in the ancestor's inbox; it must not appear before a turn.
+	// It waits in the ancestor's inbox; it must not appear before the loop runs.
 	waitFor(t, 2*time.Second, "up message to be queued", func() bool {
 		for _, pm := range mgr.PendingMessages() {
 			if pm.Text == "progress report" {
@@ -389,12 +467,20 @@ func TestSendAgentMessageUp(t *testing.T) {
 		return false
 	})
 	if got := top.History(); len(got) != 0 {
-		t.Fatalf("up message leaked into history before the turn boundary: %+v", got)
+		t.Fatalf("up message leaked into history before the loop turn: %+v", got)
 	}
 
-	if err := top.Turn(context.Background(), "continue"); err != nil {
+	if err := mgr.StartTopLoop("main"); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, 2*time.Second, "main loop to deliver the up message", func() bool {
+		for _, it := range top.History() {
+			if it.Content == "progress report" {
+				return true
+			}
+		}
+		return false
+	})
 	got := findHistoryItem(t, top.History(), "progress report")
 	if got.Origin != llm.OriginAgent {
 		t.Fatalf("up message origin = %q, want agent", got.Origin)
@@ -436,13 +522,16 @@ func TestSendAgentMessageRejectsSelfSiblingAndEscape(t *testing.T) {
 	}
 }
 
-// TestPendingMessagesListsQueuedAndDropsOnDrain proves the polling view the web
-// console depends on: a queued agent message is listed until the recipient's
-// turn drains it.
-func TestPendingMessagesListsQueuedAndDropsOnDrain(t *testing.T) {
+// TestPendingMessagesListsQueuedAndDropsWhenLoopTakes proves the polling view
+// the web console depends on: a queued agent message is listed until the main
+// loop takes it. A human Turn no longer drains the top-level inbox.
+func TestPendingMessagesListsQueuedAndDropsWhenLoopTakes(t *testing.T) {
 	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderBlocking()})
 	t.Cleanup(func() { _ = mgr.Shutdown() })
-	top := newTop(t, true)
+	top := agent.New(agent.Spec{
+		ID: "main", Type: "main", AllowSubagents: true,
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("top done"), finalTurn("top done again")}},
+	})
 	if err := mgr.RegisterTop(top); err != nil {
 		t.Fatal(err)
 	}
@@ -468,14 +557,40 @@ func TestPendingMessagesListsQueuedAndDropsOnDrain(t *testing.T) {
 		t.Fatalf("queued message not listed as pending: %+v", mgr.PendingMessages())
 	}
 
+	// A human Turn no longer drains the top-level inbox.
 	if err := top.Turn(context.Background(), "go"); err != nil {
 		t.Fatal(err)
 	}
+	found = false
 	for _, pm := range mgr.PendingMessages() {
 		if pm.Text == "ping" {
-			t.Fatalf("drained message still pending: %+v", pm)
+			found = true
 		}
 	}
+	if !found {
+		t.Fatal("Turn drained the inbox; want the queued message to remain pending")
+	}
+
+	// Starting the loop takes the message and runs a turn for it.
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "loop to take the pending message", func() bool {
+		for _, pm := range mgr.PendingMessages() {
+			if pm.Text == "ping" {
+				return false
+			}
+		}
+		return true
+	})
+	waitFor(t, 2*time.Second, "loop turn to record the message", func() bool {
+		for _, it := range top.History() {
+			if it.Content == "ping" {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // findHistoryItem returns the history item with the given content, failing if
@@ -590,18 +705,26 @@ func TestSubagentDeliversExactlyOnceAtTurnBoundary(t *testing.T) {
 	})
 
 	// The result sits in the caller's inbox, not yet in its history: delivery is
-	// deferred to the caller's next legal turn boundary.
+	// deferred to the caller's next main-loop turn boundary.
 	if got := top.History(); len(got) != 0 {
-		t.Fatalf("result leaked into history before the turn boundary: %+v", got)
+		t.Fatalf("result leaked into history before the loop turn: %+v", got)
 	}
 
-	if err := top.Turn(context.Background(), "continue"); err != nil {
-		t.Fatalf("Turn: %v", err)
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
 	}
+	waitFor(t, 2*time.Second, "main loop to deliver the subagent report", func() bool {
+		for _, it := range top.History() {
+			if strings.Contains(it.Content, "sub done") {
+				return true
+			}
+		}
+		return false
+	})
 
 	hist := top.History()
-	if len(hist) != 3 {
-		t.Fatalf("history len = %d, want 3 (delivered result + input + reply): %+v", len(hist), hist)
+	if len(hist) != 2 {
+		t.Fatalf("history len = %d, want 2 (delivered result + reply): %+v", len(hist), hist)
 	}
 	if !strings.Contains(hist[0].Content, "sub done") || hist[0].Role != llm.RoleUser {
 		t.Fatalf("delivered result = %+v", hist[0])
@@ -616,14 +739,8 @@ func TestSubagentDeliversExactlyOnceAtTurnBoundary(t *testing.T) {
 		d.Direction != llm.DirectionUp || d.Kind != llm.KindReport {
 		t.Fatalf("delivered report delivery = %+v", hist[0].Delivery)
 	}
-	if hist[1].Content != "continue" {
-		t.Fatalf("input = %+v", hist[1])
-	}
-	if hist[1].Origin != llm.OriginHuman {
-		t.Fatalf("human input origin = %q, want %q", hist[1].Origin, llm.OriginHuman)
-	}
-	if hist[2].Content != "top done" {
-		t.Fatalf("reply = %+v", hist[2])
+	if hist[1].Content != "top done" {
+		t.Fatalf("reply = %+v", hist[1])
 	}
 }
 
@@ -1031,5 +1148,290 @@ func TestSpawnSubagentNameMismatchRejected(t *testing.T) {
 	}
 	if got := mgr.Agent(id).Name(); got != id {
 		t.Fatalf("Name() = %q, want id %q", got, id)
+	}
+}
+
+func TestMainLoopActiveRoundtripAndSubagentNoop(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{MaxAgents: 8, Builder: builderWithScript([][]llm.Event{finalTurn("done")})})
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+	top := newTop(t, true)
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+
+	if active, err := mgr.MainLoopActive("main"); err != nil || !active {
+		t.Fatalf("default MainLoopActive = (%v, %v), want (true, nil)", active, err)
+	}
+	if err := mgr.SetMainLoopActive("main", false); err != nil {
+		t.Fatal(err)
+	}
+	if active, _ := mgr.MainLoopActive("main"); active {
+		t.Fatal("MainLoopActive still true after disable")
+	}
+	if err := mgr.SetMainLoopActive("main", true); err != nil {
+		t.Fatal(err)
+	}
+	if active, _ := mgr.MainLoopActive("main"); !active {
+		t.Fatal("MainLoopActive still false after enable")
+	}
+	if _, err := mgr.MainLoopActive("missing"); !errors.Is(err, agent.ErrAgentNotFound) {
+		t.Fatalf("MainLoopActive(missing) err = %v, want ErrAgentNotFound", err)
+	}
+	if err := mgr.SetMainLoopActive("missing", false); !errors.Is(err, agent.ErrAgentNotFound) {
+		t.Fatalf("SetMainLoopActive(missing) err = %v, want ErrAgentNotFound", err)
+	}
+
+	// A subagent's SetMainLoopActive is a no-op and succeeds.
+	id, err := mgr.SpawnSubagent(context.Background(), "main", "coder", "", "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "subagent to complete", func() bool { return mgr.Agent(id).State() == agent.StateIdle })
+	if err := mgr.SetMainLoopActive(id, false); err != nil {
+		t.Fatalf("SetMainLoopActive(subagent) err = %v", err)
+	}
+	if err := mgr.SetMainLoopActive(id, true); err != nil {
+		t.Fatalf("SetMainLoopActive(subagent) err = %v", err)
+	}
+}
+
+func TestDisableMainLoopWhileIdleHoldsNextMessage(t *testing.T) {
+	client := &testllm.FakeClient{Script: [][]llm.Event{finalTurn("warmup reply"), finalTurn("queued reply")}}
+	top := agent.New(agent.Spec{ID: "main", Type: "main", Client: client})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
+	// Drive one turn so the loop is parked while active and the agent is idle.
+	warmup := &llm.Delivery{From: "sub-0", To: "main", Direction: llm.DirectionUp, Kind: llm.KindMessage}
+	if !top.SendAgent("warmup", warmup) {
+		t.Fatal("SendAgent(warmup) failed")
+	}
+	waitFor(t, 2*time.Second, "warmup turn to finish", func() bool {
+		return top.State() == agent.StateIdle && historyCount(top.History(), "warmup") == 1
+	})
+	if !top.MainLoopActive() {
+		t.Fatal("main loop not active after warmup")
+	}
+	// Let the loop re-park in the active select so the disable lands while parked.
+	time.Sleep(20 * time.Millisecond)
+
+	if err := mgr.SetMainLoopActive("main", false); err != nil {
+		t.Fatal(err)
+	}
+	d := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindMessage}
+	if !top.SendAgent("must stay queued", d) {
+		t.Fatal("SendAgent(must stay queued) failed")
+	}
+	// A short wait proves the parked loop did NOT consume the message.
+	time.Sleep(50 * time.Millisecond)
+	if historyCount(top.History(), "must stay queued") != 0 {
+		t.Fatalf("disabled loop consumed the next message: %+v", top.History())
+	}
+	found := false
+	for _, pm := range mgr.PendingMessages() {
+		if pm.Text == "must stay queued" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("queued message not pending while disabled: %+v", mgr.PendingMessages())
+	}
+
+	if err := mgr.SetMainLoopActive("main", true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "re-enabled loop to deliver the message", func() bool {
+		return historyCount(top.History(), "must stay queued") == 1
+	})
+}
+
+func TestStartTopLoopStartsExactlyOnce(t *testing.T) {
+	client := &testllm.FakeClient{Script: [][]llm.Event{finalTurn("r1"), finalTurn("r2"), finalTurn("r3")}}
+	top := agent.New(agent.Spec{ID: "main", Type: "main", AllowSubagents: true, Client: client})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatalf("second StartTopLoop err = %v", err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
+	for i, text := range []string{"one", "two", "three"} {
+		d := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindMessage}
+		if !top.SendAgent(text, d) {
+			t.Fatalf("SendAgent(%d) failed", i)
+		}
+	}
+	waitFor(t, 2*time.Second, "loop to process all three messages", func() bool {
+		h := top.History()
+		return historyCount(h, "one") == 1 && historyCount(h, "two") == 1 && historyCount(h, "three") == 1
+	})
+	if got := len(client.Requests()); got != 3 {
+		t.Fatalf("client requests = %d, want 3 (no duplicate turns)", got)
+	}
+}
+
+func TestMainLoopDisabledQueuesThenReenabledProcesses(t *testing.T) {
+	client := &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}}
+	top := agent.New(agent.Spec{ID: "main", Type: "main", Client: client})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.SetMainLoopActive("main", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
+	d := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !top.SendAgent("queued report", d) {
+		t.Fatal("SendAgent failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := top.History(); len(got) != 0 {
+		t.Fatalf("disabled loop still ran a turn: %+v", got)
+	}
+	var found bool
+	for _, pm := range mgr.PendingMessages() {
+		if pm.Text == "queued report" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("queued report not pending while disabled: %+v", mgr.PendingMessages())
+	}
+
+	if err := mgr.SetMainLoopActive("main", true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "re-enabled loop to process the report", func() bool {
+		return historyCount(top.History(), "queued report") == 1
+	})
+}
+
+func TestMainLoopTurnSerializedWithTurn(t *testing.T) {
+	probe := &concurrencyProbe{release: make(chan struct{}), started: make(chan struct{}, 2)}
+	top := agent.New(agent.Spec{ID: "main", Type: "main", Client: probe})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
+	d := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !top.SendAgent("loop msg", d) {
+		t.Fatal("SendAgent failed")
+	}
+	waitFor(t, 2*time.Second, "loop turn to start", func() bool {
+		select {
+		case <-probe.started:
+			return true
+		default:
+			return false
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- top.Turn(context.Background(), "human msg") }()
+	time.Sleep(50 * time.Millisecond)
+	probe.mu.Lock()
+	active, max := probe.active, probe.max
+	probe.mu.Unlock()
+	if active != 1 || max != 1 {
+		t.Fatalf("turns overlapped: active=%d max=%d", active, max)
+	}
+
+	close(probe.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, "loop turn to finish", func() bool {
+		return historyCount(top.History(), "loop msg") == 1 && historyCount(top.History(), "human msg") == 1
+	})
+	probe.mu.Lock()
+	max = probe.max
+	probe.mu.Unlock()
+	if max != 1 {
+		t.Fatalf("turns were not serialized: max concurrent Stream calls = %d", max)
+	}
+}
+
+func TestShutdownJoinsMainLoop(t *testing.T) {
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	top := newTop(t, true)
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = mgr.Shutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown hung: main loop leaked")
+	}
+	if top.State() != agent.StateClosed {
+		t.Fatalf("top state = %v, want closed", top.State())
+	}
+}
+
+func TestCancelAllCancelsInFlightLoopTurnAndKeepsLoopAlive(t *testing.T) {
+	top := agent.New(agent.Spec{ID: "main", Type: "main", AllowSubagents: true, Client: blockingClient{}})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
+	d1 := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !top.SendAgent("first", d1) {
+		t.Fatal("SendAgent(first) failed")
+	}
+	waitFor(t, 2*time.Second, "first loop turn to start", func() bool { return top.State() == agent.StateRunning })
+
+	d2 := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !top.SendAgent("second", d2) {
+		t.Fatal("SendAgent(second) failed")
+	}
+
+	n, err := mgr.CancelAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatalf("CancelAll affected = %d, want at least the in-flight loop turn", n)
+	}
+
+	// The loop survives the cancellation and immediately runs the queued second
+	// message, proving the top-level inbox was not discarded. The second turn can
+	// only start once the cancelled first turn has released turnMu, so observing
+	// it also proves the first turn was actually cancelled.
+	waitFor(t, 2*time.Second, "loop to pick up the preserved second message", func() bool {
+		return top.State() == agent.StateRunning && historyCount(top.History(), "second") == 1
+	})
+	hist := top.History()
+	if historyCount(hist, "first") != 1 || historyCount(hist, "second") != 1 {
+		t.Fatalf("inbox messages not preserved through CancelAll: %+v", hist)
 	}
 }

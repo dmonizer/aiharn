@@ -181,11 +181,15 @@ type Agent struct {
 	// not yet drained into history, so a polling API client (which has no event
 	// stream) can list them. Guarded by mu.
 	pendingInbox []inboxItem
-	// A timeout leaves the top-level agent ready to continue when its next
-	// input is a subagent report, without requiring a human follow-up.
-	resumeAfterTimeout bool
-	pendingToolLimit   *pendingToolLimit
-	toolLimitSeq       uint64
+	// mainLoopActive enables the top-level agent's automatic inbox loop. It is
+	// true by default and toggled by SetMainLoopActive. Only depth-0 agents use it.
+	mainLoopActive atomic.Bool
+	// mainLoopResume wakes the main loop after it was disabled.
+	mainLoopResume chan struct{}
+	// mainLoopClaim guards the one-time start of the main loop goroutine.
+	mainLoopClaim    atomic.Bool
+	pendingToolLimit *pendingToolLimit
+	toolLimitSeq     uint64
 	// Pause holds queued tasks at turn boundaries. In-flight work is allowed to
 	// complete, avoiding duplicate commands or provider requests on resume.
 	paused bool
@@ -234,7 +238,7 @@ func New(spec Spec) *Agent {
 	if spec.ThinkingTimeout <= 0 {
 		spec.ThinkingTimeout = spec.RequestTimeout
 	}
-	return &Agent{
+	a := &Agent{
 		id:               spec.ID,
 		name:             spec.Name,
 		typ:              spec.Type,
@@ -258,8 +262,11 @@ func New(spec Spec) *Agent {
 		state:            StateStarting,
 		events:           make(chan Event, spec.EventCapacity),
 		inbox:            make(chan inboxItem, spec.InboxCapacity),
+		mainLoopResume:   make(chan struct{}, 1),
 		closeDone:        make(chan struct{}),
 	}
+	a.mainLoopActive.Store(true)
+	return a
 }
 
 // ID returns the agent's unique id.
@@ -285,6 +292,37 @@ func (a *Agent) AllowSubagents() bool { return a.allowSubagents }
 
 // CallerID returns the id of the agent that spawned this one ("" for top-level).
 func (a *Agent) CallerID() string { return a.callerID }
+
+// MainLoopActive reports whether the top-level agent's automatic inbox loop is enabled.
+func (a *Agent) MainLoopActive() bool { return a.mainLoopActive.Load() }
+
+// SetMainLoopActive enables or disables the top-level agent's automatic inbox
+// loop. For a subagent this is a no-op (the caller should use SetSubagentPaused).
+// Disabling takes effect for the next inbox item; an in-flight turn completes.
+func (a *Agent) SetMainLoopActive(active bool) error {
+	if a.Depth() != 0 {
+		return nil
+	}
+	if a.State() == StateClosed {
+		return ErrAgentClosed
+	}
+	a.mainLoopActive.Store(active)
+	// Wake the loop on both transitions so a disable that lands while the loop
+	// is parked in the active select causes it to re-check the flag before
+	// consuming the next inbox item. The channel is buffered and this send is
+	// non-blocking, so a stale wake is harmless.
+	select {
+	case a.mainLoopResume <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// claimMainLoop reports whether this agent may start its main loop, and claims
+// that right so only one goroutine is ever started.
+func (a *Agent) claimMainLoop() bool {
+	return a.Depth() == 0 && a.mainLoopClaim.CompareAndSwap(false, true)
+}
 
 // State returns the current lifecycle state.
 func (a *Agent) State() State {
@@ -348,7 +386,6 @@ func (a *Agent) send(item inboxItem) bool {
 	}
 	select {
 	case a.inbox <- item:
-		resume := a.depth == 0 && a.resumeAfterTimeout
 		if item.delivery != nil {
 			a.pendingInbox = append(a.pendingInbox, item)
 		}
@@ -358,27 +395,10 @@ func (a *Agent) send(item inboxItem) bool {
 		if item.delivery != nil {
 			a.emit(Event{Type: EventAgentMessage, Text: item.text, Delivery: item.delivery, Pending: true})
 		}
-		if resume {
-			go a.continueAfterTimeout()
-		}
 		return true
 	default:
 		a.mu.Unlock()
 		return false
-	}
-}
-
-// drainInbox returns and removes all currently queued inbox messages, each with
-// the origin and delivery it was enqueued with.
-func (a *Agent) drainInbox() []inboxItem {
-	var msgs []inboxItem
-	for {
-		select {
-		case m := <-a.inbox:
-			msgs = append(msgs, m)
-		default:
-			return msgs
-		}
 	}
 }
 
@@ -429,42 +449,25 @@ func (a *Agent) setOnComplete(fn func(string)) { a.onComplete = fn }
 // before the subagent's run loop starts and read only from that goroutine.
 func (a *Agent) setOnStateChange(fn func()) { a.onStateChange = fn }
 
-// Turn runs one full turn on behalf of a caller: it drains the inbox (subagent
-// results and other inbound messages, injected as synthetic user messages),
-// appends input, then streams and executes tool calls until the model responds
-// with no tool calls. A time-budget expiry is recorded in chat and leaves the
-// agent idle; other errors are returned and set the state to errored.
+// Turn runs one human turn. It does not drain the inbox; the inbox is owned by
+// the main loop and the subagent run loop.
 func (a *Agent) Turn(ctx context.Context, input string) error {
-	return a.runTurn(ctx, input, llm.OriginHuman, nil, true, false)
+	return a.runTurn(ctx, input, llm.OriginHuman, nil)
 }
 
 // turn is the core loop: append input and iterate stream → tools until the model
-// stops calling tools. It does not drain the inbox; Turn and the subagent run
-// loop manage that.
+// stops calling tools. It does not drain the inbox; the main loop and the
+// subagent run loop manage that.
 func (a *Agent) turn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery) error {
-	return a.runTurn(ctx, input, origin, delivery, false, false)
+	return a.runTurn(ctx, input, origin, delivery)
 }
 
-func (a *Agent) continueAfterTimeout() {
-	ctx := a.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := a.runTurn(ctx, "", llm.OriginAgent, nil, true, true); err != nil && !errors.Is(err, context.Canceled) {
-		logging.Debug("agent: timeout continuation failed", slog.String("agent_id", a.id), slog.Any("err", err))
-	}
-}
-
-func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery, drainInbox, onlyPending bool) error {
+func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery) error {
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
-	a.mu.Lock()
-	if onlyPending && !a.resumeAfterTimeout {
-		a.mu.Unlock()
-		return nil
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	a.resumeAfterTimeout = false
-	a.mu.Unlock()
 
 	start := time.Now()
 	logging.Debug("agent: turn start",
@@ -515,32 +518,16 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 		a.mu.Unlock()
 		a.active.Done()
 	}()
-	if drainInbox {
-		for _, m := range a.drainInbox() {
-			a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: m.text, Origin: m.origin, Delivery: m.delivery})
-			a.markTaken(m)
-			// The item is now in history, so a delivery-carrying message becomes
-			// delivered exactly here: the delivered event can never describe
-			// text that is absent from the transcript. Human messages carry no
-			// delivery and emit nothing extra.
-			if m.delivery != nil {
-				a.emit(Event{Type: EventAgentMessage, Text: m.text, Delivery: m.delivery, Pending: false})
-			}
-		}
-	}
-
 	ctx = turnCtx
 
 	a.setState(StateRunning)
-	if input != "" || !onlyPending {
+	if input != "" {
 		a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: input, Origin: origin, Delivery: delivery})
 	}
-	if onlyPending {
-		// The queued subagent message was appended while draining the inbox.
-	} else if delivery != nil {
-		// A delivery-carrying turn input (a subagent task prompt) has just
-		// entered history: report it as the delivered agent message, and NOT as
-		// a raw user turn, so a UI does not render the same task twice.
+	if delivery != nil {
+		// A delivery-carrying turn input (a subagent task prompt or a delivered
+		// inbox message) has just entered history: report it as the delivered agent
+		// message, and NOT as a raw user turn.
 		a.emit(Event{Type: EventAgentMessage, Text: input, Delivery: delivery, Pending: false})
 	} else {
 		a.emit(Event{Type: EventUser, Text: input})
@@ -660,6 +647,71 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 			toolCount++
 		}
 	}
+}
+
+// runTop is the depth-0 analogue of the subagent run loop: it consumes one
+// agent-authored inbox message at a time and runs a turn for each. It lives
+// until a.ctx is cancelled and is woken from the disabled state by
+// SetMainLoopActive(true). The caller (Manager.StartTopLoop) tracks this
+// goroutine in the manager wait group.
+func (a *Agent) runTop() {
+	for {
+		if !a.mainLoopActive.Load() {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-a.mainLoopResume:
+			}
+			continue
+		}
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-a.mainLoopResume:
+			// A loop enable/disable arrived; re-check the flag at the top.
+			continue
+		case item := <-a.inbox:
+			// Disabling takes effect for the next inbox item. If the loop was
+			// switched off just as this item was received, put it back so it
+			// stays pending rather than running one more turn.
+			if !a.mainLoopActive.Load() {
+				a.reinstate(item)
+				continue
+			}
+			// The item has left the inbox, so it is no longer pending. It is not
+			// yet delivered; the delivered event is emitted when turn appends it
+			// to history (mirrors the subagent run loop).
+			a.markTaken(item)
+			if err := a.turn(a.ctx, item.text, item.origin, item.delivery); err != nil {
+				// A cancelled turn that is not a shutdown leaves the agent open
+				// and reusable; keep the loop alive. A genuine error has already
+				// set the agent to errored via fail(); the loop keeps running but
+				// send() rejects new messages to an errored agent, so it stays
+				// parked until a human turn recovers it.
+				if a.ctx.Err() != nil {
+					return
+				}
+				logging.Debug("agent: main-loop turn failed",
+					slog.String("component", "agent"),
+					slog.String("agent_id", a.id),
+					slog.String("agent_type", a.typ),
+					slog.Any("err", err),
+				)
+			}
+		}
+	}
+}
+
+// reinstate puts an inbox item back after it was received but not started
+// because the main loop was just disabled. markTaken has not run yet, so the
+// item remains in pendingInbox; only the inbox channel needs restoring.
+func (a *Agent) reinstate(item inboxItem) {
+	a.mu.Lock()
+	select {
+	case a.inbox <- item:
+	default:
+	}
+	a.mu.Unlock()
 }
 
 // run drives a subagent: it consumes one task at a time from the inbox, runs a
@@ -985,14 +1037,7 @@ func (a *Agent) recordTimeout(phase string, duration time.Duration, partial stri
 	a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: content})
 	a.emit(Event{Type: EventTimeout, Text: note, TimeoutPhase: phase})
 	a.trimHistory()
-	a.mu.Lock()
-	a.resumeAfterTimeout = a.depth == 0
-	pending := len(a.inbox) > 0
-	a.mu.Unlock()
 	a.setState(StateIdle)
-	if pending && a.depth == 0 {
-		go a.continueAfterTimeout()
-	}
 }
 
 func (a *Agent) fail(err error) error {

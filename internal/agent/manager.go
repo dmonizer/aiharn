@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
 
 	"aiharn/internal/llm"
+	"aiharn/internal/logging"
 	"aiharn/internal/tools"
 )
 
@@ -36,7 +38,12 @@ type ManagerOptions struct {
 	InboxCapacity int
 	EventCapacity int
 	SubagentTypes []tools.SubagentType
-	Builder       Builder
+	// ResolveSubagentTypes, when set, supplies the current subagent type
+	// catalog on every ListSubagentTypes call instead of the static
+	// SubagentTypes. The app layer uses it to keep each type's effective
+	// channel in sync with the main agent's switchable channel.
+	ResolveSubagentTypes func() []tools.SubagentType
+	Builder              Builder
 }
 
 // Sentinel errors returned by Manager methods, surfaced to the model via tools.
@@ -48,6 +55,9 @@ var (
 	ErrMaxDepth            = errors.New("agent: maximum agent depth reached")
 	ErrMaxAgents           = errors.New("agent: maximum open agents reached")
 	ErrSubagentNotFound    = errors.New("agent: subagent not found")
+	// ErrAgentNotFound is returned when a manager operation addresses an agent
+	// id that is not registered.
+	ErrAgentNotFound       = errors.New("agent: agent not found")
 	ErrSubagentNotOwned    = errors.New("agent: subagent is outside caller's subtree")
 	ErrCannotMessageSelf   = errors.New("agent: cannot message self")
 	ErrSubagentUnavailable = errors.New("agent: subagent is not open")
@@ -62,17 +72,18 @@ var (
 // unique ids, enforces the spawn limits (allow_subagents, depth, open count),
 // routes messages, and provides idempotent shutdown.
 type Manager struct {
-	mu         sync.Mutex
-	agents     map[string]*Agent
-	seq        int
-	building   int // in-flight spawns, counted against the open limit
-	maxDepth   int
-	maxAgents  int
-	inboxCap   int
-	eventCap   int
-	agentTypes []tools.SubagentType
-	builder    Builder
-	closed     bool
+	mu           sync.Mutex
+	agents       map[string]*Agent
+	seq          int
+	building     int // in-flight spawns, counted against the open limit
+	maxDepth     int
+	maxAgents    int
+	inboxCap     int
+	eventCap     int
+	agentTypes   []tools.SubagentType
+	resolveTypes func() []tools.SubagentType
+	builder      Builder
+	closed       bool
 
 	wg           sync.WaitGroup
 	shutdownOnce sync.Once
@@ -104,6 +115,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		inboxCap:     opts.InboxCapacity,
 		eventCap:     opts.EventCapacity,
 		agentTypes:   types,
+		resolveTypes: opts.ResolveSubagentTypes,
 		builder:      opts.Builder,
 		shutdownDone: make(chan struct{}),
 		roster:       make(chan struct{}, 1),
@@ -132,7 +144,7 @@ func (m *Manager) ListSubagentTypes(ctx context.Context, callerID string) (tools
 
 	active := m.openCountLocked() + m.building
 	catalog := tools.SubagentCatalog{
-		Types:         append([]tools.SubagentType(nil), m.agentTypes...),
+		Types:         m.currentSubagentTypesLocked(),
 		CallerDepth:   caller.Depth(),
 		MaxDepth:      m.maxDepth,
 		ActiveAgents:  active,
@@ -152,6 +164,18 @@ func (m *Manager) ListSubagentTypes(ctx context.Context, callerID string) (tools
 		catalog.BlockedReasons = append(catalog.BlockedReasons, "no subagent types are configured")
 	}
 	return catalog, nil
+}
+
+// currentSubagentTypesLocked returns the catalog to show. The caller holds the
+// manager lock. When a dynamic resolver is configured it wins, so a runtime
+// channel switch is reflected immediately; otherwise the static list is used.
+func (m *Manager) currentSubagentTypesLocked() []tools.SubagentType {
+	if m.resolveTypes != nil {
+		types := append([]tools.SubagentType(nil), m.resolveTypes()...)
+		sort.Slice(types, func(i, j int) bool { return types[i].Name < types[j].Name })
+		return types
+	}
+	return append([]tools.SubagentType(nil), m.agentTypes...)
 }
 
 // RegisterTop registers the top-level agent (depth 0). It installs the agent's
@@ -183,6 +207,54 @@ func (m *Manager) RegisterTop(a *Agent) error {
 	a.setContext(context.WithCancel(context.Background()))
 	m.agents[a.ID()] = a
 	return nil
+}
+
+// StartTopLoop starts the top-level agent's automatic inbox loop exactly once.
+// It is called after the agent is registered and its lifecycle context is set.
+func (m *Manager) StartTopLoop(id string) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	a := m.agents[id]
+	if a == nil {
+		m.mu.Unlock()
+		return ErrAgentNotFound
+	}
+	if a.Depth() != 0 {
+		m.mu.Unlock()
+		return errors.New("agent: only the top-level agent has a main loop")
+	}
+	if !a.claimMainLoop() {
+		m.mu.Unlock()
+		return nil
+	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		a.runTop()
+	}()
+	m.mu.Unlock()
+	return nil
+}
+
+// SetMainLoopActive enables or disables the top-level agent's inbox loop.
+func (m *Manager) SetMainLoopActive(id string, active bool) error {
+	a := m.Agent(id)
+	if a == nil {
+		return ErrAgentNotFound
+	}
+	return a.SetMainLoopActive(active)
+}
+
+// MainLoopActive reports the top-level agent's inbox-loop state.
+func (m *Manager) MainLoopActive(id string) (bool, error) {
+	a := m.Agent(id)
+	if a == nil {
+		return false, ErrAgentNotFound
+	}
+	return a.MainLoopActive(), nil
 }
 
 // Agent returns the agent with the given id, or nil.
@@ -307,11 +379,18 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, name, 
 		// once. The delivery records the direction relative to the SENDER: a
 		// subagent reporting to its caller travels "up" to an ancestor. Agent
 		// origin keeps the console from rendering the report as the human's own
-		// message.
-		caller.SendAgent(
-			fmt.Sprintf("[subagent %s (%s)] %s", agentType, id, result),
-			&llm.Delivery{From: id, To: callerID, Direction: llm.DirectionUp, Kind: llm.KindReport},
-		)
+		// message. A dropped report is logged; there is no retry channel for a
+		// caller that is closed or whose inbox is full.
+		report := fmt.Sprintf("[subagent %s (%s)] %s", agentType, id, result)
+		if !caller.SendAgent(report, &llm.Delivery{
+			From: id, To: callerID, Direction: llm.DirectionUp, Kind: llm.KindReport,
+		}) {
+			logging.Debug("agent: subagent report undeliverable",
+				slog.String("component", "agent"),
+				slog.String("from", id),
+				slog.String("to", callerID),
+			)
+		}
 	})
 	sub.setOnStateChange(m.notify)
 	m.agents[id] = sub
@@ -457,6 +536,8 @@ func (m *Manager) SendAgentMessage(ctx context.Context, callerID, targetID, text
 // not yet injected into its history. A polling API client, which has no event
 // stream, reads these through Manager.PendingMessages.
 type PendingMessage struct {
+	// Seq orders pending messages process-wide in enqueue order.
+	Seq       uint64
 	From      string
 	To        string
 	Direction string
@@ -499,6 +580,7 @@ func (m *Manager) PendingMessages() []PendingMessage {
 	sort.Slice(all, func(i, j int) bool { return all[i].seq < all[j].seq })
 	out := make([]PendingMessage, 0, len(all))
 	for _, s := range all {
+		s.msg.Seq = s.seq
 		out = append(out, s.msg)
 	}
 	return out

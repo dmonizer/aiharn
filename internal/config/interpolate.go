@@ -49,6 +49,7 @@ func interpolate(cfg *Config) error {
 	}{
 		{"toggle_actions", &cfg.Shortcuts.ToggleActions},
 		{"toggle_thinking", &cfg.Shortcuts.ToggleThinking},
+		{"toggle_loop", &cfg.Shortcuts.ToggleLoop},
 		{"cycle_shell", &cfg.Shortcuts.CycleShell},
 		{"grow_input", &cfg.Shortcuts.GrowInput},
 		{"shrink_input", &cfg.Shortcuts.ShrinkInput},

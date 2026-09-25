@@ -29,7 +29,7 @@ type Channel struct {
 }
 
 // Agent is the slice of a session's top-level agent needed by the remote API.
-// *agent.Agent satisfies it.
+// *agent.Agent satisfies it. It also exposes the main-loop controls.
 type Agent interface {
 	ID() string
 	// Name is the agent's human-readable display name, distinct from the
@@ -40,6 +40,12 @@ type Agent interface {
 	State() agent.State
 	History() []llm.Item
 	Turn(context.Context, string) error
+	// MainLoopActive reports whether the top-level agent's automatic inbox loop
+	// is enabled.
+	MainLoopActive() bool
+	// SetMainLoopActive enables or disables that loop. For a subagent it is a
+	// no-op; the web API calls it only on the top-level agent.
+	SetMainLoopActive(active bool) error
 }
 
 // Handle is one conversation session: a top-level agent, its subagent tree, its

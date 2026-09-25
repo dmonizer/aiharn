@@ -33,6 +33,7 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 		m.appendLine(kindPlain, "  up/down - previous prompts")
 		m.appendLine(kindPlain, "  esc (including ctrl+esc) - stop all requests while active; double esc clears input while idle")
 		m.appendLine(kindPlain, "  "+m.shortcuts.ToggleActions+" - toggle actions allowed between ask and all (existing prompts still need a decision)")
+		m.appendLine(kindPlain, "  "+m.shortcuts.ToggleLoop+" - toggle main loop (auto-process agent messages)")
 		m.appendLine(kindPlain, "  "+m.shortcuts.ToggleThinking+" - show/hide streamed thinking summaries")
 		m.appendLine(kindPlain, "  pgup/pgdown - scroll the transcript when it overflows, otherwise the input")
 		m.appendLine(kindPlain, "  "+m.shortcuts.CycleShell+" - toggle shell view (closed/open/maximized)")

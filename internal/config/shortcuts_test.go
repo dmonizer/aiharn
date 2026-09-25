@@ -13,7 +13,7 @@ func TestLoadShortcutsOverrideAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Shortcuts.ToggleActions != "ctrl+a" || cfg.Shortcuts.ToggleThinking != "f10" || cfg.Shortcuts.InsertNewline != "ctrl+j" {
+	if cfg.Shortcuts.ToggleActions != "ctrl+a" || cfg.Shortcuts.ToggleThinking != "f10" || cfg.Shortcuts.InsertNewline != "ctrl+j" || cfg.Shortcuts.ToggleLoop != "ctrl+l" {
 		t.Fatalf("shortcuts = %+v", cfg.Shortcuts)
 	}
 	if err := Validate(cfg, ValidateOptions{}); err != nil {
@@ -30,6 +30,7 @@ func TestValidateShortcutsRejectsInvalidAndConflictingKeys(t *testing.T) {
 		{"enter alias", "toggle_actions = \"ctrl+m\"", "shortcuts.toggle_actions"},
 		{"tab alias", "toggle_actions = \"ctrl+i\"", "shortcuts.toggle_actions"},
 		{"unsupported function key", "toggle_actions = \"f13\"", "shortcuts.toggle_actions"},
+		{"loop duplicate", "toggle_loop = \"f9\"", "conflicts with shortcuts.toggle_actions"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := Load(setup(t, "[shortcuts]\n"+tc.body+"\n"+validConfig))

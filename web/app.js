@@ -63,6 +63,10 @@
     snapshots: new Map(),
     selectedAgents: new Map(),
     drafts: new Map(),
+    // Session ids with an accepted cancel request whose agent state has not
+    // settled yet. This prevents repeated Stop submissions against the same
+    // stale running snapshot.
+    stoppingSessions: new Set(),
     request: null,
     sessionsRequest: null,
     timer: null,
@@ -291,6 +295,15 @@
         marker.textContent = "default";
         name.append(marker);
       }
+      const canLoop = Array.isArray(session.capabilities) &&
+        session.capabilities.indexOf("main_loop") !== -1;
+      if (canLoop) {
+        const loop = document.createElement("em");
+        loop.className = "session-loop " + (session.loop_active ? "on" : "off");
+        loop.textContent = "loop";
+        loop.title = session.loop_active ? "Main loop running" : "Main loop stopped";
+        name.append(loop);
+      }
       const detail = document.createElement("span");
       const count = Array.isArray(session.agents) ? session.agents.length - 1 : 0;
       detail.textContent = count > 0
@@ -383,7 +396,6 @@
     elements.message.disabled = true;
     resetSendButton();
     elements.transcript.replaceChildren(emptyState("Loading agent…", id));
-    renderPendingAgentMessages();
     poll();
     setMenuOpen(false);
   }
@@ -446,7 +458,6 @@
     elements.sessionMeta.replaceChildren();
     elements.agentList.replaceChildren();
     elements.approvals.replaceChildren();
-    renderPendingAgentMessages();
     elements.message.disabled = true;
     resetSendButton();
     elements.queue.textContent = "";
@@ -498,6 +509,8 @@
     const channel = channelChip(session, capabilities, channels);
     if (channel) items.push(channel);
     items.push(approvalChip(session, capabilities));
+    const loop = loopChip(session, capabilities);
+    if (loop) items.push(loop);
     items.push(chip(session.state || "unknown", "state-" + (session.state || "unknown")));
     elements.sessionMeta.replaceChildren(...items);
   }
@@ -517,6 +530,26 @@
     button.setAttribute("aria-label",
       "Approval mode: " + mode + ". Switch to " + next + ".");
     button.addEventListener("click", () => toggleApprovalMode(button, capabilities));
+    return button;
+  }
+
+  function loopChip(session, capabilities) {
+    const active = Boolean(session.loop_active);
+    const unavailable = session.state === "closed" || session.state === "errored";
+    const capable = Array.isArray(capabilities) &&
+      capabilities.indexOf("main_loop") !== -1;
+    if (!capable) return null;
+    const label = active ? "loop on" : "loop off";
+    if (unavailable) {
+      return chip(label, active ? "loop-on" : "loop-off");
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "meta-chip loop-toggle " + (active ? "loop-on" : "loop-off");
+    button.textContent = label;
+    button.title = "Switch main loop " + (active ? "off" : "on");
+    button.setAttribute("aria-label", "Main loop: " + (active ? "active" : "inactive") + ". Switch " + (active ? "off" : "on") + ".");
+    button.addEventListener("click", () => toggleLoopMode(button, capabilities));
     return button;
   }
 
@@ -557,6 +590,39 @@
     if (entry) entry.approval_mode = mode;
     const snapshot = state.snapshots.get(state.sessionId);
     if (snapshot && snapshot.session) snapshot.session.approval_mode = mode;
+  }
+
+  async function toggleLoopMode(button, capabilities) {
+    if (!state.endpoint || button.disabled) return;
+    const snapshot = state.snapshots.get(state.sessionId);
+    const session = snapshot?.session || {};
+    const active = Boolean(session.loop_active);
+    const next = !active;
+    const payload = { active: next };
+    if (state.sessionSupport === true && state.sessionId) {
+      payload.session_id = state.sessionId;
+    }
+    button.disabled = true;
+    try {
+      const result = await apiCall("/session/loop", {
+        method: "POST", body: JSON.stringify(payload)
+      });
+      const applied = result && typeof result.loop_active === "boolean"
+        ? result.loop_active : next;
+      setLoopMode(applied);
+      renderSessionMeta(session, capabilities, snapshot?.channels);
+    } catch (error) {
+      showConnection(error.message || "Could not change the main loop.");
+      button.disabled = false;
+    }
+  }
+
+  function setLoopMode(active) {
+    const snapshot = state.snapshots.get(state.sessionId);
+    if (snapshot && snapshot.session) snapshot.session.loop_active = active;
+    const entry = activeSession();
+    if (entry) entry.loop_active = active;
+    renderSessionList();
   }
 
   // channelChip renders the execution-channel chip. When the server advertises
@@ -703,66 +769,12 @@
     state.connected = true;
     updateComposer();
     renderApprovals(snapshot.pending_approvals || [], snapshot.pending_tool_limits || []);
-    renderMessages(snapshot.messages || [], snapshot.live_reasoning);
-    renderPendingAgentMessages(snapshot.pending_agent_messages);
+    renderMessages(snapshot.messages || [], snapshot.live_reasoning, snapshot.pending_agent_messages);
     if (state.sessionSupport === false) showConnection(LEGACY_SERVER_NOTICE);
     else if (stale) showConnection(STALE_SERVER_NOTICE);
     else if (snapshot.agents_error) showConnection(snapshot.agents_error);
     else if (snapshot.last_error) showConnection(snapshot.last_error);
     else hideConnection();
-  }
-
-  // Agent messages still queued in an inbox are not part of the transcript
-  // yet, so the poll (which is the only thing that refreshes the transcript)
-  // cannot show them there. Render them in a bounded strip directly above the
-  // composer, visually distinct from the transcript, so a queued agent message
-  // is visible before the next turn. The strip is hidden entirely when the
-  // server is older (no pending_agent_messages field) or the array is empty.
-  function renderPendingAgentMessages(pending) {
-    let strip = elements.pendingAgentMessages;
-    if (!strip) {
-      strip = document.createElement("section");
-      strip.id = "pending-agent-messages";
-      strip.className = "pending-agent-messages hidden";
-      strip.setAttribute("aria-label", "Agent messages");
-      if (elements.composer && elements.composer.parentNode) {
-        elements.composer.parentNode.insertBefore(strip, elements.composer);
-      }
-      elements.pendingAgentMessages = strip;
-    }
-    strip.replaceChildren();
-    const list = Array.isArray(pending) ? pending : [];
-    if (!list.length) {
-      strip.classList.add("hidden");
-      return;
-    }
-    strip.classList.remove("hidden");
-    const head = document.createElement("div");
-    head.className = "pending-head";
-    const title = document.createElement("span");
-    title.className = "pending-title";
-    title.textContent = "Agent messages";
-    const hint = document.createElement("span");
-    hint.className = "pending-hint";
-    hint.textContent = "Queued between agents. They appear in the transcript after your next message.";
-    head.append(title, hint);
-    const items = document.createElement("ul");
-    items.className = "pending-list";
-    for (const entry of list) {
-      const item = document.createElement("li");
-      item.className = "pending-item";
-      const header = document.createElement("div");
-      header.className = "pending-item-header";
-      const arrow = entry && entry.direction === "down" ? "\u2193" : "\u2191";
-      header.textContent = arrow + " " + agentLabel(entry && entry.from) + " \u2192 " +
-        agentLabel(entry && entry.to) + " \u00b7 " + ((entry && entry.kind) || "message");
-      const text = document.createElement("div");
-      text.className = "pending-item-body";
-      text.textContent = (entry && entry.content) || "";
-      item.append(header, text);
-      items.append(item);
-    }
-    strip.append(head, items);
   }
 
   const markdownTags = new Set([
@@ -844,7 +856,75 @@
     body.append(document.createTextNode(message.content || ""));
   }
 
-  function renderMessages(messages, liveReasoning) {
+  function agentMessageSummary(from, to, currentID) {
+    const fromLabel = agentLabel(from);
+    const toLabel = agentLabel(to);
+    if (from === currentID) {
+      return { direction: "outgoing", text: "outgoing " + fromLabel + " > " + toLabel };
+    }
+    if (to === currentID) {
+      return { direction: "incoming", text: "incoming " + toLabel + " < " + fromLabel };
+    }
+    return { direction: "", text: fromLabel + " > " + toLabel };
+  }
+
+  function renderAgentMessageBlock(message, delivery, key, currentID, expanded, pending) {
+    const meta = agentMessageSummary(delivery.from, delivery.to, currentID);
+    const details = document.createElement("details");
+    details.className = "agent-message-block" +
+      (pending ? " pending" : " delivered") +
+      (meta.direction ? " " + meta.direction : "");
+    details.dataset.agentMessageKey = key;
+    details.open = expanded;
+
+    const summary = document.createElement("summary");
+    const label = document.createElement("span");
+    label.className = "agent-message-title";
+    label.textContent = meta.text;
+    summary.append(label);
+    if (pending) {
+      const badge = document.createElement("span");
+      badge.className = "agent-message-status";
+      badge.textContent = "pending";
+      summary.append(badge);
+    }
+    summary.title = (delivery.kind || "agent message") + (pending ? " (pending)" : "");
+    details.append(summary);
+
+    const body = document.createElement("div");
+    body.className = "message agent-message-content";
+    body.dataset.scrollKey = "agent:" + key;
+    appendMessageContent(body, message || { content: "" });
+    details.append(body);
+    return details;
+  }
+
+  function captureScrollState(root) {
+    const state = new Map();
+    for (const details of root.querySelectorAll("details[open]")) {
+      for (const el of details.querySelectorAll("[data-scroll-key]")) {
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+        state.set(el.dataset.scrollKey, { top: el.scrollTop, follow: nearBottom });
+      }
+    }
+    return state;
+  }
+
+  function restoreScrollState(root, state) {
+    for (const details of root.querySelectorAll("details[open]")) {
+      for (const el of details.querySelectorAll("[data-scroll-key]")) {
+        const saved = state.get(el.dataset.scrollKey);
+        if (saved) {
+          if (saved.follow) el.scrollTop = el.scrollHeight;
+          else el.scrollTop = saved.top;
+        } else if (el.dataset.follow === "true") {
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+    }
+  }
+
+  function renderMessages(messages, liveReasoning, pendingMessages) {
     const previousTop = elements.transcript.scrollTop;
     const nearBottom = elements.transcript.scrollHeight - previousTop -
       elements.transcript.clientHeight < 100;
@@ -855,8 +935,20 @@
     const existingThinking = Array.from(elements.transcript.querySelectorAll(".thinking-block"));
     const expandedThinking = new Set(existingThinking.filter((block) => block.open).map((block) => block.dataset.thinkingKey));
     const hadLiveThinking = existingThinking.some((block) => block.dataset.thinkingKey === "live");
+    const currentAgentID = state.snapshots.get(state.sessionId)?.session?.agent_id || "";
+    const pending = Array.isArray(pendingMessages) ? pendingMessages : [];
+    const relevantPending = pending.filter((entry) => entry && (entry.from === currentAgentID || entry.to === currentAgentID));
+    const expandedAgentMessages = new Set(Array.from(
+      elements.transcript.querySelectorAll(".agent-message-block[open]"),
+      (block) => block.dataset.agentMessageKey
+    ));
+    const existingAgentMessageKeys = new Set(Array.from(
+      elements.transcript.querySelectorAll(".agent-message-block"),
+      (block) => block.dataset.agentMessageKey
+    ));
+    const scrollState = captureScrollState(elements.transcript);
     elements.transcript.replaceChildren();
-    if (!messages.length && !liveReasoning) {
+    if (!messages.length && !liveReasoning && !relevantPending.length) {
       elements.transcript.append(emptyState("Session is ready", "Send a message to begin."));
       return;
     }
@@ -885,6 +977,14 @@
           ? message.delivery : null;
         const agentAuthored = message.role === "user" &&
           (message.origin === "agent" || Boolean(delivery));
+        if (agentAuthored && delivery) {
+          const deliveryKey = "delivered:" + (entry.key || "");
+          elements.transcript.append(renderAgentMessageBlock(
+            message, delivery, deliveryKey, currentAgentID,
+            expandedAgentMessages.has(deliveryKey), false
+          ));
+          continue;
+        }
         const row = document.createElement("div");
         const body = document.createElement("div");
         if (agentAuthored) {
@@ -920,6 +1020,16 @@
         elements.transcript.append(renderToolBlock(entry, expandedTools));
       }
     }
+    for (const [index, entry] of relevantPending.entries()) {
+      const pendingKey = "pending:" + (typeof entry.seq === "number" ? entry.seq : index);
+      const pendingOpen = expandedAgentMessages.has(pendingKey) ||
+        !existingAgentMessageKeys.has(pendingKey);
+      elements.transcript.append(renderAgentMessageBlock(
+        { content: entry.content },
+        { from: entry.from, to: entry.to, kind: entry.kind },
+        pendingKey, currentAgentID, pendingOpen, true
+      ));
+    }
     if (liveReasoning) {
       elements.transcript.append(renderThinking(liveReasoning.text || "", Boolean(liveReasoning.active),
         "live", expandedThinking.has("live") || !hadLiveThinking));
@@ -927,8 +1037,8 @@
     elements.transcript.scrollTop = nearBottom
       ? elements.transcript.scrollHeight
       : previousTop;
+    restoreScrollState(elements.transcript, scrollState);
   }
-
   function renderThinking(content, active, key, expanded) {
     const details = document.createElement("details");
     details.className = "thinking-block" + (active ? " active" : "");
@@ -940,6 +1050,8 @@
     icon.textContent = active ? "◌" : "✓";
     summary.append(icon, document.createTextNode(active ? "Thinking…" : "Thinking"));
     const body = document.createElement("pre");
+    body.dataset.scrollKey = "thinking:" + key;
+    if (active) body.dataset.follow = "true";
     body.textContent = content || (active ? "Waiting for the model…" : "");
     details.append(summary, body);
     return details;
@@ -964,7 +1076,7 @@
         if (waiting?.length) waiting.shift().result = message;
         else entries.push({ message, result: null, key: "result:" + callID + ":" + index });
       } else {
-        entries.push({ message });
+        entries.push({ message, key: "msg:" + index });
       }
     }
     return entries;
@@ -1040,7 +1152,7 @@
     summary.append(icon, title);
     details.append(summary);
 
-    for (const call of calls) {
+    for (const [index, call] of calls.entries()) {
       const callStatus = toolStatusFor(call.message, call.result);
       const item = document.createElement("div");
       item.className = "tool-group-call";
@@ -1053,8 +1165,8 @@
       callIcon.setAttribute("aria-hidden", "true");
       head.append(callIcon, document.createTextNode("tool · " + (call.message.name || "unknown")));
       item.append(head);
-      appendToolSection(item, "Call", call.message.arguments);
-      if (call.result) appendToolSection(item, "Result", call.result.content);
+      appendToolSection(item, "Call", call.message.arguments, "tool:" + group.key + ":" + index + ":Call");
+      if (call.result) appendToolSection(item, "Result", call.result.content, "tool:" + group.key + ":" + index + ":Result");
       details.append(item);
     }
     return details;
@@ -1082,18 +1194,19 @@
     summary.append(icon, title);
     details.append(summary);
 
-    if (call) appendToolSection(details, "Call", call.arguments);
-    if (result) appendToolSection(details, "Result", result.content);
+    if (call) appendToolSection(details, "Call", call.arguments, "tool:" + entry.key + ":Call");
+    if (result) appendToolSection(details, "Result", result.content, "tool:" + entry.key + ":Result");
     return details;
   }
 
-  function appendToolSection(details, label, value) {
+  function appendToolSection(details, label, value, scrollKey) {
     const section = document.createElement("div");
     section.className = "tool-section";
     const heading = document.createElement("div");
     heading.className = "tool-section-label";
     heading.textContent = label;
     const pre = document.createElement("pre");
+    if (scrollKey) pre.dataset.scrollKey = scrollKey;
     pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
     section.append(heading, pre);
     details.append(section);
@@ -1323,11 +1436,14 @@
       showConnection("Not connected to the API.");
       return;
     }
+    const sessionID = state.sessionId;
+    if (state.stoppingSessions.has(sessionID)) return;
     const payload = {};
-    if (state.sessionSupport === true && state.sessionId) {
-      payload.session_id = state.sessionId;
+    if (state.sessionSupport === true && sessionID) {
+      payload.session_id = sessionID;
     }
-    elements.send.disabled = true;
+    state.stoppingSessions.add(sessionID);
+    updateComposer();
     try {
       await apiCall("/session/cancel", {
         method: "POST",
@@ -1335,6 +1451,7 @@
       });
       await poll(true);
     } catch (error) {
+      state.stoppingSessions.delete(sessionID);
       showConnection(error.message || "Could not stop requests.");
     } finally {
       updateComposer();
@@ -1434,10 +1551,12 @@
     elements.send.disabled = true;
   }
 
-  // sessionBusy reports whether any LLM request, queued prompt, or pending
-  // approval is still active. This is the web console's equivalent of the TUI's
-  // "there is work to stop" test. "starting" is deliberately NOT treated as
-  // busy: a fresh, never-used agent reports "starting" while it is really idle.
+  // sessionBusy reports whether any LLM request, queued prompt, or blocking
+  // prompt is still active. Pending agent-to-agent messages are deliberately
+  // excluded: they are durable inbox notices waiting for a future turn, not
+  // active work, and Cancel preserves messages queued for the top-level agent.
+  // Counting them here leaves the button stuck on Stop forever. "starting" is
+  // also not busy: a fresh, never-used agent reports it while actually idle.
   function sessionBusy(snapshot) {
     if (!snapshot) return false;
     const session = snapshot.session || {};
@@ -1449,10 +1568,7 @@
       snapshot.pending_approvals.length > 0;
     const toolLimits = Array.isArray(snapshot.pending_tool_limits) &&
       snapshot.pending_tool_limits.length > 0;
-    const pendingAgentMessages = Array.isArray(snapshot.pending_agent_messages) &&
-      snapshot.pending_agent_messages.length > 0;
-    return Boolean(stateBusy || agentBusy || queued || approvals || toolLimits ||
-      pendingAgentMessages);
+    return Boolean(stateBusy || agentBusy || queued || approvals || toolLimits);
   }
 
   function canCancel(snapshot) {
@@ -1464,11 +1580,26 @@
     const snapshot = state.snapshots.get(state.sessionId);
     const session = snapshot?.session || {};
     const unavailable = session.state === "closed" || session.state === "errored";
+    const busy = sessionBusy(snapshot);
+    const stopping = state.stoppingSessions.has(state.sessionId);
+
+    // Cancel returns as soon as cancellation is signalled; the following poll
+    // can still contain the previous running snapshot. Keep the button disabled
+    // until a later snapshot confirms that the work stopped, rather than
+    // inviting repeated cancel requests.
+    if (stopping && busy) {
+      elements.send.textContent = "Stopping…";
+      elements.send.classList.add("stop");
+      elements.send.setAttribute("aria-label", "Stopping all requests");
+      elements.send.disabled = true;
+      return;
+    }
+    if (stopping) state.stoppingSessions.delete(state.sessionId);
 
     // Stop availability is driven by connection state and actual work, not by
     // the selected agent's state: a user can still stop the whole session even
     // while viewing a subagent that already errored or closed.
-    if (state.connected && canCancel(snapshot) && sessionBusy(snapshot)) {
+    if (state.connected && canCancel(snapshot) && busy) {
       elements.send.textContent = "Stop";
       elements.send.classList.add("stop");
       elements.send.setAttribute("aria-label", "Stop all requests");
@@ -1486,6 +1617,7 @@
   function refreshAfterEndpointChange() {
     state.fingerprint = "";
     state.connected = false;
+    state.stoppingSessions.clear();
     state.sessionsRequest?.abort();
     state.request?.abort();
   }

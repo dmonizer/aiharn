@@ -201,6 +201,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if msg.String() == m.shortcuts.ToggleLoop && m.agent != nil {
+		_ = m.agent.SetMainLoopActive(!m.agent.MainLoopActive())
+		return m, nil
+	}
 
 	if m.pending != nil {
 		return m, m.handleApprovalKey(msg)

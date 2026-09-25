@@ -91,6 +91,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
 	mux.HandleFunc("/api/v1/session/channel", s.handleSessionChannel)
 	mux.HandleFunc("/api/v1/session/cancel", s.handleSessionCancel)
+	mux.HandleFunc("/api/v1/session/loop", s.handleSessionLoop)
 	mux.HandleFunc("/api/v1/messages", s.handleMessages)
 	mux.HandleFunc("/api/v1/approvals/", s.handleApproval)
 	mux.HandleFunc("/api/v1/tool-limits/", s.handleToolLimit)
@@ -220,6 +221,7 @@ type session struct {
 	Channel      string    `json:"channel"`
 	State        string    `json:"state"`
 	ApprovalMode string    `json:"approval_mode"`
+	LoopActive   bool      `json:"loop_active"`
 }
 
 // sessionListResponse is the payload of GET /api/v1/sessions.
@@ -242,6 +244,7 @@ type sessionDescriptor struct {
 	AgentsError    string         `json:"agents_error,omitempty"`
 	QueuedMessages int            `json:"queued_messages"`
 	LastError      string         `json:"last_error,omitempty"`
+	LoopActive     bool           `json:"loop_active"`
 	// Capabilities is always present, exactly as on GET /api/v1/session.
 	Capabilities []string `json:"capabilities"`
 }
@@ -280,6 +283,7 @@ type delivery struct {
 // pendingMessage is one agent-authored message queued in an inbox but not yet
 // injected into a history.
 type pendingMessage struct {
+	Seq       uint64 `json:"seq"`
 	From      string `json:"from"`
 	To        string `json:"to"`
 	Direction string `json:"direction"`
@@ -321,12 +325,16 @@ const channelSwitchCapability = "channel_switch"
 const markdownHTMLCapability = "markdown_html"
 const sessionCancelCapability = "session_cancel"
 
+// mainLoopCapability advertises that the server can enable/disable the
+// top-level agent's automatic inbox loop.
+const mainLoopCapability = "main_loop"
+
 // capabilities returns a fresh slice for each response. A shared backing array
 // would let one caller's mutation leak into another payload, and keeping the
 // list in one place stops GET /api/v1/session and the session descriptors from
 // drifting apart.
 func capabilities() []string {
-	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability, sessionCancelCapability}
+	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability, sessionCancelCapability, mainLoopCapability}
 }
 
 // channelDescriptors renders every configured execution channel for the wire.
@@ -393,6 +401,7 @@ func (s *Server) describe(ctx context.Context, handle sessions.Handle, isDefault
 		Agents:         agents,
 		AgentsError:    agentsErr,
 		QueuedMessages: handle.Queued(), LastError: handle.LastError(),
+		LoopActive:   handle.Agent().MainLoopActive(),
 		Capabilities: capabilities(),
 	}
 }
@@ -444,6 +453,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			Model: model, Channel: channel,
 			State:        selected.State().String(),
 			ApprovalMode: handle.Gate().Mode().String(),
+			LoopActive:   handle.Agent().MainLoopActive(),
 		},
 		Agents:               agents,
 		AgentsError:          agentsErr,
@@ -757,6 +767,35 @@ func (s *Server) handleSessionApproval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"mode": gate.Mode().String()})
 }
 
+// handleSessionLoop enables or disables the session's top-level agent loop.
+func (s *Server) handleSessionLoop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var body struct {
+		Active    bool   `json:"active"`
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		return
+	}
+	handle, ok := s.resolve(body.SessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if err := handle.Agent().SetMainLoopActive(body.Active); err != nil {
+		if errors.Is(err, agent.ErrAgentClosed) {
+			writeError(w, http.StatusConflict, "session is closed")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "cannot change main loop: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"loop_active": handle.Agent().MainLoopActive()})
+}
+
 // handleSessionChannel switches a session's active execution channel.
 func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -934,7 +973,7 @@ func pendingAgentMessages(manager *agent.Manager) []pendingMessage {
 	}
 	for _, m := range manager.PendingMessages() {
 		out = append(out, pendingMessage{
-			From: m.From, To: m.To, Direction: m.Direction, Kind: m.Kind, Content: m.Text,
+			Seq: m.Seq, From: m.From, To: m.To, Direction: m.Direction, Kind: m.Kind, Content: m.Text,
 		})
 	}
 	return out

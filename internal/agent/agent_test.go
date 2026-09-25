@@ -397,7 +397,14 @@ func TestTimeoutPhaseAndNextInput(t *testing.T) {
 			client := &timeoutThenClient{first: tc.first}
 			a := agent.New(agent.Spec{ID: "main", Type: "main", Client: client,
 				ThinkingTimeout: tc.thinking, RequestTimeout: tc.response})
-			defer a.Close()
+			mgr := agent.NewManager(agent.ManagerOptions{})
+			if err := mgr.RegisterTop(a); err != nil {
+				t.Fatal(err)
+			}
+			if err := mgr.StartTopLoop("main"); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = mgr.Shutdown() })
 			if err := a.Turn(context.Background(), "first"); err != nil {
 				t.Fatal(err)
 			}
@@ -422,7 +429,7 @@ func TestTimeoutPhaseAndNextInput(t *testing.T) {
 				}
 				select {
 				case <-deadline:
-					t.Fatal("subagent report did not resume timed-out parent")
+					t.Fatal("subagent report did not trigger a main-loop turn")
 				case <-time.After(time.Millisecond):
 				}
 			}
@@ -740,11 +747,20 @@ func TestTurnRecordsHumanOrigin(t *testing.T) {
 	}
 }
 
-func TestDrainedInboxPreservesOrigin(t *testing.T) {
+func TestLoopDeliveredInboxPreservesOrigin(t *testing.T) {
 	a := agent.New(agent.Spec{
 		ID: "a1", Type: "main", Model: "m",
-		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
+		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok"), finalTurn("ok")}},
 	})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("a1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
 	if !a.Send("queued by a person") {
 		t.Fatal("Send failed")
 	}
@@ -753,34 +769,30 @@ func TestDrainedInboxPreservesOrigin(t *testing.T) {
 	}) {
 		t.Fatal("SendAgent failed")
 	}
-	if err := a.Turn(context.Background(), "typed by a person"); err != nil {
-		t.Fatal(err)
-	}
+	waitFor(t, 2*time.Second, "loop to deliver both inbox messages", func() bool {
+		h := a.History()
+		return a.State() == agent.StateIdle &&
+			historyCount(h, "queued by a person") == 1 && historyCount(h, "[subagent coder (7)] done") == 1
+	})
 	hist := a.History()
 	if len(hist) != 4 {
 		t.Fatalf("history len = %d, want 4: %+v", len(hist), hist)
 	}
 	if hist[0].Content != "queued by a person" || hist[0].Origin != llm.OriginHuman {
-		t.Fatalf("drained human message = %+v", hist[0])
+		t.Fatalf("loop-delivered human message = %+v", hist[0])
 	}
-	if hist[1].Content != "[subagent coder (7)] done" || hist[1].Origin != llm.OriginAgent {
-		t.Fatalf("drained agent message = %+v", hist[1])
+	if hist[2].Content != "[subagent coder (7)] done" || hist[2].Origin != llm.OriginAgent {
+		t.Fatalf("loop-delivered agent message = %+v", hist[2])
 	}
-	if got := hist[1].Delivery; got == nil || got.From != "coder-7" || got.To != "a1" ||
+	if got := hist[2].Delivery; got == nil || got.From != "coder-7" || got.To != "a1" ||
 		got.Direction != llm.DirectionUp || got.Kind != llm.KindReport {
-		t.Fatalf("drained agent message delivery = %+v", got)
+		t.Fatalf("loop-delivered agent message delivery = %+v", got)
 	}
-	if hist[2].Content != "typed by a person" || hist[2].Origin != llm.OriginHuman {
-		t.Fatalf("turn input = %+v", hist[2])
-	}
-	if hist[2].Delivery != nil {
-		t.Fatalf("human turn input must carry no delivery: %+v", hist[2].Delivery)
-	}
-	// The drained report is reported delivered exactly once, at the point it is
-	// appended to history; the human turn input stays a plain EventUser.
+	// The loop-delivered report is reported delivered exactly once, at the point
+	// it is appended to history.
 	events := drainEvents(a)
 	if got := countAgentMessages(events, "[subagent coder (7)] done", false); got != 1 {
-		t.Fatalf("drained report delivered events = %d, want exactly 1: %+v", got, events)
+		t.Fatalf("loop-delivered report delivered events = %d, want exactly 1: %+v", got, events)
 	}
 }
 
@@ -792,42 +804,38 @@ func TestSendAgentEmitsPendingThenDelivered(t *testing.T) {
 		ID: "a1", Type: "main", Model: "m",
 		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
 	})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("a1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
 	d := &llm.Delivery{From: "sub-1", To: "a1", Direction: llm.DirectionUp, Kind: llm.KindReport}
 	if !a.SendAgent("done", d) {
 		t.Fatal("SendAgent failed")
 	}
-	queued := drainEvents(a)
-	var pending bool
-	for _, e := range queued {
-		if e.Type == agent.EventAgentMessage {
-			if !e.Pending || e.Text != "done" || e.Delivery == nil || e.Delivery.From != "sub-1" {
-				t.Fatalf("queued event = %+v", e)
-			}
-			pending = true
-		}
+	waitFor(t, 2*time.Second, "loop to deliver the agent message", func() bool {
+		return a.State() == agent.StateIdle && historyCount(a.History(), "done") == 1
+	})
+	events := drainEvents(a)
+	if got := countAgentMessages(events, "done", true); got != 1 {
+		t.Fatalf("Pending-true events = %d, want exactly 1: %+v", got, events)
 	}
-	if !pending {
-		t.Fatalf("no Pending EventAgentMessage emitted: %+v", queued)
+	if got := countAgentMessages(events, "done", false); got != 1 {
+		t.Fatalf("delivered events = %d, want exactly 1: %+v", got, events)
 	}
-
-	if err := a.Turn(context.Background(), "go"); err != nil {
-		t.Fatal(err)
-	}
-	delivered := drainEvents(a)
-	count := 0
-	for _, e := range delivered {
-		if e.Type == agent.EventAgentMessage {
-			if e.Pending || e.Text != "done" || e.Delivery == nil || e.Delivery.Kind != llm.KindReport {
+	for _, e := range events {
+		if e.Type == agent.EventAgentMessage && e.Text == "done" && !e.Pending {
+			if e.Delivery == nil || e.Delivery.From != "sub-1" || e.Delivery.Kind != llm.KindReport {
 				t.Fatalf("delivered event = %+v", e)
 			}
-			count++
 		}
 		if e.Type == agent.EventUser && e.Text == "done" {
 			t.Fatalf("delivered report also rendered as a raw user turn: %+v", e)
 		}
-	}
-	if count != 1 {
-		t.Fatalf("delivered EventAgentMessage count = %d, want exactly 1: %+v", count, delivered)
 	}
 }
 
@@ -838,17 +846,21 @@ func TestHumanSendEmitsNoAgentMessage(t *testing.T) {
 		ID: "a1", Type: "main", Model: "m",
 		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
 	})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("a1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
 	if !a.Send("hi") {
 		t.Fatal("Send failed")
 	}
-	for _, e := range drainEvents(a) {
-		if e.Type == agent.EventAgentMessage {
-			t.Fatalf("human Send emitted an agent-message event: %+v", e)
-		}
-	}
-	if err := a.Turn(context.Background(), "go"); err != nil {
-		t.Fatal(err)
-	}
+	waitFor(t, 2*time.Second, "loop to deliver the human message", func() bool {
+		return a.State() == agent.StateIdle && historyCount(a.History(), "hi") == 1
+	})
 	hist := a.History()
 	if hist[0].Content != "hi" || hist[0].Origin != llm.OriginHuman || hist[0].Delivery != nil {
 		t.Fatalf("human message = %+v", hist[0])
@@ -858,7 +870,7 @@ func TestHumanSendEmitsNoAgentMessage(t *testing.T) {
 		if e.Type == agent.EventAgentMessage {
 			t.Fatalf("human turn emitted an agent-message event: %+v", e)
 		}
-		if e.Type == agent.EventUser && e.Text == "go" {
+		if e.Type == agent.EventUser && e.Text == "hi" {
 			users++
 		}
 	}

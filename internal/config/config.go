@@ -106,7 +106,7 @@ type AgentConfig struct {
 	Model          string              `toml:"model"`
 	Description    string              `toml:"description"`
 	SystemPrompt   string              `toml:"system_prompt"`
-	Channel        string              `toml:"channel"` // "" = first channel
+	Channel        string              `toml:"channel"` // top-level default; "" = first channel
 	WorkingDir     *WorkingDirTemplate `toml:"working_dir"`
 	Tools          ToolSelection       `toml:"tools"`
 	AllowSubagents bool                `toml:"allow_subagents"`

@@ -19,6 +19,7 @@ aiharn_home = "~/.aiharn"
 [shortcuts]
 toggle_actions = "f9"       # ask/all; for example, change to "ctrl+a"
 toggle_thinking = "f10"
+toggle_loop = "ctrl+l"      # auto-process agent messages on/off
 cycle_shell = "ctrl+s"
 grow_input = "ctrl+up"
 shrink_input = "ctrl+down"
@@ -84,9 +85,9 @@ description = "General coordinator; delegates planning and operator tasks"
 system_prompt = "prompts/main_pentester.md"
 # channel = "" # main agent default: first channel; explicit "sf" is equivalent here
 channel = "sf"
-# Subagent types without a channel inherit the main agent's channel instead of
-# defaulting to the first channel, so a top-level --channel or runtime switch
-# also applies to subagents spawned afterwards.
+# Spawned agents use a parallel session on the main agent's current channel,
+# so a top-level --channel or runtime switch applies to subagents spawned
+# afterwards. An agent's configured channel is its top-level default only.
 # working_dir is unset by default; an agent override takes precedence over its channel's.
 # working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"
 # tools = "none" # default; accepts "ALL", "NONE", "execute_command,spawn_subagent", or a TOML array (including ["ALL"] or ["NONE"])

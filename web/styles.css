@@ -171,6 +171,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .session-copy span { margin-top: 3px; color: var(--faint); font-size: 10px; }
 .session-copy em { margin-left: 5px; color: var(--faint); font-size: 9px; font-style: normal; letter-spacing: .08em; text-transform: uppercase; }
 
+.session-loop { margin-left: 5px; font-size: 9px; font-style: normal; letter-spacing: .08em; text-transform: uppercase; }
+.session-loop::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 4px; border-radius: 50%; background: currentColor; }
+.session-loop.on { color: var(--accent); }
+.session-loop.off { color: #d6b45c; }
+
 .session-actions { display: flex; gap: 2px; visibility: hidden; }
 .session-item:hover .session-actions, .session-item:focus-within .session-actions { visibility: visible; }
 .session-action {
@@ -319,6 +324,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   cursor: default;
   opacity: .6;
 }
+
+.meta-chip.loop-toggle {
+  cursor: pointer;
+  appearance: none;
+  text-align: center;
+}
+.meta-chip.loop-toggle:hover { border-color: var(--line-bright); color: var(--text); }
+.meta-chip.loop-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.meta-chip.loop-toggle:disabled { cursor: default; opacity: .6; }
+.meta-chip.loop-on { border-color: #536b35; color: var(--accent); }
+.meta-chip.loop-off { border-color: #6b5a2f; color: #d6b45c; }
 
 .connection-state {
   flex: none;
@@ -494,6 +510,49 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 .message-delivery .delivery-header::first-letter { color: #cfe3dd; }
 
+/* Agent-to-agent message block rendered in the transcript like a tool call or
+   thinking block. The summary names the direction relative to the selected
+   agent; the body is collapsible and keeps its own scroll position. */
+.agent-message-block {
+  margin: -4px 0 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #101316;
+}
+.agent-message-block summary {
+  padding: 9px 12px;
+  color: var(--muted);
+  font: 11px ui-monospace, "SFMono-Regular", Consolas, monospace;
+  cursor: pointer;
+}
+.agent-message-title { color: #8fb0a9; }
+.agent-message-block.outgoing .agent-message-title { color: #9fb8d8; }
+.agent-message-block.incoming .agent-message-title { color: #8fc0a9; }
+.agent-message-status {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #3a2f17;
+  color: #d6b45c;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.agent-message-block .agent-message-content {
+  max-width: none;
+  max-height: 330px;
+  margin: 0;
+  padding: 8px 12px 12px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  color: #aeb8bf;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.agent-message-block .agent-message-content.markdown { white-space: normal; }
+
 
 .tool-block {
   margin: -4px 0 18px;
@@ -534,43 +593,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .thinking-block.active .thinking-icon { color: var(--warn); animation: thinking-breathe 1.8s ease-in-out infinite; }
 @keyframes thinking-breathe { 50% { opacity: .3; transform: scale(.85); } }
 @media (prefers-reduced-motion: reduce) { .thinking-block.active .thinking-icon { animation: none; } }
-
-/* Agent messages still queued in an inbox: not in the transcript yet. A
-   bounded, bordered strip directly above the composer so it can never be
-   mistaken for the transcript. */
-.pending-agent-messages {
-  /* A long queued report used to hold the whole column open at its content
-     height, pushing the composer thousands of pixels below the viewport: a flex
-     item's content-based minimum size (min-height: auto) was clamped by nothing.
-     The max-height below is what stops that; overflow-y keeps the excess
-     scrolling inside the strip instead of spilling over the composer. */
-  overflow-y: auto;
-  /* At most 30% of the window, at most 320px, and never so much that the rest of
-     the column is squeezed. Fixed overhead below the strip is 229px (76px topbar
-     + 121px composer + its 22px and 10px margins), so a 320px reserve leaves an
-     80px transcript down to a 331px-tall window (where the strip's 22px
-     padding/border floor takes over). 30vh alone is not enough: at 1280x400 it
-     is 120px, which still squeezed the transcript to its own 52px padding. */
-  max-height: min(30vh, 320px, calc(100vh - 320px));
-  /* flex: none keeps the strip out of the free-space split entirely, so the
-     transcript is always the element that absorbs a deficit. */
-  flex: none;
-  margin: 0 max(28px, calc((100% - 920px) / 2)) 10px;
-  padding: 10px 14px;
-  border: 1px solid #4a5a3a;
-  border-left: 3px solid #8a9a5b;
-  border-radius: 10px;
-  background: #151a12;
-}
-.pending-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; margin-bottom: 8px; }
-.pending-title { color: #cfe3a8; font-size: 11px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
-.pending-hint { color: var(--faint); font-size: 10px; }
-.pending-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
-.pending-item { border-top: 1px dashed #35402c; padding-top: 8px; }
-.pending-item:first-child { border-top: 0; padding-top: 0; }
-.pending-item-header { margin-bottom: 3px; color: #a9c07a; font: 11px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace; }
-.pending-item-body { color: #c6cfc0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
-
 
 .composer {
   display: grid;

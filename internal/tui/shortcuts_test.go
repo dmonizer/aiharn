@@ -36,6 +36,20 @@ func TestConfiguredApprovalShortcutReplacesF9(t *testing.T) {
 	}
 }
 
+func TestHelpListsToggleLoop(t *testing.T) {
+	m := newTestModel(t)
+	m.handleCommand("/help")
+	found := false
+	for _, line := range m.lines {
+		if strings.Contains(line.text, "ctrl+l - toggle main loop") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("/help did not list the toggle loop shortcut")
+	}
+}
+
 func TestConfiguredInsertNewlineShortcut(t *testing.T) {
 	base := newTestModel(t)
 	m := New(base.manager, base.agent, base.gate, Status{
