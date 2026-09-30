@@ -1,5 +1,5 @@
 // Package ssh implements the execution.Transport/Session interfaces over SSH
-// with a persistent, stateful, non-PTY shell per session. It owns all SSH
+// with a long-lived non-PTY shell process per session. It owns all SSH
 // session creation, host-key verification, shared/dedicated client handling,
 // and (framing.go) the delimiter protocol that separates command output.
 package ssh

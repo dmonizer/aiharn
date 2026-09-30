@@ -528,18 +528,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 .agent-message-title { color: #8fb0a9; }
 .agent-message-block.outgoing .agent-message-title { color: #9fb8d8; }
 .agent-message-block.incoming .agent-message-title { color: #8fc0a9; }
-.agent-message-status {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: #3a2f17;
-  color: #d6b45c;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-}
 .agent-message-block .agent-message-content {
   max-width: none;
   max-height: 330px;

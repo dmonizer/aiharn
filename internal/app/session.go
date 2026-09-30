@@ -163,15 +163,23 @@ func (s *Session) Submit(ctx context.Context, agentID, content string) error {
 		return sessions.ErrClosed
 	default:
 	}
-	prompt := queuedPrompt{content: content, epoch: s.turnEpochNow()}
+	// Stamp and enqueue while holding turnMu so Cancel's epoch advance and old
+	// queue drain form one atomic boundary. A submission after that boundary is
+	// guaranteed to survive the stop.
+	s.turnMu.Lock()
+	prompt := queuedPrompt{content: content, epoch: s.turnEpoch}
 	select {
 	case s.queue <- prompt:
+		s.turnMu.Unlock()
 		return nil
 	case <-ctx.Done():
+		s.turnMu.Unlock()
 		return ctx.Err()
 	case <-s.ctx.Done():
+		s.turnMu.Unlock()
 		return sessions.ErrClosed
 	default:
+		s.turnMu.Unlock()
 		return sessions.ErrQueueFull
 	}
 }
@@ -192,17 +200,27 @@ func (s *Session) Cancel(ctx context.Context) (int, error) {
 		return 0, sessions.ErrClosed
 	}
 
-	// Advance the epoch first so any prompt enqueued after this point is
-	// stamped for the new epoch and will survive the drain below.
+	affected := 0
+	// Advance the epoch and drain the old queue under the same lock used by
+	// Submit. Any prompt accepted after this critical section is stamped with
+	// the new epoch and cannot be consumed by this stop.
 	s.turnMu.Lock()
 	s.turnEpoch++
 	turnCancel := s.turnCancel
+	for {
+		select {
+		case <-s.queue:
+			affected++
+		default:
+			goto drained
+		}
+	}
+
+drained:
 	s.turnMu.Unlock()
 
-	affected := 0
-	// Manager.CancelAll cancels the active top-level turn and every subagent
-	// turn, and discards queued subagent tasks; its count is authoritative for
-	// agent work.
+	// Manager.CancelAll cancels every active agent turn and discards every
+	// agent inbox item; its count is authoritative for agent work.
 	if s.rt.Manager != nil {
 		n, err := s.rt.Manager.CancelAll()
 		affected += n
@@ -218,19 +236,6 @@ func (s *Session) Cancel(ctx context.Context) (int, error) {
 		turnCancel()
 	}
 
-	// Discard every top-level prompt still waiting in the queue. A prompt that
-	// already left the queue carries a pre-stop epoch and is dropped by
-	// beginTurn before its turn starts.
-	for {
-		select {
-		case <-s.queue:
-			affected++
-		default:
-			goto drained
-		}
-	}
-
-drained:
 	if s.rt.Gate != nil {
 		for _, req := range s.rt.Gate.PendingRequests() {
 			affected++
@@ -238,15 +243,6 @@ drained:
 		}
 	}
 	return affected, nil
-}
-
-// turnEpochNow returns the current stop epoch, stamped onto a prompt when it is
-// enqueued. beginTurn rejects a prompt whose stamp no longer matches, so Cancel
-// drops exactly the prompts queued before the stop and keeps later ones.
-func (s *Session) turnEpochNow() uint64 {
-	s.turnMu.Lock()
-	defer s.turnMu.Unlock()
-	return s.turnEpoch
 }
 
 // beginTurn publishes the queue worker's turn cancel handle unless a stop has

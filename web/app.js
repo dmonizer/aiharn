@@ -769,7 +769,7 @@
     state.connected = true;
     updateComposer();
     renderApprovals(snapshot.pending_approvals || [], snapshot.pending_tool_limits || []);
-    renderMessages(snapshot.messages || [], snapshot.live_reasoning, snapshot.pending_agent_messages);
+    renderMessages(snapshot.messages || [], snapshot.live_reasoning);
     if (state.sessionSupport === false) showConnection(LEGACY_SERVER_NOTICE);
     else if (stale) showConnection(STALE_SERVER_NOTICE);
     else if (snapshot.agents_error) showConnection(snapshot.agents_error);
@@ -868,11 +868,10 @@
     return { direction: "", text: fromLabel + " > " + toLabel };
   }
 
-  function renderAgentMessageBlock(message, delivery, key, currentID, expanded, pending) {
+  function renderAgentMessageBlock(message, delivery, key, currentID, expanded) {
     const meta = agentMessageSummary(delivery.from, delivery.to, currentID);
     const details = document.createElement("details");
-    details.className = "agent-message-block" +
-      (pending ? " pending" : " delivered") +
+    details.className = "agent-message-block delivered" +
       (meta.direction ? " " + meta.direction : "");
     details.dataset.agentMessageKey = key;
     details.open = expanded;
@@ -882,13 +881,7 @@
     label.className = "agent-message-title";
     label.textContent = meta.text;
     summary.append(label);
-    if (pending) {
-      const badge = document.createElement("span");
-      badge.className = "agent-message-status";
-      badge.textContent = "pending";
-      summary.append(badge);
-    }
-    summary.title = (delivery.kind || "agent message") + (pending ? " (pending)" : "");
+    summary.title = delivery.kind || "agent message";
     details.append(summary);
 
     const body = document.createElement("div");
@@ -924,7 +917,7 @@
     }
   }
 
-  function renderMessages(messages, liveReasoning, pendingMessages) {
+  function renderMessages(messages, liveReasoning) {
     const previousTop = elements.transcript.scrollTop;
     const nearBottom = elements.transcript.scrollHeight - previousTop -
       elements.transcript.clientHeight < 100;
@@ -936,19 +929,13 @@
     const expandedThinking = new Set(existingThinking.filter((block) => block.open).map((block) => block.dataset.thinkingKey));
     const hadLiveThinking = existingThinking.some((block) => block.dataset.thinkingKey === "live");
     const currentAgentID = state.snapshots.get(state.sessionId)?.session?.agent_id || "";
-    const pending = Array.isArray(pendingMessages) ? pendingMessages : [];
-    const relevantPending = pending.filter((entry) => entry && (entry.from === currentAgentID || entry.to === currentAgentID));
     const expandedAgentMessages = new Set(Array.from(
       elements.transcript.querySelectorAll(".agent-message-block[open]"),
       (block) => block.dataset.agentMessageKey
     ));
-    const existingAgentMessageKeys = new Set(Array.from(
-      elements.transcript.querySelectorAll(".agent-message-block"),
-      (block) => block.dataset.agentMessageKey
-    ));
     const scrollState = captureScrollState(elements.transcript);
     elements.transcript.replaceChildren();
-    if (!messages.length && !liveReasoning && !relevantPending.length) {
+    if (!messages.length && !liveReasoning) {
       elements.transcript.append(emptyState("Session is ready", "Send a message to begin."));
       return;
     }
@@ -981,7 +968,7 @@
           const deliveryKey = "delivered:" + (entry.key || "");
           elements.transcript.append(renderAgentMessageBlock(
             message, delivery, deliveryKey, currentAgentID,
-            expandedAgentMessages.has(deliveryKey), false
+            expandedAgentMessages.has(deliveryKey)
           ));
           continue;
         }
@@ -1019,16 +1006,6 @@
       } else {
         elements.transcript.append(renderToolBlock(entry, expandedTools));
       }
-    }
-    for (const [index, entry] of relevantPending.entries()) {
-      const pendingKey = "pending:" + (typeof entry.seq === "number" ? entry.seq : index);
-      const pendingOpen = expandedAgentMessages.has(pendingKey) ||
-        !existingAgentMessageKeys.has(pendingKey);
-      elements.transcript.append(renderAgentMessageBlock(
-        { content: entry.content },
-        { from: entry.from, to: entry.to, kind: entry.kind },
-        pendingKey, currentAgentID, pendingOpen, true
-      ));
     }
     if (liveReasoning) {
       elements.transcript.append(renderThinking(liveReasoning.text || "", Boolean(liveReasoning.active),
@@ -1461,13 +1438,13 @@
   async function sendMessage(event) {
     event?.preventDefault();
     const snapshot = state.snapshots.get(state.sessionId);
-    if (state.connected && canCancel(snapshot) && sessionBusy(snapshot)) {
+    const content = elements.message.value;
+    if (!content.trim() && state.connected && canCancel(snapshot) && sessionBusy(snapshot)) {
       await stopRequests();
       return;
     }
     const agentID = selectedAgentID();
     const rootID = snapshot?.agents?.[0]?.id || snapshot?.session?.agent_id || "";
-    const content = elements.message.value;
     if (!state.endpoint || !state.connected || elements.message.disabled || !content.trim()) return;
     elements.send.disabled = true;
     try {
@@ -1582,6 +1559,18 @@
     const unavailable = session.state === "closed" || session.state === "errored";
     const busy = sessionBusy(snapshot);
     const stopping = state.stoppingSessions.has(state.sessionId);
+    const hasText = Boolean(elements.message.value.trim());
+
+    // Text always wins over the stop affordance: while work is active the same
+    // form queues a follow-up. Stop is shown only for an empty composer.
+    if (hasText) {
+      elements.send.textContent = "↑";
+      elements.send.classList.remove("stop");
+      elements.send.setAttribute("aria-label", "Send message");
+      elements.send.disabled = !state.connected || !snapshot || unavailable ||
+        elements.message.disabled;
+      return;
+    }
 
     // Cancel returns as soon as cancellation is signalled; the following poll
     // can still contain the previous running snapshot. Keep the button disabled

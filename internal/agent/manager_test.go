@@ -1393,7 +1393,7 @@ func TestShutdownJoinsMainLoop(t *testing.T) {
 	}
 }
 
-func TestCancelAllCancelsInFlightLoopTurnAndKeepsLoopAlive(t *testing.T) {
+func TestCancelAllCancelsInFlightLoopTurnDropsQueuedAndKeepsLoopAlive(t *testing.T) {
 	top := agent.New(agent.Spec{ID: "main", Type: "main", AllowSubagents: true, Client: blockingClient{}})
 	mgr := agent.NewManager(agent.ManagerOptions{})
 	if err := mgr.RegisterTop(top); err != nil {
@@ -1423,15 +1423,70 @@ func TestCancelAllCancelsInFlightLoopTurnAndKeepsLoopAlive(t *testing.T) {
 		t.Fatalf("CancelAll affected = %d, want at least the in-flight loop turn", n)
 	}
 
-	// The loop survives the cancellation and immediately runs the queued second
-	// message, proving the top-level inbox was not discarded. The second turn can
-	// only start once the cancelled first turn has released turnMu, so observing
-	// it also proves the first turn was actually cancelled.
-	waitFor(t, 2*time.Second, "loop to pick up the preserved second message", func() bool {
-		return top.State() == agent.StateRunning && historyCount(top.History(), "second") == 1
+	// Stop discards the queued second message, and the current turn settles.
+	waitFor(t, 2*time.Second, "cancelled loop turn to settle", func() bool {
+		return top.State() == agent.StateIdle
 	})
-	hist := top.History()
-	if historyCount(hist, "first") != 1 || historyCount(hist, "second") != 1 {
-		t.Fatalf("inbox messages not preserved through CancelAll: %+v", hist)
+	if got := historyCount(top.History(), "second"); got != 0 {
+		t.Fatalf("queued message survived CancelAll: %+v", top.History())
+	}
+
+	// The loop itself remains reusable for work sent after the stop.
+	d3 := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindReport}
+	if !top.SendAgent("third", d3) {
+		t.Fatal("SendAgent(third) failed")
+	}
+	waitFor(t, 2*time.Second, "main loop to accept post-stop work", func() bool {
+		return top.State() == agent.StateRunning && historyCount(top.History(), "third") == 1
+	})
+	if _, err := mgr.CancelAll(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelAllInvalidatesMainLoopMessageWaitingForTurn(t *testing.T) {
+	top := agent.New(agent.Spec{ID: "main", Type: "main", Client: blockingClient{}})
+	mgr := agent.NewManager(agent.ManagerOptions{})
+	if err := mgr.RegisterTop(top); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.StartTopLoop("main"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Shutdown() })
+
+	// Hold turnMu with a human turn, then let the main loop take an inbox item
+	// and wait behind it. At that point the item is neither in the inbox nor the
+	// active turn, which was the cancellation race.
+	humanDone := make(chan error, 1)
+	go func() { humanDone <- top.Turn(context.Background(), "human") }()
+	waitFor(t, 2*time.Second, "human turn to start", func() bool {
+		return top.State() == agent.StateRunning
+	})
+	d := &llm.Delivery{From: "sub-1", To: "main", Direction: llm.DirectionUp, Kind: llm.KindMessage}
+	if !top.SendAgent("waiting", d) {
+		t.Fatal("SendAgent(waiting) failed")
+	}
+	waitFor(t, 2*time.Second, "main loop to take waiting message", func() bool {
+		for _, pending := range mgr.PendingMessages() {
+			if pending.Text == "waiting" {
+				return false
+			}
+		}
+		return true
+	})
+
+	if _, err := mgr.CancelAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-humanDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("human turn error = %v, want context cancellation", err)
+	}
+	waitFor(t, 2*time.Second, "main agent to settle", func() bool {
+		return top.State() == agent.StateIdle
+	})
+	time.Sleep(20 * time.Millisecond)
+	if got := historyCount(top.History(), "waiting"); got != 0 {
+		t.Fatalf("pre-stop waiting message started after cancellation: %+v", top.History())
 	}
 }

@@ -791,15 +791,14 @@ func TestLoopDeliveredInboxPreservesOrigin(t *testing.T) {
 	// The loop-delivered report is reported delivered exactly once, at the point
 	// it is appended to history.
 	events := drainEvents(a)
-	if got := countAgentMessages(events, "[subagent coder (7)] done", false); got != 1 {
+	if got := countAgentMessages(events, "[subagent coder (7)] done"); got != 1 {
 		t.Fatalf("loop-delivered report delivered events = %d, want exactly 1: %+v", got, events)
 	}
 }
 
-// TestSendAgentEmitsPendingThenDelivered proves the two EventAgentMessage
-// emissions a live UI relies on: Pending true when the message is queued, and
-// Pending false once it reaches history.
-func TestSendAgentEmitsPendingThenDelivered(t *testing.T) {
+// TestSendAgentEmitsDeliveredOnce proves enqueueing is not rendered as a
+// second message: EventAgentMessage fires exactly once, at delivery.
+func TestSendAgentEmitsDeliveredOnce(t *testing.T) {
 	a := agent.New(agent.Spec{
 		ID: "a1", Type: "main", Model: "m",
 		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
@@ -821,14 +820,11 @@ func TestSendAgentEmitsPendingThenDelivered(t *testing.T) {
 		return a.State() == agent.StateIdle && historyCount(a.History(), "done") == 1
 	})
 	events := drainEvents(a)
-	if got := countAgentMessages(events, "done", true); got != 1 {
-		t.Fatalf("Pending-true events = %d, want exactly 1: %+v", got, events)
-	}
-	if got := countAgentMessages(events, "done", false); got != 1 {
+	if got := countAgentMessages(events, "done"); got != 1 {
 		t.Fatalf("delivered events = %d, want exactly 1: %+v", got, events)
 	}
 	for _, e := range events {
-		if e.Type == agent.EventAgentMessage && e.Text == "done" && !e.Pending {
+		if e.Type == agent.EventAgentMessage && e.Text == "done" {
 			if e.Delivery == nil || e.Delivery.From != "sub-1" || e.Delivery.Kind != llm.KindReport {
 				t.Fatalf("delivered event = %+v", e)
 			}
@@ -908,23 +904,20 @@ func historyCount(hist []llm.Item, content string) int {
 	return n
 }
 
-// countAgentMessages counts EventAgentMessage events for text with the given
-// Pending flag. A delivered event is Pending false; an enqueue event is Pending
-// true.
-func countAgentMessages(events []agent.Event, text string, pending bool) int {
+// countAgentMessages counts delivered EventAgentMessage events for text.
+func countAgentMessages(events []agent.Event, text string) int {
 	n := 0
 	for _, e := range events {
-		if e.Type == agent.EventAgentMessage && e.Text == text && e.Pending == pending {
+		if e.Type == agent.EventAgentMessage && e.Text == text {
 			n++
 		}
 	}
 	return n
 }
 
-// TestEnqueueEmitsPendingTrueUnchanged pins the enqueue-time event: a queued
-// agent message reports Pending true once, and nothing is delivered until the
-// text reaches a history.
-func TestEnqueueEmitsPendingTrueUnchanged(t *testing.T) {
+// TestEnqueueEmitsNoAgentMessage pins enqueueing as an internal scheduling
+// detail. The UI sees the message only after it reaches history.
+func TestEnqueueEmitsNoAgentMessage(t *testing.T) {
 	a := agent.New(agent.Spec{
 		ID: "a1", Type: "main", Model: "m",
 		Client: &testllm.FakeClient{Script: [][]llm.Event{finalTurn("ok")}},
@@ -934,11 +927,8 @@ func TestEnqueueEmitsPendingTrueUnchanged(t *testing.T) {
 		t.Fatal("SendAgent failed")
 	}
 	events := drainEvents(a)
-	if got := countAgentMessages(events, "queued report", true); got != 1 {
-		t.Fatalf("Pending-true events = %d, want exactly 1: %+v", got, events)
-	}
-	if got := countAgentMessages(events, "queued report", false); got != 0 {
-		t.Fatalf("enqueue emitted %d delivered events before any turn: %+v", got, events)
+	if got := countAgentMessages(events, "queued report"); got != 0 {
+		t.Fatalf("enqueue emitted %d message events before delivery: %+v", got, events)
 	}
 }
 
@@ -963,14 +953,14 @@ func TestDeliveryCarryingTurnInputEmitsDeliveredNotUser(t *testing.T) {
 	})
 
 	events := drainEvents(sub)
-	if got := countAgentMessages(events, prompt, false); got != 1 {
+	if got := countAgentMessages(events, prompt); got != 1 {
 		t.Fatalf("delivered turn-input events = %d, want exactly 1: %+v", got, events)
 	}
 	for _, e := range events {
 		if e.Type == agent.EventUser && e.Text == prompt {
 			t.Fatalf("delivery-carrying turn input also emitted EventUser: %+v", e)
 		}
-		if e.Type == agent.EventAgentMessage && e.Text == prompt && !e.Pending {
+		if e.Type == agent.EventAgentMessage && e.Text == prompt {
 			if e.Delivery == nil || e.Delivery.Direction != llm.DirectionDown || e.Delivery.Kind != llm.KindTask {
 				t.Fatalf("delivered task event lost its delivery metadata: %+v", e)
 			}
@@ -1049,7 +1039,7 @@ func TestTaskTakenWhilePausedDeliversOnlyOnResume(t *testing.T) {
 	})
 	// ...but it is neither delivered nor in history while held.
 	held := drainEvents(sub)
-	if got := countAgentMessages(held, second, false); got != 0 {
+	if got := countAgentMessages(held, second); got != 0 {
 		t.Fatalf("taken-but-unrun task emitted %d delivered events: %+v", got, held)
 	}
 	if historyCount(sub.History(), second) != 0 {
@@ -1064,7 +1054,7 @@ func TestTaskTakenWhilePausedDeliversOnlyOnResume(t *testing.T) {
 		return historyCount(sub.History(), second) == 1
 	})
 	after := drainEvents(sub)
-	if got := countAgentMessages(after, second, false); got != 1 {
+	if got := countAgentMessages(after, second); got != 1 {
 		t.Fatalf("resumed task delivered events = %d, want exactly 1: %+v", got, after)
 	}
 }
@@ -1107,7 +1097,7 @@ func TestTaskTakenThenShutdownDeliversNothing(t *testing.T) {
 		}
 		return true
 	})
-	if got := countAgentMessages(drainEvents(sub), queued, false); got != 0 {
+	if got := countAgentMessages(drainEvents(sub), queued); got != 0 {
 		t.Fatalf("taken-but-unrun task emitted %d delivered events: %+v", got, queued)
 	}
 
@@ -1115,7 +1105,7 @@ func TestTaskTakenThenShutdownDeliversNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := drainEvents(sub)
-	if got := countAgentMessages(events, queued, false); got != 0 {
+	if got := countAgentMessages(events, queued); got != 0 {
 		t.Fatalf("dropped task emitted %d delivered events: %+v", got, events)
 	}
 	if historyCount(sub.History(), queued) != 0 {

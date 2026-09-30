@@ -692,8 +692,9 @@ func (m *Manager) CloseSubagent(ctx context.Context, callerID, subagentID string
 	return nil
 }
 
-// CancelAll cancels every agent's current turn and discards queued subagent
-// tasks. Agents and their execution sessions remain open and reusable. The
+// CancelAll cancels every agent's current turn and discards every queued inbox
+// item. Agents and their execution sessions remain open and reusable. Messages
+// sent after the stop receive a new work epoch and are not discarded. The
 // returned count is the number of agents whose active or queued work was
 // affected.
 func (m *Manager) CancelAll() (int, error) {
@@ -710,9 +711,7 @@ func (m *Manager) CancelAll() (int, error) {
 
 	cancelled := 0
 	for _, a := range agents {
-		// The top-level inbox contains completed subagent messages rather than
-		// queued tasks, so preserve it. Subagent inboxes are work queues.
-		if a.cancelWork(a.Depth() > 0) {
+		if a.cancelWork(true) {
 			cancelled++
 		}
 	}

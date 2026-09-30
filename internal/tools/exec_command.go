@@ -43,7 +43,7 @@ type execCommand struct {
 func (t *execCommand) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Name:        NameExecuteCommand,
-		Description: "Run a shell command on the target machine and return its exit code, stdout, and stderr. Requires user approval unless approval is allow-all.",
+		Description: "Run a shell command on the target machine and return its exit code, stdout, and stderr. Each command runs in a fresh shell: working directory, exported variables, functions, and shell options do not persist between calls (use the cwd argument or chain with && when needed). Requires user approval unless approval is allow-all.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {

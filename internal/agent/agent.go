@@ -62,9 +62,9 @@ const (
 	EventToolCall
 	EventToolResult
 	EventState
-	// EventAgentMessage reports an agent-to-agent message. It is emitted when
-	// the message is enqueued (Pending true, still in the recipient's inbox) and
-	// again when it is injected into the recipient's history (Pending false).
+	// EventAgentMessage reports an agent-to-agent message once it is injected
+	// into the recipient's history. Enqueueing is an internal scheduling detail,
+	// not a second conversational event.
 	// Appended last so existing EventType values stay stable.
 	EventAgentMessage
 	EventTimeout
@@ -85,9 +85,6 @@ type Event struct {
 	// Delivery is set on EventAgentMessage: which agent sent the text, to which
 	// agent, in which direction, and why.
 	Delivery *llm.Delivery
-	// Pending is true on EventAgentMessage while the message still sits in the
-	// recipient's inbox, and false once it has been injected into its history.
-	Pending bool
 	// TimeoutPhase identifies thinking or response, including provider deadlines
 	// that occur during either phase, on EventTimeout.
 	TimeoutPhase string
@@ -181,6 +178,10 @@ type Agent struct {
 	// not yet drained into history, so a polling API client (which has no event
 	// stream) can list them. Guarded by mu.
 	pendingInbox []inboxItem
+	// workEpoch invalidates inbox items that were queued or taken before a
+	// stop-all request. It closes the race where the main loop has received an
+	// item and is waiting for turnMu, so there is no turnCancel handle yet.
+	workEpoch uint64
 	// mainLoopActive enables the top-level agent's automatic inbox loop. It is
 	// true by default and toggled by SetMainLoopActive. Only depth-0 agents use it.
 	mainLoopActive atomic.Bool
@@ -352,6 +353,7 @@ type inboxItem struct {
 	origin   llm.Origin
 	delivery *llm.Delivery
 	seq      uint64
+	epoch    uint64
 }
 
 // inboxSeq orders agent-authored inbox messages process-wide, so the API can
@@ -384,17 +386,13 @@ func (a *Agent) send(item inboxItem) bool {
 		a.mu.Unlock()
 		return false
 	}
+	item.epoch = a.workEpoch
 	select {
 	case a.inbox <- item:
 		if item.delivery != nil {
 			a.pendingInbox = append(a.pendingInbox, item)
 		}
 		a.mu.Unlock()
-		// Emit only after releasing a.mu: emit reaches the activity observer and
-		// must never run under the agent lock.
-		if item.delivery != nil {
-			a.emit(Event{Type: EventAgentMessage, Text: item.text, Delivery: item.delivery, Pending: true})
-		}
 		return true
 	default:
 		a.mu.Unlock()
@@ -452,30 +450,23 @@ func (a *Agent) setOnStateChange(fn func()) { a.onStateChange = fn }
 // Turn runs one human turn. It does not drain the inbox; the inbox is owned by
 // the main loop and the subagent run loop.
 func (a *Agent) Turn(ctx context.Context, input string) error {
-	return a.runTurn(ctx, input, llm.OriginHuman, nil)
+	return a.runTurn(ctx, input, llm.OriginHuman, nil, nil)
 }
 
 // turn is the core loop: append input and iterate stream → tools until the model
 // stops calling tools. It does not drain the inbox; the main loop and the
 // subagent run loop manage that.
-func (a *Agent) turn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery) error {
-	return a.runTurn(ctx, input, origin, delivery)
+func (a *Agent) turn(ctx context.Context, item inboxItem) error {
+	return a.runTurn(ctx, item.text, item.origin, item.delivery, &item.epoch)
 }
 
-func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery) error {
+func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, delivery *llm.Delivery, expectedEpoch *uint64) error {
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
 	start := time.Now()
-	logging.Debug("agent: turn start",
-		slog.String("component", "agent"),
-		slog.String("agent_id", a.id),
-		slog.String("agent_type", a.typ),
-		slog.Int("input_bytes", len(input)),
-	)
 	fail := func(err error) error {
 		logging.Debug("agent: turn end",
 			slog.String("component", "agent"),
@@ -488,6 +479,13 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 	}
 
 	a.mu.Lock()
+	// Check the epoch while holding the same lock used to publish turnCancel.
+	// Cancel therefore either invalidates this item first, or sees and cancels
+	// the installed handle; there is no gap in which a pre-stop turn can start.
+	if expectedEpoch != nil && *expectedEpoch != a.workEpoch {
+		a.mu.Unlock()
+		return context.Canceled
+	}
 	if a.state == StateClosed {
 		a.mu.Unlock()
 		logging.Debug("agent: turn end",
@@ -519,6 +517,12 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 		a.active.Done()
 	}()
 	ctx = turnCtx
+	logging.Debug("agent: turn start",
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.String("agent_type", a.typ),
+		slog.Int("input_bytes", len(input)),
+	)
 
 	a.setState(StateRunning)
 	if input != "" {
@@ -528,7 +532,7 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 		// A delivery-carrying turn input (a subagent task prompt or a delivered
 		// inbox message) has just entered history: report it as the delivered agent
 		// message, and NOT as a raw user turn.
-		a.emit(Event{Type: EventAgentMessage, Text: input, Delivery: delivery, Pending: false})
+		a.emit(Event{Type: EventAgentMessage, Text: input, Delivery: delivery})
 	} else {
 		a.emit(Event{Type: EventUser, Text: input})
 	}
@@ -682,7 +686,7 @@ func (a *Agent) runTop() {
 			// yet delivered; the delivered event is emitted when turn appends it
 			// to history (mirrors the subagent run loop).
 			a.markTaken(item)
-			if err := a.turn(a.ctx, item.text, item.origin, item.delivery); err != nil {
+			if err := a.turn(a.ctx, item); err != nil {
 				// A cancelled turn that is not a shutdown leaves the agent open
 				// and reusable; keep the loop alive. A genuine error has already
 				// set the agent to errored via fail(); the loop keeps running but
@@ -690,6 +694,9 @@ func (a *Agent) runTop() {
 				// parked until a human turn recovers it.
 				if a.ctx.Err() != nil {
 					return
+				}
+				if errors.Is(err, context.Canceled) {
+					continue
 				}
 				logging.Debug("agent: main-loop turn failed",
 					slog.String("component", "agent"),
@@ -736,7 +743,7 @@ func (a *Agent) run(ctx context.Context) {
 			// Preserve the origin and delivery carried by the queued task: a
 			// subagent's task prompt and any injected report are agent-authored,
 			// not human text.
-			if err := a.turn(ctx, task.text, task.origin, task.delivery); err != nil {
+			if err := a.turn(ctx, task); err != nil {
 				// A user interrupt cancels one task, not the reusable subagent's
 				// lifecycle. Keep its run loop alive for future messages.
 				if errors.Is(err, context.Canceled) && ctx.Err() == nil {
@@ -803,6 +810,9 @@ func (a *Agent) cancelWork(discardInbox bool) bool {
 	a.mu.Lock()
 	cancel := a.turnCancel
 	affected := cancel != nil
+	// Invalidate work already taken from the inbox but still waiting for
+	// turnMu. New messages sent after this point receive the new epoch.
+	a.workEpoch++
 	if discardInbox {
 		// Every queued message is discarded, so nothing remains pending.
 		if len(a.pendingInbox) > 0 {

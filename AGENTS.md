@@ -1,6 +1,8 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Repository-wide guidance for coding agents working on Aiharn. Read this file
+first, then read every linked subsystem guide relevant to the files you will
+change. A nested `AGENTS.md` extends these root instructions for its directory.
 
 ## Commands
 
@@ -12,144 +14,43 @@ make race     # go test -race ./...
 make run      # build and run ./aiharn
 ```
 
-Run a single test (path-scoped so only that package's tests execute):
+Run one test with a package-scoped command:
 
 ```sh
 go test ./internal/agent/ -run TestName -v
 ```
 
-The `internal/execution/ssh/harness` package provides an in-process SSH server used
-by the transport/session tests, so those tests run without a real SSH daemon.
+The `internal/execution/ssh/harness` package supplies an in-process SSH server,
+so transport and session tests do not require a real SSH daemon.
 
 ## Architecture
 
-Aiharn is an AI agent harness: a Bubbletea TUI drives an agent loop that calls an
-LLM, which may invoke tools that execute commands on an execution channel, gated by
-an approval prompt. `docs/plan.md` is the canonical design document; `stopped.md`
-records completed-phase notes that post-date it.
+Aiharn is an AI agent harness: a Bubbletea TUI drives an agent loop that calls
+an LLM, which may invoke tools that execute commands on an execution channel,
+gated by an approval prompt. `README.md` covers user-facing setup and `BUGS.md`
+tracks known issues.
 
-Packages depend only in one direction (acyclic):
+Packages depend only in this direction; preserve the acyclic boundary:
 
-```
+```text
 config → llm → execution → approval → tools → agent → app → tui / webapi
 ```
 
-`internal/config` sits at the root and imports nothing from the rest of the project.
-It loads TOML, interpolates `${VAR}` from the environment, resolves local paths
-(relative to the config file; `~` expands only for local paths), applies defaults,
-and semantically validates. Secret-bearing fields (`api_key`, `password`) are
-redacted in every error/log boundary. Committed `config.toml` references only
-environment variables; real credentials go in git-ignored `*.local.toml`.
+## Subsystem index
 
-### Execution abstraction (`internal/execution`)
+- [Configuration](internal/config/AGENTS.md)
+- [LLM provider-neutral contract and adapters](internal/llm/AGENTS.md)
+- [Execution transports, sessions, and framing](internal/execution/AGENTS.md)
+- [Approval gate](internal/approval/AGENTS.md)
+- [Tool registry and subagent tool boundary](internal/tools/AGENTS.md)
+- [Agent loop and manager](internal/agent/AGENTS.md)
+- [Runtime assembly and conversation sessions](internal/app/AGENTS.md)
+- [Session interfaces](internal/sessions/AGENTS.md)
+- [Terminal UI](internal/tui/AGENTS.md)
+- [Web API](internal/webapi/AGENTS.md)
+- [Web console](web/AGENTS.md)
+- [Test doubles](internal/testutil/AGENTS.md)
 
-The core seam is two interfaces in `internal/execution/transport.go` and
-`session.go`: `Transport` (connection lifecycle) and `Session` (a persistent,
-stateful shell that runs one command at a time and returns a `Result` of stdout,
-stderr, and exit code). `ErrSessionReset` marks an unrecoverable session that
-must be discarded. Implementations satisfy the interface via a compile-time
-assertion (`var _ execution.Transport = (*Transport)(nil)`).
-
-- `internal/execution/ssh` — SSH transport (golang.org/x/crypto/ssh), with
-  host-key verification via knownhosts, password / key-file / SSH-agent auth,
-  and OpenSSH `~/.ssh/config` alias resolution when a channel specifies only
-  name+host.
-- `internal/execution/local` — runs commands on this machine via `os/exec` with
-  `Setsid` and process-group kill, mirroring SSH semantics. Requires no host,
-  user, or auth fields.
-- `internal/execution/shell` — shared marker-based framing protocol that both
-  transports use. A command is base64-encoded and run via `setsid bash -c` in the
-  background; unique `AIHARN-BEGIN/END/ERR` markers plus a 128-bit nonce separate
-  stdout, stderr, and exit code without shell quoting.
-
-The framing protocol is subtle (marker uniqueness, truncation, process-group
-signal handling, cancellation without leaving the session unusable). Before
-changing it, read `internal/execution/shell/framing.go` and both transports'
-`Exec` implementations together; keep them in sync.
-
-### LLM (`internal/llm`)
-
-`internal/llm/types.go` defines the provider-neutral contract (`Item`,
-`Request`, `Client.Stream`) and a streaming event model (TextDelta → terminal
-Completed/Failed). Two adapters translate it to wire protocols:
-`responses` (OpenAI Responses API) and `chatcompletions` (Chat Completions API).
-The rest of the program never imports SDK types. The agent owns conversation
-history and rebuilds a full stateless request each turn.
-
-### Tools and approval
-
-`internal/tools` defines the callable tools (`execute_command`, `set_approval`,
-and five subagent tools) behind a registry. The `SubagentBackend` interface is
-declared in `tools` and implemented by `agent.Manager` — this is what breaks the
-agent↔tools import cycle (`tools` never imports `agent`).
-
-`internal/approval` is a `Gate` that prompts the user before a command runs.
-`internal/tools/set_approval.go` lets the model switch the gate between `ask` and
-`allow-all`.
-
-### Agent and app
-
-`internal/agent` is the agent loop (`starting → running → idle → closed | errored`)
-plus a `Manager` that owns all agents, assigns ids, enforces limits
-(`max_agent_depth`, `max_open_agents`, `allow_subagents`), and routes subagent
-inbox messages. `internal/app` assembles everything from validated config into a
-`Runtime`, including a per-channel transport cache shared by all agents.
-
-`internal/tui` is the Bubbletea UI; `internal/webapi` (with `web/`) is the
-optional current-session HTTP API and static frontend (see `docs/remote.md`).
-
-### Sessions (`internal/app`, `internal/webapi`)
-
-"Session" is overloaded in this codebase; disambiguate before changing either
-meaning:
-
-- **Execution session** (`internal/execution.Session`): one long-lived, stateful
-  shell per agent. Unrelated to the API's "session".
-- **Conversation session**: the top-level agent plus its subagent tree, its
-  history, and its transcript — what `GET /api/v1/session` returns. (The TUI
-  never uses the word for the conversation; its "session" mentions are all about
-  the execution-shell pane.)
-
-There is one default conversation session per process (id `default`, name
-`Default`) plus as many additional sessions as the API creates, bounded by
-`api.max_sessions` (default 8). Each session owns its own `Runtime` (its own
-`agent.Manager`, approval `Gate`, and transport cache), transcript, and message
-queue.
-
-- `internal/sessions` declares the `Handle` and `Store` interfaces;
-  `internal/app` implements them as `Session` and `SessionManager`. The default
-  session is the one the terminal UI drives (`SessionManager.DefaultRuntime`).
-- `webapi` binds a `sessions.Store` at construction (`cmd/aiharn/main.go`), so
-  `queued_messages` and `last_error` are per-session (not server-global) and are
-  reported only when the top-level agent is selected.
-- Routes registered in `internal/webapi/api.go`: `GET /api/v1/session` (optional
-  `?session_id=` and `?agent_id=`), `POST /api/v1/messages`,
-  `POST /api/v1/approvals/{id}`, `POST /api/v1/session/approval`,
-  `POST /api/v1/session/channel`, `POST /api/v1/session/cancel` (the web
-  equivalent of the TUI's Esc stop-everything), `POST /api/v1/tool-limits/{id}`,
-  and `GET`/`POST /api/v1/sessions` plus `GET`/`PATCH`/`DELETE
-  /api/v1/sessions/{id}`. The `session_id` field defaults to the default session
-  on every route, so v1 clients keep working.
-- Approval ids are sequential per `Gate` (each session has its own gate), so
-  they are unique only within that gate.
-- Transcripts are per-session by default (`recorder.NewSessionFile`); `--log`
-  switches to one shared per-process recorder, and an overridden empty `--log`
-  disables transcripts. `docs/remote.md` records the current API surface.
-
-### Web console (`web/`)
-
-`web/app.js` is a single IIFE and `web/index.html` carries no inline script or
-style plus a strict CSP (`script-src 'self'`, so no inline handlers and no
-`eval`); new UI must be `addEventListener`-based code in `app.js`/`styles.css`.
-State lives in memory plus `localStorage` (endpoint and active session
-selection) and `sessionStorage` (HTTP Basic credentials, keyed per endpoint).
-The composer's send button becomes a Stop button while a session has active or
-queued work, and posts `POST /api/v1/session/cancel` to mirror the TUI's Esc
-stop-everything. The transcript is rendered from a full `GET /api/v1/session`
-snapshot polled once per second — there is no streaming, and the client keeps no
-history of its own.
-
-### Test doubles
-
-`internal/testutil/{llm,execution,approval}` hold fakes for the interfaces above;
-use them for unit tests of the agent/tools/app layers rather than real services.
+For cross-subsystem changes, read all affected guides before editing. Keep
+provider SDK types inside LLM adapters, transport details behind execution
+interfaces, and agent implementation details out of `tools`.
