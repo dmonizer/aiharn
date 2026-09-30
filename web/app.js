@@ -34,6 +34,7 @@
     endpointLabel: document.querySelector("#endpoint-label"),
     agentTitle: document.querySelector("#agent-title"),
     sessionMeta: document.querySelector("#session-meta"),
+    mobileSessionMeta: document.querySelector("#mobile-session-meta"),
     composer: document.querySelector("#composer"),
     message: document.querySelector("#message"),
     send: document.querySelector("#send"),
@@ -188,8 +189,40 @@
   function setMenuOpen(open) {
     document.body.classList.toggle("menu-open", open);
     const button = document.querySelector("#mobile-menu");
+    const drawer = document.querySelector("#navigation-drawer");
     button.setAttribute("aria-expanded", String(open));
-    button.setAttribute("aria-label", open ? "Close sessions" : "Open sessions");
+    button.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      drawer.toggleAttribute("inert", !open);
+      drawer.setAttribute("aria-hidden", String(!open));
+    } else {
+      drawer.removeAttribute("inert");
+      drawer.removeAttribute("aria-hidden");
+    }
+    if (open && document.activeElement === elements.message) {
+      elements.message.blur();
+    }
+  }
+
+  // Mobile browsers disagree about whether dynamic viewport units shrink for
+  // the on-screen keyboard. Mirror the visual viewport into CSS so the flex
+  // layout always ends above the keyboard and returns to full height on close.
+  function syncVisualViewport() {
+    if (!window.matchMedia("(max-width: 760px)").matches) {
+      document.documentElement.style.removeProperty("--visual-height");
+      document.documentElement.style.removeProperty("--visual-top");
+      document.body.classList.remove("keyboard-open");
+      setMenuOpen(false);
+      return;
+    }
+    const viewport = window.visualViewport;
+    const height = Math.round(viewport?.height || window.innerHeight);
+    const top = Math.round(viewport?.offsetTop || 0);
+    document.documentElement.style.setProperty("--visual-height", height + "px");
+    document.documentElement.style.setProperty("--visual-top", top + "px");
+    const keyboardOpen = Boolean(viewport && window.innerHeight - viewport.height > 120);
+    document.body.classList.toggle("keyboard-open", keyboardOpen);
+    setMenuOpen(document.body.classList.contains("menu-open"));
   }
 
   function draftKey(sessionID = state.sessionId, agentID = selectedAgentID()) {
@@ -456,6 +489,7 @@
       : "Not configured";
     elements.agentTitle.textContent = endpoint ? "Connecting…" : "Current session";
     elements.sessionMeta.replaceChildren();
+    elements.mobileSessionMeta.replaceChildren();
     elements.agentList.replaceChildren();
     elements.approvals.replaceChildren();
     elements.message.disabled = true;
@@ -489,11 +523,22 @@
     return box;
   }
 
-  function chip(text, className = "") {
+  function setChipContent(item, label, value) {
+    const name = document.createElement("span");
+    name.className = "meta-chip-label";
+    name.textContent = label;
+    const content = document.createElement("span");
+    content.className = "meta-chip-value";
+    content.textContent = value;
+    item.replaceChildren(name, content);
+    item.dataset.value = value;
+    return item;
+  }
+
+  function chip(value, className = "", label = "status") {
     const item = document.createElement("span");
     item.className = "meta-chip " + className;
-    item.textContent = text;
-    return item;
+    return setChipContent(item, label, value);
   }
 
   // renderSessionMeta paints the session meta row (model, channel, approval
@@ -504,15 +549,19 @@
   // execution channel is interactive only when the server advertises the
   // "channel_switch" capability and the session is live.
   function renderSessionMeta(session, capabilities, channels) {
-    const items = [];
-    if (session.model) items.push(chip(session.model));
-    const channel = channelChip(session, capabilities, channels);
-    if (channel) items.push(channel);
-    items.push(approvalChip(session, capabilities));
-    const loop = loopChip(session, capabilities);
-    if (loop) items.push(loop);
-    items.push(chip(session.state || "unknown", "state-" + (session.state || "unknown")));
-    elements.sessionMeta.replaceChildren(...items);
+    const renderItems = () => {
+      const items = [];
+      if (session.model) items.push(chip(session.model, "", "model"));
+      const channel = channelChip(session, capabilities, channels);
+      if (channel) items.push(channel);
+      items.push(approvalChip(session, capabilities));
+      const loop = loopChip(session, capabilities);
+      if (loop) items.push(loop);
+      items.push(chip(session.state || "unknown", "state-" + (session.state || "unknown"), "state"));
+      return items;
+    };
+    elements.sessionMeta.replaceChildren(...renderItems());
+    elements.mobileSessionMeta.replaceChildren(...renderItems());
   }
 
   function approvalChip(session, capabilities) {
@@ -520,12 +569,12 @@
     const unavailable = session.state === "closed" || session.state === "errored";
     const capable = Array.isArray(capabilities) &&
       capabilities.indexOf("approval_mode") !== -1;
-    if (!capable || unavailable) return chip(mode);
+    if (!capable || unavailable) return chip(mode, "", "approval");
     const next = mode === "ask" ? "allow-all" : "ask";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "meta-chip approval-toggle";
-    button.textContent = mode;
+    setChipContent(button, "approval", mode);
     button.title = "Switch approval mode to " + next;
     button.setAttribute("aria-label",
       "Approval mode: " + mode + ". Switch to " + next + ".");
@@ -539,14 +588,13 @@
     const capable = Array.isArray(capabilities) &&
       capabilities.indexOf("main_loop") !== -1;
     if (!capable) return null;
-    const label = active ? "loop on" : "loop off";
     if (unavailable) {
-      return chip(label, active ? "loop-on" : "loop-off");
+      return chip(active ? "on" : "off", active ? "loop-on" : "loop-off", "loop");
     }
     const button = document.createElement("button");
     button.type = "button";
     button.className = "meta-chip loop-toggle " + (active ? "loop-on" : "loop-off");
-    button.textContent = label;
+    setChipContent(button, "loop", active ? "on" : "off");
     button.title = "Switch main loop " + (active ? "off" : "on");
     button.setAttribute("aria-label", "Main loop: " + (active ? "active" : "inactive") + ". Switch " + (active ? "off" : "on") + ".");
     button.addEventListener("click", () => toggleLoopMode(button, capabilities));
@@ -633,14 +681,14 @@
     const capable = Array.isArray(capabilities) &&
       capabilities.indexOf("channel_switch") !== -1;
     const unavailable = session.state === "closed" || session.state === "errored";
-    if (!capable || unavailable) return chip(session.channel);
+    if (!capable || unavailable) return chip(session.channel, "", "channel");
 
     const wrapper = document.createElement("span");
     wrapper.className = "channel-menu-anchor";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "meta-chip channel-toggle";
-    button.textContent = session.channel;
+    setChipContent(button, "channel", session.channel);
     button.title = "Switch execution channel";
     button.setAttribute("aria-haspopup", "listbox");
     button.setAttribute("aria-expanded", "false");
@@ -673,7 +721,7 @@
     menu.setAttribute("role", "listbox");
     menu.setAttribute("aria-label", "Execution channel");
 
-    const current = button.textContent;
+    const current = button.dataset.value || "";
     for (const channel of channels || []) {
       const option = document.createElement("button");
       option.type = "button";
@@ -921,13 +969,10 @@
     const previousTop = elements.transcript.scrollTop;
     const nearBottom = elements.transcript.scrollHeight - previousTop -
       elements.transcript.clientHeight < 100;
-    const expandedTools = new Set(Array.from(
-      elements.transcript.querySelectorAll(".tool-block[open]"),
-      (block) => block.dataset.toolKey
+    const expandedActivities = new Set(Array.from(
+      elements.transcript.querySelectorAll(".activity-block[open]"),
+      (block) => block.dataset.activityKey
     ));
-    const existingThinking = Array.from(elements.transcript.querySelectorAll(".thinking-block"));
-    const expandedThinking = new Set(existingThinking.filter((block) => block.open).map((block) => block.dataset.thinkingKey));
-    const hadLiveThinking = existingThinking.some((block) => block.dataset.thinkingKey === "live");
     const currentAgentID = state.snapshots.get(state.sessionId)?.session?.agent_id || "";
     const expandedAgentMessages = new Set(Array.from(
       elements.transcript.querySelectorAll(".agent-message-block[open]"),
@@ -940,17 +985,15 @@
       return;
     }
 
-    let thinkingIndex = 0;
-    for (const entry of groupSequentialToolCalls(groupMessages(messages))) {
-      if (entry.group) {
-        elements.transcript.append(renderToolGroup(entry, expandedTools));
+    for (const entry of groupSequentialActivity(groupMessages(messages), liveReasoning)) {
+      if (entry.activity) {
+        elements.transcript.append(renderActivityBlock(
+          entry, expandedActivities.has(entry.key)
+        ));
         continue;
       }
       const message = entry.message;
-      if (message.type === "reasoning") {
-        const key = "thinking-" + thinkingIndex++;
-        elements.transcript.append(renderThinking(message.content || "", false, key, expandedThinking.has(key)));
-      } else if (message.type === "message") {
+      if (message.type === "message") {
         // A completed subagent report arrives in the top-level history as a
         // role:"user" item injected by the agent system. Without an origin it is
         // indistinguishable from something the human typed, so it used to wear
@@ -1003,35 +1046,12 @@
         appendMessageContent(body, message);
         row.append(body);
         elements.transcript.append(row);
-      } else {
-        elements.transcript.append(renderToolBlock(entry, expandedTools));
       }
-    }
-    if (liveReasoning) {
-      elements.transcript.append(renderThinking(liveReasoning.text || "", Boolean(liveReasoning.active),
-        "live", expandedThinking.has("live") || !hadLiveThinking));
     }
     elements.transcript.scrollTop = nearBottom
       ? elements.transcript.scrollHeight
       : previousTop;
     restoreScrollState(elements.transcript, scrollState);
-  }
-  function renderThinking(content, active, key, expanded) {
-    const details = document.createElement("details");
-    details.className = "thinking-block" + (active ? " active" : "");
-    details.dataset.thinkingKey = key;
-    details.open = expanded;
-    const summary = document.createElement("summary");
-    const icon = document.createElement("span");
-    icon.className = "thinking-icon";
-    icon.textContent = active ? "◌" : "✓";
-    summary.append(icon, document.createTextNode(active ? "Thinking…" : "Thinking"));
-    const body = document.createElement("pre");
-    body.dataset.scrollKey = "thinking:" + key;
-    if (active) body.dataset.follow = "true";
-    body.textContent = content || (active ? "Waiting for the model…" : "");
-    details.append(summary, body);
-    return details;
   }
 
   function groupMessages(messages) {
@@ -1081,24 +1101,40 @@
     return worst;
   }
 
-  function groupSequentialToolCalls(entries) {
+  function isActivityEntry(entry) {
+    return ["reasoning", "tool_call", "tool_result"].includes(entry.message?.type);
+  }
+
+  // Collapse each uninterrupted reasoning/tool run into one disclosure. Its
+  // ordinal is stable while later polls append activity to the same transcript,
+  // preserving the user's expanded state through phase changes.
+  function groupSequentialActivity(entries, liveReasoning) {
+    const source = entries.slice();
+    if (liveReasoning) {
+      source.push({
+        message: {
+          type: "reasoning",
+          content: liveReasoning.text || "",
+          live: true,
+          active: Boolean(liveReasoning.active)
+        },
+        key: "live-reasoning"
+      });
+    }
     const grouped = [];
     let run = [];
+    let activityIndex = 0;
     const flush = () => {
       if (!run.length) return;
-      if (run.length === 1) {
-        grouped.push(run[0]);
-      } else {
-        grouped.push({
-          group: true,
-          calls: run,
-          key: "group:" + run.map((c) => c.key).join(","),
-        });
-      }
+      grouped.push({
+        activity: true,
+        items: run,
+        key: "activity:" + activityIndex++
+      });
       run = [];
     };
-    for (const entry of entries) {
-      if (entry.message?.type === "tool_call") {
+    for (const entry of source) {
+      if (isActivityEntry(entry)) {
         run.push(entry);
       } else {
         flush();
@@ -1109,70 +1145,96 @@
     return grouped;
   }
 
-  function renderToolGroup(group, expandedTools) {
-    const calls = group.calls;
+  function activityPresentation(group) {
+    const calls = group.items.filter((entry) => entry.message?.type === "tool_call");
+    const reasoning = group.items.filter((entry) => entry.message?.type === "reasoning");
+    const last = group.items[group.items.length - 1];
+    const liveThinking = last?.message?.type === "reasoning" &&
+      last.message.live && last.message.active;
+    const pendingCalls = calls.filter((entry) => toolStatusFor(entry.message, entry.result) === "pending");
     const status = aggregateToolStatus(calls);
+
+    if (liveThinking) {
+      return { title: "Thinking…", status, active: true, calls };
+    }
+    if (pendingCalls.length) {
+      const name = pendingCalls.length === 1 ? pendingCalls[0].message.name : "";
+      const title = name ? "Calling " + name + "…" : "Calling tools…";
+      return { title, status: "pending", active: true, calls };
+    }
+
+    const parts = [];
+    if (reasoning.length) parts.push("Thought process");
+    if (calls.length) parts.push(calls.length + (calls.length === 1 ? " tool call" : " tool calls"));
+    return { title: parts.join(" · ") || "Activity", status, active: false, calls };
+  }
+
+  function renderActivityBlock(group, expanded) {
+    const presentation = activityPresentation(group);
     const details = document.createElement("details");
-    details.className = "tool-block tool-group " + status;
-    details.dataset.toolKey = group.key;
-    details.open = expandedTools.has(group.key);
+    details.className = "activity-block " + presentation.status +
+      (presentation.active ? " active" : "");
+    details.dataset.activityKey = group.key;
+    details.open = expanded;
 
     const summary = document.createElement("summary");
-    summary.setAttribute("aria-label", status + " · " + calls.length + " tool calls");
+    summary.setAttribute("aria-label", presentation.title);
     const icon = document.createElement("span");
-    icon.className = "tool-status-icon " + status;
-    icon.textContent = toolStatusIcon(status);
-    icon.title = status;
+    icon.className = "activity-status-icon " + presentation.status;
+    icon.textContent = presentation.active ? "◌" : toolStatusIcon(presentation.status);
+    icon.title = presentation.active ? "active" : presentation.status;
     icon.setAttribute("aria-hidden", "true");
     const title = document.createElement("span");
-    title.textContent = "tool calls (" + calls.length + ")";
+    title.className = "activity-title";
+    title.textContent = presentation.title;
     summary.append(icon, title);
     details.append(summary);
 
-    for (const [index, call] of calls.entries()) {
-      const callStatus = toolStatusFor(call.message, call.result);
-      const item = document.createElement("div");
-      item.className = "tool-group-call";
-      const head = document.createElement("div");
-      head.className = "tool-group-call-head";
+    for (const [index, entry] of group.items.entries()) {
+      if (entry.message.type === "reasoning") {
+        const step = document.createElement("section");
+        step.className = "activity-step reasoning-step" +
+          (entry.message.active ? " active" : "");
+        const heading = document.createElement("div");
+        heading.className = "activity-step-heading";
+        heading.textContent = entry.message.active ? "Thinking" : "Reasoning";
+        const body = document.createElement("pre");
+        body.dataset.scrollKey = "activity:" + group.key + ":" + index + ":reasoning";
+        if (entry.message.active) body.dataset.follow = "true";
+        body.textContent = entry.message.content ||
+          (entry.message.active ? "Waiting for the model…" : "");
+        step.append(heading, body);
+        details.append(step);
+        continue;
+      }
+
+      const call = entry.message.type === "tool_call" ? entry.message : null;
+      const result = entry.result || (call ? null : entry.message);
+      const callStatus = toolStatusFor(call, result);
+      const step = document.createElement("section");
+      step.className = "activity-step tool-step " + callStatus;
+      const heading = document.createElement("div");
+      heading.className = "activity-step-heading";
       const callIcon = document.createElement("span");
       callIcon.className = "tool-status-icon " + callStatus;
       callIcon.textContent = toolStatusIcon(callStatus);
       callIcon.title = callStatus;
       callIcon.setAttribute("aria-hidden", "true");
-      head.append(callIcon, document.createTextNode("tool · " + (call.message.name || "unknown")));
-      item.append(head);
-      appendToolSection(item, "Call", call.message.arguments, "tool:" + group.key + ":" + index + ":Call");
-      if (call.result) appendToolSection(item, "Result", call.result.content, "tool:" + group.key + ":" + index + ":Result");
-      details.append(item);
+      heading.append(callIcon, document.createTextNode(
+        call ? "Tool · " + (call.name || "unknown") :
+          "Tool result · " + (result.call_id || "unknown")
+      ));
+      step.append(heading);
+      if (call) {
+        appendToolSection(step, "Call", call.arguments,
+          "activity:" + group.key + ":" + index + ":call");
+      }
+      if (result) {
+        appendToolSection(step, "Result", result.content,
+          "activity:" + group.key + ":" + index + ":result");
+      }
+      details.append(step);
     }
-    return details;
-  }
-
-  function renderToolBlock(entry, expandedTools) {
-    const call = entry.message.type === "tool_call" ? entry.message : null;
-    const result = entry.result || (call ? null : entry.message);
-    const status = toolStatusFor(call, result);
-    const details = document.createElement("details");
-    details.className = "tool-block " + status;
-    details.dataset.toolKey = entry.key;
-    details.open = expandedTools.has(entry.key);
-
-    const summary = document.createElement("summary");
-    summary.setAttribute("aria-label", status + " · " + (call?.name || "tool result"));
-    const icon = document.createElement("span");
-    icon.className = "tool-status-icon " + status;
-    icon.textContent = toolStatusIcon(status);
-    icon.title = status;
-    icon.setAttribute("aria-hidden", "true");
-    const title = document.createElement("span");
-    title.textContent = call ? "tool · " + (call.name || "unknown") :
-      "tool result · " + (result.call_id || "unknown");
-    summary.append(icon, title);
-    details.append(summary);
-
-    if (call) appendToolSection(details, "Call", call.arguments, "tool:" + entry.key + ":Call");
-    if (result) appendToolSection(details, "Result", result.content, "tool:" + entry.key + ":Result");
     return details;
   }
 
@@ -1530,10 +1592,9 @@
 
   // sessionBusy reports whether any LLM request, queued prompt, or blocking
   // prompt is still active. Pending agent-to-agent messages are deliberately
-  // excluded: they are durable inbox notices waiting for a future turn, not
-  // active work, and Cancel preserves messages queued for the top-level agent.
-  // Counting them here leaves the button stuck on Stop forever. "starting" is
-  // also not busy: a fresh, never-used agent reports it while actually idle.
+  // excluded: a disabled loop may hold them indefinitely, so counting them
+  // leaves the button stuck on Stop even though no request is running.
+  // "starting" is also not busy: a fresh agent reports it while actually idle.
   function sessionBusy(snapshot) {
     if (!snapshot) return false;
     const session = snapshot.session || {};
@@ -1723,6 +1784,13 @@
 
   elements.composer.addEventListener("submit", sendMessage);
   elements.message.addEventListener("input", updateComposer);
+  elements.message.addEventListener("focus", () => {
+    syncVisualViewport();
+    requestAnimationFrame(() => {
+      elements.transcript.scrollTop = elements.transcript.scrollHeight;
+    });
+  });
+  elements.message.addEventListener("blur", syncVisualViewport);
   elements.message.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -1741,7 +1809,7 @@
     if (!resizeStart) return;
     const nearBottom = elements.transcript.scrollHeight - elements.transcript.scrollTop -
       elements.transcript.clientHeight < 100;
-    const max = Math.round(window.innerHeight * 0.4);
+    const max = Math.round((window.visualViewport?.height || window.innerHeight) * 0.4);
     const height = Math.min(Math.max(resizeStart.h + (resizeStart.y - event.clientY), 40), max);
     elements.message.style.height = height + "px";
     if (nearBottom) elements.transcript.scrollTop = elements.transcript.scrollHeight;
@@ -1762,9 +1830,19 @@
     }
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeChannelMenu();
+    if (event.key === "Escape") {
+      closeChannelMenu();
+      setMenuOpen(false);
+    }
   });
 
+  window.addEventListener("resize", syncVisualViewport);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncVisualViewport);
+    window.visualViewport.addEventListener("scroll", syncVisualViewport);
+  }
+
+  syncVisualViewport();
   renderSessionList();
   renderWaiting();
   if (state.endpoint) {

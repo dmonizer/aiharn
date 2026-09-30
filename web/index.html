@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark">
   <meta name="description" content="Remote console for active Aiharn sessions">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src http: https:; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
@@ -12,7 +12,7 @@
 <body>
   <div class="shell">
     <div id="sidebar-scrim" class="sidebar-scrim" aria-hidden="true"></div>
-    <aside class="sidebar">
+    <aside id="navigation-drawer" class="sidebar" aria-label="Navigation and session controls">
       <div class="brand">
         <div class="mark" aria-hidden="true">A</div>
         <div><strong>aiharn</strong><span>remote console</span></div>
@@ -23,6 +23,10 @@
         <div class="side-heading"><span>Agents</span></div>
         <nav id="agent-list" class="agent-list" aria-label="Current session agents"></nav>
       </div>
+      <div class="mobile-session-controls">
+        <div class="side-heading"><span>Session controls</span></div>
+        <div id="mobile-session-meta" class="session-meta mobile-session-meta"></div>
+      </div>
       <div class="sidebar-foot">
         <button id="open-settings" class="quiet-button">Settings</button>
         <p>Login credentials live only in this browser tab.</p>
@@ -31,7 +35,7 @@
 
     <section class="workspace">
       <header class="topbar">
-        <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open sessions" aria-expanded="false" aria-controls="session-list">☰</button>
+        <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open navigation" aria-expanded="false" aria-controls="navigation-drawer">☰</button>
         <div class="session-title">
           <div class="eyebrow" id="endpoint-label">Not configured</div>
           <h1 id="agent-title">Current session</h1>
