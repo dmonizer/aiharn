@@ -21,6 +21,9 @@ tracks the current phase (`Thinking…`, `Calling <tool>…`, or a completed
 reasoning/tool summary). Keep tool arguments, results, and reasoning accessible
 inside that disclosure rather than emitting adjacent standalone blocks.
 
+A `session_clear` capability shows a Clear chip in the session meta row; it posts
+`/api/v1/session/clear` and then re-polls the session list and snapshot.
+
 Composer behavior is text-sensitive: while a session is busy, an empty composer
 shows Stop and posts `/api/v1/session/cancel`; any non-empty text shows Send and
 posts `/api/v1/messages`, allowing mid-run follow-ups to queue. Preserve this
