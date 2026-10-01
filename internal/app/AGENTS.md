@@ -19,6 +19,11 @@ discards prompts and agent inbox work accepted before that boundary, cancels
 active turns, and denies pending approvals. Prompts accepted afterward must
 survive. A cancelled session stays open and reusable.
 
+`SessionManager.Clear` replaces one session with a fresh conversation session
+on the same id; it closes the old runtime and transcript and builds a new
+transcript. `SessionManager` also owns one shared `memory.Manager` so global
+memories span sessions while local memories stay in their session.
+
 Transcripts are per-session by default through `recorder.NewSessionFile`.
 `--log` selects one shared process recorder; an explicitly empty `--log`
 disables transcripts.

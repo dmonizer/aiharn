@@ -82,6 +82,10 @@ type Store interface {
 	Lookup(id string) (Handle, bool)
 	Rename(id, name string) (Handle, error)
 	Close(ctx context.Context, id string) error
+	// Clear replaces the addressed session with a fresh conversation session
+	// that keeps the same id and name. The old session (and its transcript) is
+	// closed but not deleted, and the new session starts a new transcript.
+	Clear(ctx context.Context, id string) (Handle, error)
 	// Channels returns every configured execution channel, in config order.
 	Channels() []Channel
 }

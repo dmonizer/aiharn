@@ -15,6 +15,7 @@ import (
 	"aiharn/internal/config"
 	"aiharn/internal/llm"
 	"aiharn/internal/logging"
+	"aiharn/internal/memory"
 	"aiharn/internal/sessions"
 )
 
@@ -376,6 +377,7 @@ type SessionManager struct {
 	order      []string
 	defaultID  string
 	closedIDs  map[string]bool // ids already closed, so Close is idempotent
+	clearing   map[string]bool // ids currently being replaced by Clear
 	building   int             // in-flight Creates, counted against the cap
 	nextNumber int
 	closed     bool
@@ -395,6 +397,9 @@ func NewSessionManager(ctx context.Context, opts SessionManagerOptions) (*Sessio
 	if opts.ID == nil {
 		opts.ID = newSessionID
 	}
+	if opts.Build.Memory == nil {
+		opts.Build.Memory = memory.NewManager()
+	}
 	m := &SessionManager{
 		cfg:          opts.Config,
 		build:        opts.Build,
@@ -404,6 +409,7 @@ func NewSessionManager(ctx context.Context, opts SessionManagerOptions) (*Sessio
 		sessions:     map[string]*Session{},
 		defaultID:    defaultSessionID,
 		closedIDs:    map[string]bool{},
+		clearing:     map[string]bool{},
 	}
 
 	rt, transcript, err := m.buildSession(ctx, defaultSessionID, defaultSessionName)
@@ -556,6 +562,76 @@ func (m *SessionManager) Rename(id, name string) (sessions.Handle, error) {
 	}
 	s.setName(trimmed)
 	return s, nil
+}
+
+// Clear replaces the addressed session with a fresh conversation session that
+// keeps the same id and name. The old session is closed (which closes and
+// flushes its transcript) but its transcript file is not deleted; the new
+// session is built with a new transcript. The default session may be cleared,
+// unlike Close. The returned handle is the new session.
+//
+// The old session stays registered and usable while the new runtime is being
+// built, so a failed build leaves the current session untouched. A concurrent
+// Clear of the same id is rejected until this one finishes.
+func (m *SessionManager) Clear(ctx context.Context, id string) (sessions.Handle, error) {
+	if id == "" {
+		id = m.defaultID
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, sessions.ErrClosed
+	}
+	old := m.sessions[id]
+	if old == nil {
+		m.mu.Unlock()
+		return nil, sessions.ErrNotFound
+	}
+	if m.clearing[id] {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("app: session %q is already being cleared", id)
+	}
+	m.clearing[id] = true
+	name := old.Name()
+	m.mu.Unlock()
+
+	rt, transcript, err := m.buildSession(ctx, id, name)
+	if err != nil {
+		m.mu.Lock()
+		delete(m.clearing, id)
+		m.mu.Unlock()
+		return nil, err
+	}
+
+	// Close the old session before swapping in the new one so two sessions on
+	// the same id never coexist as live handles.
+	_ = old.Close()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.clearing, id)
+	if m.closed {
+		cerr := rt.Close()
+		if transcript != nil {
+			cerr = errors.Join(cerr, transcript.Close())
+		}
+		return nil, errors.Join(sessions.ErrClosed, cerr)
+	}
+	if m.sessions[id] != old {
+		// Another operation replaced the session while the new one was building.
+		cerr := rt.Close()
+		if transcript != nil {
+			cerr = errors.Join(cerr, transcript.Close())
+		}
+		return nil, errors.Join(fmt.Errorf("app: session %q changed during clear", id), cerr)
+	}
+	replacement := newSession(id, name, rt, transcript)
+	m.sessions[id] = replacement
+	return replacement, nil
 }
 
 // Close closes one non-default session and removes it from the manager. The

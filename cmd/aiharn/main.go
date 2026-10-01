@@ -15,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"aiharn/internal/agent"
 	"aiharn/internal/app"
 	"aiharn/internal/config"
 	"aiharn/internal/logging"
@@ -188,14 +189,34 @@ func run(args []string) int {
 		return 0
 	}
 
-	p := tea.NewProgram(tui.New(rt.Manager, rt.Agent, rt.Gate, tui.Status{
+	m := tui.New(rt.Manager, rt.Agent, rt.Gate, tui.Status{
 		Model:      rt.Summary.Model,
 		AgentType:  rt.Summary.AgentType,
 		Channel:    rt.Summary.Channel,
 		Approval:   rt.Summary.Approval,
 		Shortcuts:  cfg.Shortcuts,
 		AiharnHome: cfg.AiharnHome,
-	}), tea.WithMouseCellMotion())
+	})
+	m.SetClearFunc(func(ctx context.Context) (tui.ClearResult, error) {
+		handle, err := sessionsMgr.Clear(ctx, "")
+		if err != nil {
+			return tui.ClearResult{}, err
+		}
+		top, ok := handle.Agent().(*agent.Agent)
+		if !ok {
+			return tui.ClearResult{}, fmt.Errorf("aiharn: cleared session returned unexpected agent type %T", handle.Agent())
+		}
+		return tui.ClearResult{
+			Manager:   handle.Manager(),
+			Agent:     top,
+			Gate:      handle.Gate(),
+			Model:     handle.Model(),
+			AgentType: top.Type(),
+			Channel:   handle.Channel(),
+			Approval:  handle.Gate().Mode().String(),
+		}, nil
+	})
+	p := tea.NewProgram(m, tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
 		return 1

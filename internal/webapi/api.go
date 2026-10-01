@@ -90,6 +90,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
 	mux.HandleFunc("/api/v1/session/channel", s.handleSessionChannel)
+	mux.HandleFunc("/api/v1/session/clear", s.handleSessionClear)
 	mux.HandleFunc("/api/v1/session/cancel", s.handleSessionCancel)
 	mux.HandleFunc("/api/v1/session/loop", s.handleSessionLoop)
 	mux.HandleFunc("/api/v1/messages", s.handleMessages)
@@ -324,6 +325,7 @@ const toolLimitsCapability = "tool_limits"
 const channelSwitchCapability = "channel_switch"
 const markdownHTMLCapability = "markdown_html"
 const sessionCancelCapability = "session_cancel"
+const sessionClearCapability = "session_clear"
 
 // mainLoopCapability advertises that the server can enable/disable the
 // top-level agent's automatic inbox loop.
@@ -334,7 +336,7 @@ const mainLoopCapability = "main_loop"
 // list in one place stops GET /api/v1/session and the session descriptors from
 // drifting apart.
 func capabilities() []string {
-	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability, sessionCancelCapability, mainLoopCapability}
+	return []string{approvalModeCapability, agentMessagesCapability, agentNamesCapability, toolLimitsCapability, channelSwitchCapability, markdownHTMLCapability, sessionCancelCapability, sessionClearCapability, mainLoopCapability}
 }
 
 // channelDescriptors renders every configured execution channel for the wire.
@@ -830,6 +832,36 @@ func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"channel": handle.Channel()})
+}
+
+// handleSessionClear replaces the addressed session with a fresh conversation
+// session that keeps the same id. The old transcript is closed but not deleted,
+// and the replacement session starts a new transcript.
+func (s *Server) handleSessionClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		return
+	}
+	handle, err := s.cfg.Sessions.Clear(r.Context(), body.SessionID)
+	switch {
+	case errors.Is(err, sessions.ErrNotFound):
+		writeError(w, http.StatusNotFound, "session not found")
+	case errors.Is(err, sessions.ErrClosed):
+		writeError(w, http.StatusConflict, "session store is closed")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The client is gone; there is nothing left to write.
+		return
+	case err != nil:
+		writeError(w, http.StatusBadGateway, "cannot clear session: "+err.Error())
+	default:
+		writeJSON(w, http.StatusOK, s.describe(r.Context(), handle, handle.ID() == s.defaultSessionID()))
+	}
 }
 
 // handleSessionCancel stops every active and queued request in the addressed

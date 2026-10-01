@@ -23,6 +23,7 @@ import (
 	"aiharn/internal/llm"
 	"aiharn/internal/llm/chatcompletions"
 	"aiharn/internal/llm/responses"
+	"aiharn/internal/memory"
 	"aiharn/internal/sessions"
 	"aiharn/internal/skills"
 	"aiharn/internal/tools"
@@ -45,6 +46,13 @@ type Options struct {
 	// runtime is built. It supersedes Observer, which remains the single shared
 	// transcript used when no factory is set.
 	NewTranscript func(sessionID, sessionName string) (sessions.Transcript, error)
+
+	// Memory, when set, is the process-wide memory manager shared by every
+	// session. Build binds a per-session local store to it and wires the
+	// write_memory/list_memories/get_memory tools to that binding. A nil value
+	// creates a fresh manager for that runtime (global memories are then not
+	// shared beyond it).
+	Memory *memory.Manager
 }
 
 // sessionTranscript resolves the history observer for a new session. With
@@ -284,6 +292,11 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 
 	var mgr *agent.Manager
 	observer := opts.Observer
+	memManager := opts.Memory
+	if memManager == nil {
+		memManager = memory.NewManager()
+	}
+	memStore := memManager.NewStore()
 	var controller *channelController
 	// mainChannel reports the main agent's current channel. It is read when a
 	// subagent is actually spawned (not at Build time), so a later channel
@@ -306,7 +319,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 			return configuredSubagentTypes(cfg, mainChannel())
 		},
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
-			return buildAgent(ctx, cfg, tc, mgr, gate, spec,
+			return buildAgent(ctx, cfg, tc, mgr, gate, memStore, spec,
 				agentOverrides{Channel: mainChannel()}, observer, nil)
 		},
 	})
@@ -323,7 +336,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		}
 	}()
 
-	top, err := buildAgent(ctx, cfg, tc, mgr, gate, agent.SpawnSpec{
+	top, err := buildAgent(ctx, cfg, tc, mgr, gate, memStore, agent.SpawnSpec{
 		ID:            agentType,
 		Type:          agentType,
 		Depth:         0,
@@ -365,7 +378,7 @@ type agentOverrides struct {
 // buildAgent resolves an agent type, model, and channel; opens a dedicated
 // session; reads the system prompt; and constructs a fully-wired Agent whose
 // cleanup closes its session.
-func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController) (*agent.Agent, error) {
+func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, mem memory.Backend, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController) (*agent.Agent, error) {
 	agentCfg, ok := cfg.Agents[spec.Type]
 	if !ok {
 		return nil, fmt.Errorf("app: agent type %q is not defined", spec.Type)
@@ -424,7 +437,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	}
 
 	reg, err := buildRegistry(executor, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
-		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, spec.ID, spec.Type)
+		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, mem, spec.ID, spec.Type)
 	if err != nil {
 		if cleanup != nil {
 			cleanup()
@@ -643,11 +656,17 @@ func buildGate(mode string) (*approval.Gate, error) {
 // The session and gate are shared by all built-ins; backend (the Manager) and
 // callerID wire the subagent tools to the runtime. defaultCwd is the directory
 // execute_command falls back to when the model omits one.
-func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, callerID, callerType string) (*tools.Registry, error) {
+func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, mem memory.Backend, callerID, callerType string) (*tools.Registry, error) {
 	reg := tools.New()
+	if mem == nil {
+		mem = memory.NewManager().NewStore()
+	}
 	spawnToolEnabled := sel.Mode == config.ToolModeAll || (sel.Mode == config.ToolModeList && slices.Contains(sel.Names, tools.NameSpawnSubagent))
 	all := map[string]tools.Tool{
 		tools.NameExecuteCommand:      tools.ExecuteCommand(ex, gate, maxOutput, defaultCwd, commandTimeout, callerID, callerType),
+		tools.NameWriteMemory:         tools.WriteMemory(mem),
+		tools.NameListMemories:        tools.ListMemories(mem),
+		tools.NameGetMemory:           tools.GetMemory(mem),
 		tools.NameListSubagentTypes:   tools.ListSubagentTypes(backend, callerID, spawnToolEnabled),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID, callerType),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),

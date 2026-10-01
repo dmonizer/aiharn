@@ -555,6 +555,8 @@
       const channel = channelChip(session, capabilities, channels);
       if (channel) items.push(channel);
       items.push(approvalChip(session, capabilities));
+      const clear = clearChip(session, capabilities);
+      if (clear) items.push(clear);
       const loop = loopChip(session, capabilities);
       if (loop) items.push(loop);
       items.push(chip(session.state || "unknown", "state-" + (session.state || "unknown"), "state"));
@@ -579,6 +581,22 @@
     button.setAttribute("aria-label",
       "Approval mode: " + mode + ". Switch to " + next + ".");
     button.addEventListener("click", () => toggleApprovalMode(button, capabilities));
+    return button;
+  }
+
+  function clearChip(session, capabilities) {
+    const capable = Array.isArray(capabilities) &&
+      capabilities.indexOf("session_clear") !== -1;
+    if (!capable) return null;
+    const unavailable = session.state === "closed" || session.state === "errored";
+    if (unavailable) return chip("clear", "", "session");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "meta-chip clear-session";
+    setChipContent(button, "session", "clear");
+    button.title = "Clear session and start a new conversation";
+    button.setAttribute("aria-label", "Clear current session");
+    button.addEventListener("click", () => clearSession(button));
     return button;
   }
 
@@ -776,6 +794,42 @@
     if (entry) entry.channel = name;
     const snapshot = state.snapshots.get(state.sessionId);
     if (snapshot && snapshot.session) snapshot.session.channel = name;
+  }
+
+  async function clearSession(button) {
+    if (!state.endpoint || !state.connected) {
+      showConnection("Not connected to the API.");
+      return;
+    }
+    const snapshot = state.snapshots.get(state.sessionId);
+    const session = snapshot?.session || {};
+    const name = session.name || state.sessionId || "current";
+    if (!window.confirm("Clear session \"" + name + "\"? This starts a new conversation.")) return;
+    if (button) button.disabled = true;
+
+    const payload = {};
+    if (state.sessionSupport === true && state.sessionId) {
+      payload.session_id = state.sessionId;
+    }
+    try {
+      await apiCall("/session/clear", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      // The replacement keeps the same session id, so clear all locally cached
+      // render state before the polls fetch the fresh transcript.
+      state.fingerprint = "";
+      state.selectedAgents.delete(state.sessionId);
+      state.drafts.delete(draftKey());
+      elements.message.value = "";
+      state.stoppingSessions.delete(state.sessionId);
+      updateComposer();
+      await pollSessions();
+      await poll(true);
+    } catch (error) {
+      showConnection(error.message || "Could not clear the session.");
+      if (button) button.disabled = false;
+    }
   }
 
   function renderSnapshot(snapshot) {

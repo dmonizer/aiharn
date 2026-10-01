@@ -299,6 +299,28 @@ func (s *fakeStore) Create(ctx context.Context, name string) (sessions.Handle, e
 	return created, nil
 }
 
+func (s *fakeStore) Clear(_ context.Context, id string) (sessions.Handle, error) {
+	handle, ok := s.Lookup(id)
+	if !ok {
+		return nil, sessions.ErrNotFound
+	}
+	old := handle.(*fakeHandle)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	replacement := &fakeHandle{
+		id: old.id, name: old.name, createdAt: time.Now(),
+		agent: newFakeAgent(), manager: old.manager, gate: approval.NewGate(approval.ModeAsk),
+		model: old.model, channel: old.channel, channels: s.channels,
+	}
+	for i, h := range s.list {
+		if h.id == old.id {
+			s.list[i] = replacement
+			break
+		}
+	}
+	return replacement, nil
+}
+
 func (s *fakeStore) Rename(id, name string) (sessions.Handle, error) {
 	trimmed, err := sessions.ValidateName(name)
 	if err != nil {
@@ -1626,6 +1648,42 @@ func TestSessionCancelStopsWork(t *testing.T) {
 		map[string]string{"session_id": "closed"})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("closed session status = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSessionClearReplacesSession(t *testing.T) {
+	h := newHarness(t, "")
+
+	w := request(t, h.server, http.MethodGet, "/api/v1/session", "", nil)
+	var rawCaps struct {
+		Capabilities []any `json:"capabilities"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rawCaps); err != nil {
+		t.Fatal(err)
+	}
+	assertCapability(t, rawCaps.Capabilities, "session_clear")
+
+	old := h.store.list[0]
+	w = request(t, h.server, http.MethodPost, "/api/v1/session/clear", "", map[string]any{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	replacement := h.store.list[0]
+	if replacement == old {
+		t.Fatal("clear did not replace the session")
+	}
+	if replacement.id != "default" || replacement.agent == old.agent {
+		t.Fatalf("replacement id=%q, agent reused=%v", replacement.id, replacement.agent == old.agent)
+	}
+
+	unknown := request(t, h.server, http.MethodPost, "/api/v1/session/clear", "",
+		map[string]string{"session_id": "ghost"})
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown session status = %d: %s", unknown.Code, unknown.Body.String())
+	}
+	get := request(t, h.server, http.MethodGet, "/api/v1/session/clear", "", nil)
+	if get.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d: %s", get.Code, get.Body.String())
 	}
 }
 

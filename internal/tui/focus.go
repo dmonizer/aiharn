@@ -124,7 +124,7 @@ func (m *Model) startSubagentBridges() tea.Cmd {
 			continue
 		}
 		m.bridged[sub.ID] = true
-		cmds = append(cmds, waitAgentEventContext(m.ctx, a))
+		cmds = append(cmds, waitAgentEventContext(m.ctx, a, m.sessionGen))
 	}
 	return tea.Batch(cmds...)
 }

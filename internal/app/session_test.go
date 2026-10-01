@@ -397,6 +397,73 @@ func TestSessionManagerClose(t *testing.T) {
 	}
 }
 
+func TestSessionManagerClear(t *testing.T) {
+	b := &fakeBuild{}
+	m := newTestManager(t, SessionManagerOptions{BuildRuntime: b.build, ID: counterIDs()})
+	ctx := context.Background()
+
+	old := m.Default()
+	if err := old.Submit(ctx, "", "hello"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	waitFor(t, "the queued turn to run", func() bool {
+		return historyContains(old.Agent().History(), "hello")
+	})
+
+	replacement, err := m.Clear(ctx, "")
+	if err != nil {
+		t.Fatalf("Clear(default): %v", err)
+	}
+	if replacement.ID() != "default" {
+		t.Fatalf("replacement id = %q, want default", replacement.ID())
+	}
+	if replacement == old {
+		t.Fatal("Clear returned the old session handle")
+	}
+	if got := m.Default(); got != replacement {
+		t.Fatal("Default() did not return the replacement session")
+	}
+	if len(replacement.Agent().History()) != 0 {
+		t.Fatalf("replacement session has %d history items, want 0", len(replacement.Agent().History()))
+	}
+	if got := b.closedCount(); got < 1 {
+		t.Fatalf("old runtime close count = %d, want >= 1", got)
+	}
+	// The old session must be closed and reject new work, while the new one is
+	// open for submissions.
+	if err := old.Submit(ctx, "", "late"); !errors.Is(err, sessions.ErrClosed) {
+		t.Fatalf("Submit on old session err = %v, want ErrClosed", err)
+	}
+	if err := replacement.Submit(ctx, "", "fresh"); err != nil {
+		t.Fatalf("Submit on replacement: %v", err)
+	}
+	waitFor(t, "the replacement turn to run", func() bool {
+		return historyContains(replacement.Agent().History(), "fresh")
+	})
+}
+
+func TestSessionManagerClearKeepsNameAndFailsCleanly(t *testing.T) {
+	b := &fakeBuild{}
+	m := newTestManager(t, SessionManagerOptions{BuildRuntime: b.build, ID: counterIDs()})
+	ctx := context.Background()
+
+	named := mustCreate(t, m, "Keep me")
+	b.mu.Lock()
+	b.failNext = 1
+	b.mu.Unlock()
+	if _, err := m.Clear(ctx, named.ID()); err == nil {
+		t.Fatal("Clear with a failing build returned no error")
+	}
+	// A failed clear leaves the original session in place and usable.
+	got, ok := m.Lookup(named.ID())
+	if !ok || got != named || got.Name() != "Keep me" {
+		t.Fatalf("failed clear did not preserve the session: got=%v ok=%v", got, ok)
+	}
+	if err := got.Submit(ctx, "", "still here"); err != nil {
+		t.Fatalf("Submit after failed clear: %v", err)
+	}
+}
+
 func TestSessionSubmitRunsTurn(t *testing.T) {
 	m := newTestManager(t, SessionManagerOptions{ID: counterIDs()})
 	ctx := context.Background()

@@ -658,7 +658,7 @@ func TestWaitAgentEventDelivers(t *testing.T) {
 
 	// The bridge delivers whatever event the agent emits; the first is the
 	// running state transition, not a text delta.
-	msg := runCmd(waitAgentEventContext(context.Background(), a))
+	msg := runCmd(waitAgentEventContext(context.Background(), a, 0))
 	if _, ok := msg.(agentEventMsg); !ok {
 		t.Fatalf("msg = %+v, want agentEventMsg", msg)
 	}
@@ -684,7 +684,7 @@ func TestRunTurnReportsCompletion(t *testing.T) {
 	}}
 	a := agent.New(agent.Spec{ID: "a1", Type: "main", Model: "m", System: "s", Client: client})
 
-	msg := runCmd(runTurn(a, context.Background(), "hi"))
+	msg := runCmd(runTurn(a, context.Background(), "hi", 0))
 	if done, ok := msg.(turnDoneMsg); !ok || done.err != nil {
 		t.Fatalf("msg = %+v", msg)
 	}

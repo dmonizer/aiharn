@@ -38,6 +38,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case agentEventMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		id := msg.ev.AgentID
 		if id == "" && m.agent != nil {
 			id = m.agent.ID()
@@ -57,33 +60,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a == nil {
 			return m, nil
 		}
-		wait := waitAgentEventContext(m.ctx, a)
+		wait := waitAgentEventContext(m.ctx, a, m.sessionGen)
 		if m.focusedID == id && !wasThinking && m.thinking {
 			return m, tea.Batch(wait, tickThinking())
 		}
 		return m, wait
 
 	case approvalReqMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		if _, cancelled := m.cancelledApprovals[msg.req.ID]; cancelled {
 			delete(m.cancelledApprovals, msg.req.ID)
-			return m, waitApprovalContext(m.ctx, m.gate)
+			return m, waitApprovalContext(m.ctx, m.gate, m.sessionGen)
 		}
 		if m.pending == nil {
 			m.pending = &msg.req
 		} else {
 			m.approvals = append(m.approvals, msg.req)
 		}
-		return m, waitApprovalContext(m.ctx, m.gate)
+		return m, waitApprovalContext(m.ctx, m.gate, m.sessionGen)
 
 	case approvalResolvedMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		m.removeApproval(msg.id)
-		return m, waitApprovalResolvedContext(m.ctx, m.gate)
+		return m, waitApprovalResolvedContext(m.ctx, m.gate, m.sessionGen)
 
 	case rosterMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		m.refreshSubagents()
-		return m, tea.Batch(waitRosterContext(m.ctx, m.manager), m.startSubagentBridges())
+		return m, tea.Batch(waitRosterContext(m.ctx, m.manager, m.sessionGen), m.startSubagentBridges())
 
 	case subagentClosedMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		if msg.err != nil {
 			if errors.Is(msg.err, agent.ErrCallerUnavailable) {
 				m.appendLine(kindPlain, "warning: subagent was not closed because its caller is not open")
@@ -95,6 +110,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case bridgeStoppedMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		return m, nil
 
 	case thinkingTickMsg:
@@ -103,7 +121,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case clearDoneMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.clearing = false
+			m.appendLine(kindError, "clear session: "+msg.err.Error())
+			return m, nil
+		}
+		m.rebind(msg.result)
+		return m, m.Init()
+
 	case turnDoneMsg:
+		if msg.gen != m.sessionGen {
+			return m, nil
+		}
 		rootID := ""
 		if m.agent != nil {
 			rootID = m.agent.ID()
@@ -508,7 +541,7 @@ func (m *Model) nextTurn() tea.Cmd {
 	m.appendLine(kindUser, "> "+input)
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.turnCancel = cancel
-	return runTurn(m.agent, turnCtx, input)
+	return runTurn(m.agent, turnCtx, input, m.sessionGen)
 }
 
 func (m *Model) beginThinking(now time.Time) {

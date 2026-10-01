@@ -103,7 +103,7 @@ func (m *Model) clickRoster(x, y int) (bool, tea.Cmd) {
 		case rosterClose:
 			id := hit.id
 			return true, func() tea.Msg {
-				return subagentClosedMsg{id: id, err: m.manager.CloseSubagent(m.ctx, m.agent.ID(), id)}
+				return subagentClosedMsg{gen: m.sessionGen, id: id, err: m.manager.CloseSubagent(m.ctx, m.agent.ID(), id)}
 			}
 		}
 		return true, nil

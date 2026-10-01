@@ -91,8 +91,9 @@ channel = "sf"
 # working_dir is unset by default; an agent override takes precedence over its channel's.
 # working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}"
 # tools = "none" # default; accepts "ALL", "NONE", "execute_command,spawn_subagent", or a TOML array (including ["ALL"] or ["NONE"])
-# Available: execute_command, set_approval, list_subagent_types, spawn_subagent,
-# send_subagent_message, send_agent_message, check_subagent, list_subagents, close_subagent
+# Available: execute_command, write_memory, list_memories, get_memory, set_approval,
+# list_subagent_types, spawn_subagent, send_subagent_message, send_agent_message,
+# check_subagent, list_subagents, close_subagent
 tools = "all"
 # allow_subagents = false # default
 allow_subagents = true

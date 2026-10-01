@@ -26,6 +26,9 @@ const (
 func Names() []string {
 	return []string{
 		NameExecuteCommand,
+		NameWriteMemory,
+		NameListMemories,
+		NameGetMemory,
 		NameListSubagentTypes,
 		NameSpawnSubagent,
 		NameSendSubagentMessage,

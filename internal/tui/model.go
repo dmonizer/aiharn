@@ -32,6 +32,24 @@ type Status struct {
 	AiharnHome string // local data directory for skills and prompts
 }
 
+// ClearResult is the new runtime handed back to the TUI after a successful
+// /clear. The TUI rebinds its manager, top-level agent, gate, and status to
+// these values and starts bridging the replacement session.
+type ClearResult struct {
+	Manager   *agent.Manager
+	Agent     *agent.Agent
+	Gate      *approval.Gate
+	Model     string
+	AgentType string
+	Channel   string
+	Approval  string
+}
+
+// ClearFunc performs a session clear and returns the replacement runtime. It is
+// supplied by the process bootstrap because the TUI itself does not own the
+// session store.
+type ClearFunc func(ctx context.Context) (ClearResult, error)
+
 // lineKind discriminates a transcript line for color styling.
 type lineKind int
 
@@ -134,6 +152,10 @@ type Model struct {
 	turnCancel context.CancelFunc
 	stopping   bool
 
+	clear      ClearFunc
+	clearing   bool
+	sessionGen uint64 // bumped on clear; guards stale bridge/turn messages
+
 	showReasoning   bool
 	thinking        bool
 	thinkingStarted time.Time
@@ -178,9 +200,14 @@ func New(mgr *agent.Manager, top *agent.Agent, g *approval.Gate, status Status) 
 	return m
 }
 
+// SetClearFunc installs the session-clear callback used by the /clear command.
+func (m *Model) SetClearFunc(f ClearFunc) {
+	m.clear = f
+}
+
 // Init starts the agent-event, approval, and roster bridges.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(waitAgentEventContext(m.ctx, m.agent), waitApprovalContext(m.ctx, m.gate), waitApprovalResolvedContext(m.ctx, m.gate), waitRosterContext(m.ctx, m.manager), m.startSubagentBridges(), m.textarea.Focus())
+	return tea.Batch(waitAgentEventContext(m.ctx, m.agent, m.sessionGen), waitApprovalContext(m.ctx, m.gate, m.sessionGen), waitApprovalResolvedContext(m.ctx, m.gate, m.sessionGen), waitRosterContext(m.ctx, m.manager, m.sessionGen), m.startSubagentBridges(), m.textarea.Focus())
 }
 
 // refreshSubagents re-reads the subagent roster from the manager.

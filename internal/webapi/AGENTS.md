@@ -14,6 +14,7 @@ Registered routes:
 - `POST /api/v1/session/channel`
 - `POST /api/v1/session/loop`
 - `POST /api/v1/session/cancel`
+- `POST /api/v1/session/clear`
 - `GET`/`POST /api/v1/sessions`
 - `GET`/`PATCH`/`DELETE /api/v1/sessions/{id}`
 
