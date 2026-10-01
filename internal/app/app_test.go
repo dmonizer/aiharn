@@ -19,6 +19,15 @@ import (
 	"aiharn/internal/tools"
 )
 
+func newMemoryStore(t *testing.T) *memory.Store {
+	t.Helper()
+	m, err := memory.NewManager("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.NewStore()
+}
+
 func TestSelectChannel(t *testing.T) {
 	cfg := &config.Config{
 		Channels: []config.ChannelConfig{
@@ -75,7 +84,7 @@ func TestBuildRegistrySelection(t *testing.T) {
 	sess := testexec.NewSession(nil)
 	gate := approval.NewGate(approval.ModeAllowAll)
 
-	none, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeNone}, nil, memory.NewManager().NewStore(), "a1", "main")
+	none, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeNone}, nil, newMemoryStore(t), "a1", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +92,7 @@ func TestBuildRegistrySelection(t *testing.T) {
 		t.Fatalf("none: got %v", none.Names())
 	}
 
-	all, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeAll}, nil, memory.NewManager().NewStore(), "a1", "main")
+	all, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeAll}, nil, newMemoryStore(t), "a1", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +106,7 @@ func TestBuildRegistrySelection(t *testing.T) {
 	list, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
 		Mode:  config.ToolModeList,
 		Names: []string{"execute_command"},
-	}, nil, memory.NewManager().NewStore(), "a1", "main")
+	}, nil, newMemoryStore(t), "a1", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,11 +115,11 @@ func TestBuildRegistrySelection(t *testing.T) {
 	}
 	discovery, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
 		Mode: config.ToolModeList, Names: []string{tools.NameListSubagentTypes},
-	}, nil, memory.NewManager().NewStore(), "a1", "main")
+	}, nil, newMemoryStore(t), "a1", "main")
 	if err != nil || !discovery.Has(tools.NameListSubagentTypes) || discovery.Has(tools.NameSpawnSubagent) {
 		t.Fatalf("discovery-only registry: names=%v err=%v", discovery.Names(), err)
 	}
-	if _, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeList, Names: []string{"not_a_tool"}}, nil, memory.NewManager().NewStore(), "a1", "main"); err == nil {
+	if _, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeList, Names: []string{"not_a_tool"}}, nil, newMemoryStore(t), "a1", "main"); err == nil {
 		t.Fatal("expected unknown tool error")
 	}
 }

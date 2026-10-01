@@ -14,6 +14,7 @@ import (
 	"aiharn/internal/authfile"
 	"aiharn/internal/config"
 	"aiharn/internal/execution/ssh/harness"
+	"aiharn/internal/memory"
 	"aiharn/internal/webapi"
 )
 
@@ -99,9 +100,13 @@ mode = "ask"
 		t.Fatalf("Validate: %v", err)
 	}
 
+	memMgr, err := memory.NewManager("", "")
+	if err != nil {
+		t.Fatalf("memory.NewManager: %v", err)
+	}
 	sessions, err := app.NewSessionManager(context.Background(), app.SessionManagerOptions{
 		Config: cfg,
-		Build:  app.Options{Agent: "main"},
+		Build:  app.Options{Agent: "main", Memory: memMgr},
 	})
 	if err != nil {
 		t.Fatalf("NewSessionManager: %v", err)
@@ -217,9 +222,13 @@ mode = "ask"
 		t.Fatalf("Validate: %v", err)
 	}
 
+	memMgr, err := memory.NewManager("", "")
+	if err != nil {
+		t.Fatalf("memory.NewManager: %v", err)
+	}
 	sessions, err := app.NewSessionManager(context.Background(), app.SessionManagerOptions{
 		Config: cfg,
-		Build:  app.Options{Agent: "main"},
+		Build:  app.Options{Agent: "main", Memory: memMgr},
 	})
 	if err != nil {
 		t.Fatalf("NewSessionManager: %v", err)

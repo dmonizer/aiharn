@@ -19,6 +19,7 @@ import (
 	"aiharn/internal/config"
 	"aiharn/internal/execution/ssh/harness"
 	"aiharn/internal/llm"
+	"aiharn/internal/memory"
 )
 
 // sseFrame marshals v into one SSE data frame.
@@ -144,7 +145,11 @@ func TestVerticalSlice(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 
-	rt, err := app.Build(context.Background(), cfg, app.Options{Agent: "main"})
+	memMgr, err := memory.NewManager("", "")
+	if err != nil {
+		t.Fatalf("memory.NewManager: %v", err)
+	}
+	rt, err := app.Build(context.Background(), cfg, app.Options{Agent: "main", Memory: memMgr})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

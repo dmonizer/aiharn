@@ -19,8 +19,8 @@ const (
 	NameGetMemory    = "get_memory"
 )
 
-// WriteMemory returns the tool that stores a memory in the local (per-session)
-// or global (shared) scope. The store allocates a unique index for every write.
+// WriteMemory returns the tool that stores a memory in the local or global
+// scope. The store allocates a unique index for every write.
 func WriteMemory(backend memory.Backend) Tool {
 	return &writeMemory{backend: backend}
 }
@@ -32,15 +32,15 @@ type writeMemory struct {
 func (t *writeMemory) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Name:        NameWriteMemory,
-		Description: "Store a memory the model can retrieve later. local memories are private to the current conversation session; global memories are shared across sessions. The system assigns a unique index.",
+		Description: "Store a memory the model can retrieve later. local memories are private to the current working directory's sessions; global memories are shared across sessions. The scope defaults to local. The system assigns a unique index.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"scope": {"type": "string", "enum": ["local", "global"], "description": "Where to store the memory."},
+				"scope": {"type": "string", "enum": ["local", "global"], "description": "Where to store the memory. Defaults to local."},
 				"summary": {"type": "string", "description": "A short label for the memory, shown by list_memories."},
 				"content": {"type": "string", "description": "The full memory content to store."}
 			},
-			"required": ["scope", "summary", "content"],
+			"required": ["summary", "content"],
 			"additionalProperties": false
 		}`),
 	}
@@ -55,9 +55,13 @@ func (t *writeMemory) Run(ctx context.Context, args json.RawMessage) (string, er
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
-	scope, err := memory.ParseScope(p.Scope)
-	if err != nil {
-		return "", err
+	scope := memory.ScopeLocal
+	if p.Scope != "" {
+		parsed, err := memory.ParseScope(p.Scope)
+		if err != nil {
+			return "", err
+		}
+		scope = parsed
 	}
 	logging.Debug("tool: write_memory",
 		slog.String("component", "tool"),
@@ -134,7 +138,7 @@ func (t *listMemories) Run(ctx context.Context, args json.RawMessage) (string, e
 	return strings.Join(lines, "\n"), nil
 }
 
-// GetMemory returns the tool that reads one stored memory by index.
+// GetMemory returns the tool that reads one stored memory by index and scope.
 func GetMemory(backend memory.Backend) Tool {
 	return &getMemory{backend: backend}
 }
@@ -146,10 +150,11 @@ type getMemory struct {
 func (t *getMemory) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Name:        NameGetMemory,
-		Description: "Return the full content of the memory at the given index. The index is shown by list_memories and is unique across both local and global memories.",
+		Description: "Return the full content of the memory at the given index. The scope defaults to local. The index is shown by list_memories.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
+				"scope": {"type": "string", "enum": ["local", "global"], "description": "Which memory scope to read. Defaults to local."},
 				"index": {"type": "integer", "description": "The memory index returned by list_memories."}
 			},
 			"required": ["index"],
@@ -160,17 +165,27 @@ func (t *getMemory) Definition() llm.ToolDefinition {
 
 func (t *getMemory) Run(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
-		Index int `json:"index"`
+		Scope string `json:"scope"`
+		Index int    `json:"index"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
 	}
+	scope := memory.ScopeLocal
+	if p.Scope != "" {
+		parsed, err := memory.ParseScope(p.Scope)
+		if err != nil {
+			return "", err
+		}
+		scope = parsed
+	}
 	logging.Debug("tool: get_memory",
 		slog.String("component", "tool"),
 		slog.String("tool", NameGetMemory),
+		slog.String("scope", string(scope)),
 		slog.Int("index", p.Index),
 	)
-	entry, err := t.backend.GetMemory(p.Index)
+	entry, err := t.backend.GetMemory(scope, p.Index)
 	if err != nil {
 		logging.Debug("tool: get_memory result", slog.String("component", "tool"), slog.String("tool", NameGetMemory), slog.Any("err", err))
 		return "", err

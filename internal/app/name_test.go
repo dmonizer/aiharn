@@ -11,6 +11,7 @@ import (
 	"aiharn/internal/app"
 	"aiharn/internal/config"
 	"aiharn/internal/execution/ssh/harness"
+	"aiharn/internal/memory"
 )
 
 // TestBuildAgentPropagatesSpawnSpecName proves that the runtime wiring copies a
@@ -98,7 +99,11 @@ mode = "ask"
 		t.Fatalf("Validate: %v", err)
 	}
 
-	rt, err := app.Build(context.Background(), cfg, app.Options{Agent: "main"})
+	memMgr, err := memory.NewManager("", "")
+	if err != nil {
+		t.Fatalf("memory.NewManager: %v", err)
+	}
+	rt, err := app.Build(context.Background(), cfg, app.Options{Agent: "main", Memory: memMgr})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

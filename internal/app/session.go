@@ -15,7 +15,6 @@ import (
 	"aiharn/internal/config"
 	"aiharn/internal/llm"
 	"aiharn/internal/logging"
-	"aiharn/internal/memory"
 	"aiharn/internal/sessions"
 )
 
@@ -398,7 +397,11 @@ func NewSessionManager(ctx context.Context, opts SessionManagerOptions) (*Sessio
 		opts.ID = newSessionID
 	}
 	if opts.Build.Memory == nil {
-		opts.Build.Memory = memory.NewManager()
+		mm, err := newMemoryManager(opts.Config.AiharnHome)
+		if err != nil {
+			return nil, err
+		}
+		opts.Build.Memory = mm
 	}
 	m := &SessionManager{
 		cfg:          opts.Config,

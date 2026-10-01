@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -48,10 +49,11 @@ type Options struct {
 	NewTranscript func(sessionID, sessionName string) (sessions.Transcript, error)
 
 	// Memory, when set, is the process-wide memory manager shared by every
-	// session. Build binds a per-session local store to it and wires the
-	// write_memory/list_memories/get_memory tools to that binding. A nil value
-	// creates a fresh manager for that runtime (global memories are then not
-	// shared beyond it).
+	// session launched from one working directory. Build binds a store to it and
+	// wires the write_memory/list_memories/get_memory tools to that binding, so
+	// both local and global memories are shared across sessions. A nil value
+	// creates a manager backed by the configured aiharn home (local memories
+	// persist under the launch directory, global memories under the home).
 	Memory *memory.Manager
 }
 
@@ -89,7 +91,7 @@ type Runtime struct {
 	Agent      *agent.Agent // the top-level agent
 	Gate       *approval.Gate
 	Summary    Summary
-	memory     *memory.Store // local memory binding; closed with the runtime
+	memory     *memory.Store // shared store binding; closed with the runtime
 	channel    *channelController
 	transports *transportCache
 }
@@ -241,6 +243,24 @@ func (c *channelController) Close() error {
 	return err
 }
 
+// newMemoryManager builds the process-wide memory manager for the given aiharn
+// home. An empty home returns a fully in-memory manager (used by tests); a
+// non-empty home persists global memories under <home>/memories and local
+// memories under <cwd>/.aiharn/memories.
+func newMemoryManager(aiharnHome string) (*memory.Manager, error) {
+	if aiharnHome == "" {
+		return memory.NewManager("", "")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("app: resolve working directory for local memories: %w", err)
+	}
+	return memory.NewManager(
+		filepath.Join(aiharnHome, "memories"),
+		filepath.Join(cwd, ".aiharn", "memories"),
+	)
+}
+
 // Build resolves the selected agent, model, and channel; builds the Manager
 // (with a builder that can materialize subagents), the top-level agent, the
 // approval gate, and the tool registry; and returns a Runtime ready to run. It
@@ -298,7 +318,10 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 	observer := opts.Observer
 	memManager := opts.Memory
 	if memManager == nil {
-		memManager = memory.NewManager()
+		memManager, err = newMemoryManager(cfg.AiharnHome)
+		if err != nil {
+			return nil, err
+		}
 	}
 	memStore := memManager.NewStore()
 	defer func() {
@@ -669,7 +692,11 @@ func buildGate(mode string) (*approval.Gate, error) {
 func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, mem memory.Backend, callerID, callerType string) (*tools.Registry, error) {
 	reg := tools.New()
 	if mem == nil {
-		mem = memory.NewManager().NewStore()
+		mgr, err := memory.NewManager("", "")
+		if err != nil {
+			return nil, err
+		}
+		mem = mgr.NewStore()
 	}
 	spawnToolEnabled := sel.Mode == config.ToolModeAll || (sel.Mode == config.ToolModeList && slices.Contains(sel.Names, tools.NameSpawnSubagent))
 	all := map[string]tools.Tool{
