@@ -818,9 +818,10 @@
       });
       // The replacement keeps the same session id, so clear all locally cached
       // render state before the polls fetch the fresh transcript.
+      const oldDraftKey = draftKey();
       state.fingerprint = "";
       state.selectedAgents.delete(state.sessionId);
-      state.drafts.delete(draftKey());
+      state.drafts.delete(oldDraftKey);
       elements.message.value = "";
       state.stoppingSessions.delete(state.sessionId);
       updateComposer();

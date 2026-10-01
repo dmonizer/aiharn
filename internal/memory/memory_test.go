@@ -76,6 +76,35 @@ func TestStoreScopesAndUniqueIndexes(t *testing.T) {
 	}
 }
 
+func TestStoreCloseRemovesLocalMemories(t *testing.T) {
+	m := NewManager()
+	s := m.NewStore()
+
+	if _, err := s.WriteMemory(ScopeLocal, "local", "content"); err != nil {
+		t.Fatal(err)
+	}
+	global, err := s.WriteMemory(ScopeGlobal, "global", "content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	list, err := s.ListMemories(ScopeLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("local memories survived Close: %+v", list)
+	}
+	globals, err := m.NewStore().ListMemories(ScopeGlobal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(globals) != 1 || globals[0].Index != global.Index {
+		t.Fatalf("global memories did not survive a local Close: %+v", globals)
+	}
+}
+
 func TestWriteMemoryValidation(t *testing.T) {
 	m := NewManager()
 	s := m.NewStore()

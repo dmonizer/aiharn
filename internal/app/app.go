@@ -89,6 +89,7 @@ type Runtime struct {
 	Agent      *agent.Agent // the top-level agent
 	Gate       *approval.Gate
 	Summary    Summary
+	memory     *memory.Store // local memory binding; closed with the runtime
 	channel    *channelController
 	transports *transportCache
 }
@@ -131,6 +132,9 @@ func (r *Runtime) Close() error {
 	}
 	if r.Gate != nil {
 		r.Gate.Close()
+	}
+	if r.memory != nil {
+		r.memory.Close()
 	}
 	return errors.Join(errs...)
 }
@@ -297,6 +301,11 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		memManager = memory.NewManager()
 	}
 	memStore := memManager.NewStore()
+	defer func() {
+		if err != nil {
+			memStore.Close()
+		}
+	}()
 	var controller *channelController
 	// mainChannel reports the main agent's current channel. It is read when a
 	// subagent is actually spawned (not at Build time), so a later channel
@@ -356,6 +365,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		Manager: mgr,
 		Agent:   top,
 		Gate:    gate,
+		memory:  memStore,
 		Summary: Summary{
 			AgentType: agentType,
 			Model:     modelName,

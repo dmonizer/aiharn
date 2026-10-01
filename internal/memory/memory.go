@@ -86,6 +86,18 @@ type Store struct {
 
 var _ Backend = (*Store)(nil)
 
+// Close removes this binding's local memories. Global memories are owned by the
+// Manager and are left intact.
+func (s *Store) Close() {
+	if s == nil || s.manager == nil {
+		return
+	}
+	m := s.manager
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.locals, s.id)
+}
+
 // WriteMemory validates its arguments, allocates the next index, and stores the
 // memory in the requested scope.
 func (s *Store) WriteMemory(scope Scope, summary, content string) (Entry, error) {
