@@ -609,7 +609,9 @@ func (m *SessionManager) Clear(ctx context.Context, id string) (sessions.Handle,
 
 	// Close the old session before swapping in the new one so two sessions on
 	// the same id never coexist as live handles.
-	_ = old.Close()
+	if err := old.Close(); err != nil {
+		logging.Debug("app: clear close old session", slog.String("session_id", id), slog.Any("err", err))
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

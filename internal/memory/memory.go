@@ -82,6 +82,7 @@ func (m *Manager) NewStore() *Store {
 type Store struct {
 	manager *Manager
 	id      int
+	closed  bool
 }
 
 var _ Backend = (*Store)(nil)
@@ -95,12 +96,18 @@ func (s *Store) Close() {
 	m := s.manager
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	s.closed = true
 	delete(m.locals, s.id)
 }
 
 // WriteMemory validates its arguments, allocates the next index, and stores the
 // memory in the requested scope.
 func (s *Store) WriteMemory(scope Scope, summary, content string) (Entry, error) {
+	switch scope {
+	case ScopeLocal, ScopeGlobal:
+	default:
+		return Entry{}, fmt.Errorf("memory: invalid scope %q (want %q or %q)", scope, ScopeLocal, ScopeGlobal)
+	}
 	summary = strings.TrimSpace(summary)
 	if summary == "" {
 		return Entry{}, errors.New("memory: summary must not be empty")
@@ -111,6 +118,9 @@ func (s *Store) WriteMemory(scope Scope, summary, content string) (Entry, error)
 	m := s.manager
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s.closed {
+		return Entry{}, errors.New("memory: store is closed")
+	}
 
 	m.next++
 	entry := Entry{
@@ -120,13 +130,10 @@ func (s *Store) WriteMemory(scope Scope, summary, content string) (Entry, error)
 		Content:   content,
 		CreatedAt: time.Now().UTC(),
 	}
-	switch scope {
-	case ScopeLocal:
+	if scope == ScopeLocal {
 		m.locals[s.id][entry.Index] = entry
-	case ScopeGlobal:
+	} else {
 		m.global[entry.Index] = entry
-	default:
-		return Entry{}, fmt.Errorf("memory: invalid scope %q (want %q or %q)", scope, ScopeLocal, ScopeGlobal)
 	}
 	return entry, nil
 }
