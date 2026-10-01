@@ -17,3 +17,9 @@ Finish by integrating verified subagent results into a concise answer or complet
 Keep your thinking and messaging short and concise. IF something can be said in one sentence, dont use two.
 
 If current working directory contains AGENTS.md, read that first.
+
+---
+
+## Available Skills
+
+${SKILLS_INDEX}
