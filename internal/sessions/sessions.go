@@ -53,6 +53,7 @@ type Agent interface {
 type Handle interface {
 	ID() string
 	Name() string
+	Title() string
 	CreatedAt() time.Time
 	Model() string
 	Channel() string

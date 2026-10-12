@@ -215,6 +215,7 @@ type agentSummary struct {
 type session struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
+	Title        string    `json:"title,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	AgentID      string    `json:"agent_id"`
 	AgentType    string    `json:"agent_type"`
@@ -236,6 +237,7 @@ type sessionListResponse struct {
 type sessionDescriptor struct {
 	ID             string         `json:"id"`
 	Name           string         `json:"name"`
+	Title          string         `json:"title,omitempty"`
 	CreatedAt      time.Time      `json:"created_at"`
 	Default        bool           `json:"default"`
 	Model          string         `json:"model,omitempty"`
@@ -398,6 +400,7 @@ func (s *Server) describe(ctx context.Context, handle sessions.Handle, isDefault
 	agents, agentsErr := s.agentSummaries(ctx, handle)
 	return sessionDescriptor{
 		ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
+		Title:   handle.Title(),
 		Default: isDefault, Model: handle.Model(), Channel: handle.Channel(),
 		State:          handle.Agent().State().String(),
 		Agents:         agents,
@@ -451,6 +454,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		Channels:   s.channelDescriptors(),
 		Session: session{
 			ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
+			Title:   handle.Title(),
 			AgentID: selected.ID(), AgentType: selected.Type(),
 			Model: model, Channel: channel,
 			State:        selected.State().String(),

@@ -117,6 +117,7 @@ func (a *fakeAgent) setState(state agent.State) {
 type fakeHandle struct {
 	id        string
 	name      string
+	title     string
 	createdAt time.Time
 	agent     sessions.Agent
 	manager   *agent.Manager
@@ -165,6 +166,12 @@ func (h *fakeHandle) setName(name string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.name = name
+}
+
+func (h *fakeHandle) Title() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.title
 }
 
 func (h *fakeHandle) Queued() int {

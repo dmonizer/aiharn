@@ -45,6 +45,7 @@ type queuedPrompt struct {
 type Session struct {
 	id         string
 	name       string
+	title      string
 	createdAt  time.Time
 	rt         *Runtime
 	queue      chan queuedPrompt
@@ -85,6 +86,9 @@ func newSession(id, name string, rt *Runtime, transcript sessions.Transcript) *S
 		ctx:        ctx,
 		cancel:     cancel,
 	}
+	if rt.title != nil {
+		rt.title.bind(s.setTitle)
+	}
 	s.wg.Add(1)
 	go s.runQueue()
 	if s.rt.Manager != nil {
@@ -105,6 +109,25 @@ func (s *Session) Name() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.name
+}
+
+// Title returns the agent-authored title, if any. It is display metadata only.
+func (s *Session) Title() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.title
+}
+
+// setTitle records the agent-authored title. It is bound to the runtime's
+// titleBackend so the set_session_title tool can reach this session.
+func (s *Session) setTitle(title string) error {
+	if s.isClosed() {
+		return sessions.ErrClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.title = title
+	return nil
 }
 
 // CreatedAt returns when the session was created.
