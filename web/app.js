@@ -53,7 +53,12 @@
     sessionTitle: document.querySelector("#session-dialog-title"),
     sessionName: document.querySelector("#session-name"),
     sessionSubmit: document.querySelector("#session-submit"),
-    sessionError: document.querySelector("#session-error")
+    sessionError: document.querySelector("#session-error"),
+    resumeDialog: document.querySelector("#resume-dialog"),
+    resumeList: document.querySelector("#resume-list"),
+    resumePreview: document.querySelector("#resume-preview"),
+    resumeError: document.querySelector("#resume-error"),
+    resumeLoad: document.querySelector("#resume-load")
   };
 
   const state = {
@@ -78,7 +83,8 @@
     fingerprint: "",
     connected: false,
     sessionMode: "create",
-    renameTarget: ""
+    renameTarget: "",
+    resumeSelected: ""
   };
 
   let openChannelMenu = null;
@@ -342,6 +348,12 @@
       detail.textContent = count > 0
         ? count + (count === 1 ? " subagent" : " subagents")
         : (session.model || session.id);
+      if (typeof session.title === "string" && session.title) {
+        const title = document.createElement("span");
+        title.className = "session-agent-title";
+        title.textContent = session.title;
+        copy.append(title);
+      }
       copy.append(name, detail);
 
       const actions = document.createElement("span");
@@ -1647,6 +1659,110 @@
     }, 0);
   }
 
+  function openResumeDialog() {
+    if (state.sessionSupport === false) {
+      showConnection(LEGACY_SERVER_NOTICE);
+      return;
+    }
+    state.resumeSelected = "";
+    elements.resumePreview.replaceChildren(emptyResumePreview("Select a session to preview its opening messages."));
+    showDialogError(elements.resumeError, "");
+    elements.resumeLoad.disabled = true;
+    renderResumeList();
+    elements.resumeDialog.showModal();
+  }
+
+  function renderResumeList() {
+    elements.resumeList.replaceChildren();
+    const previous = state.sessions.filter((session) => session.id !== state.sessionId);
+    if (!previous.length) {
+      elements.resumeList.append(emptyResumePreview("No previous sessions."));
+      return;
+    }
+    for (const session of previous) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "resume-item" + (session.id === state.resumeSelected ? " active" : "");
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", session.id === state.resumeSelected ? "true" : "false");
+      item.addEventListener("click", () => previewResume(session));
+      const copy = document.createElement("span");
+      copy.className = "resume-item-copy";
+      const name = document.createElement("strong");
+      name.textContent = session.name || session.id;
+      const meta = document.createElement("span");
+      const parts = [];
+      if (session.title) parts.push(session.title);
+      if (session.model) parts.push(session.model);
+      meta.textContent = parts.join(" · ") || session.id;
+      copy.append(name, meta);
+      item.append(copy);
+      elements.resumeList.append(item);
+    }
+  }
+
+  async function previewResume(session) {
+    state.resumeSelected = session.id;
+    renderResumeList();
+    elements.resumeLoad.disabled = true;
+    elements.resumePreview.replaceChildren(emptyResumePreview("Loading preview…"));
+    showDialogError(elements.resumeError, "");
+    try {
+      const snapshot = await apiCall("/session?session_id=" + encodeURIComponent(session.id));
+      const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+      const preview = messages
+        .filter((message) => message && message.type === "message" &&
+          (message.role === "user" || message.role === "assistant") &&
+          message.origin !== "agent" &&
+          !message.delivery)
+        .slice(0, 5);
+      renderResumePreview(preview);
+      elements.resumeLoad.disabled = false;
+    } catch (error) {
+      elements.resumePreview.replaceChildren();
+      showDialogError(elements.resumeError, error.message || "Could not load the session preview.");
+      elements.resumeLoad.disabled = true;
+    }
+  }
+
+  function emptyResumePreview(text) {
+    const div = document.createElement("div");
+    div.className = "resume-preview-empty";
+    div.textContent = text;
+    return div;
+  }
+
+  function renderResumePreview(messages) {
+    elements.resumePreview.replaceChildren();
+    if (!messages.length) {
+      elements.resumePreview.append(emptyResumePreview("No messages in this session yet."));
+      return;
+    }
+    for (const message of messages) {
+      const bubble = document.createElement("div");
+      bubble.className = "resume-bubble " + (message.role || "");
+      const role = document.createElement("span");
+      role.className = "role";
+      role.textContent = message.role === "user" ? "You" : "Aiharn";
+      const content = document.createElement("div");
+      content.textContent = truncatePreview(message.content || "");
+      bubble.append(role, content);
+      elements.resumePreview.append(bubble);
+    }
+  }
+
+  function truncatePreview(text) {
+    const max = 240;
+    return text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
+  }
+
+  function loadResume() {
+    const id = state.resumeSelected;
+    if (!id) return;
+    elements.resumeDialog.close();
+    selectSession(id);
+  }
+
   function resetSendButton() {
     elements.send.textContent = "↑";
     elements.send.classList.remove("stop");
@@ -1746,6 +1862,11 @@
     button.addEventListener("click", () => elements.sessionDialog.close());
   });
   document.querySelector("#new-session").addEventListener("click", () => openSessionDialog("create"));
+  document.querySelector("#resume-session").addEventListener("click", openResumeDialog);
+  document.querySelectorAll(".close-resume").forEach((button) => {
+    button.addEventListener("click", () => elements.resumeDialog.close());
+  });
+  elements.resumeLoad.addEventListener("click", loadResume);
   document.querySelector("#mobile-menu").addEventListener("click", () => {
     setMenuOpen(!document.body.classList.contains("menu-open"));
   });

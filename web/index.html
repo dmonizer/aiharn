@@ -17,7 +17,7 @@
         <div class="mark" aria-hidden="true">A</div>
         <div><strong>aiharn</strong><span>remote console</span></div>
       </div>
-      <div class="side-heading"><span>Sessions</span><button id="new-session" class="icon-button" title="New session" aria-label="New session">+</button></div>
+      <div class="side-heading"><span>Sessions</span><span class="side-heading-actions"><button id="resume-session" class="icon-button" title="Resume session" aria-label="Resume session">↻</button><button id="new-session" class="icon-button" title="New session" aria-label="New session">+</button></span></div>
       <nav id="session-list" class="session-list" aria-label="Sessions"></nav>
       <div class="agent-panel">
         <div class="side-heading"><span>Agents</span></div>
@@ -84,6 +84,19 @@
       <p id="session-error" class="field-error hidden" role="alert"></p>
       <div class="dialog-actions"><button type="button" class="quiet-button close-session">Cancel</button><button type="submit" id="session-submit" class="primary-button">Create</button></div>
     </form>
+  </dialog>
+
+  <dialog id="resume-dialog">
+    <div class="dialog-card resume-card">
+      <div class="dialog-head"><div><span class="eyebrow">Resume</span><h2>Previous sessions</h2></div><button type="button" class="icon-button close-resume" aria-label="Close">×</button></div>
+      <div id="resume-list" class="resume-list" role="listbox" aria-label="Previous sessions"></div>
+      <div id="resume-preview" class="resume-preview" aria-live="polite"></div>
+      <p id="resume-error" class="field-error hidden" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="quiet-button close-resume">Cancel</button>
+        <button type="button" id="resume-load" class="primary-button" disabled>Load and continue</button>
+      </div>
+    </div>
   </dialog>
 
   <script src="config.js"></script>
