@@ -321,3 +321,81 @@ func TestPersistenceExactLayout(t *testing.T) {
 		t.Fatalf("local index.md should not exist yet: %v", err)
 	}
 }
+
+func TestWriteMemoryPersistFailureRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	m := newTestManager(t, dir, "")
+	s := m.NewStore()
+
+	// After manager creation, replace index.md with a directory so the atomic
+	// rename in writeIndex fails after memory.md has already been written.
+	indexPath := filepath.Join(dir, "index.md")
+	if err := os.Mkdir(indexPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.WriteMemory(ScopeGlobal, "boom", "content"); err == nil {
+		t.Fatal("expected persist error")
+	}
+
+	// The entry must be rolled back from the in-memory map.
+	if list, err := s.ListMemories(ScopeGlobal); err != nil || len(list) != 0 {
+		t.Fatalf("entry not rolled back after persist failure: %+v, %v", list, err)
+	}
+
+	// The partially-written subdirectory must have been cleaned up.
+	subdir := filepath.Join(dir, sanitizeDir("boom"))
+	if _, err := os.Stat(subdir); !os.IsNotExist(err) {
+		t.Fatalf("orphaned subdir %s still exists: %v", subdir, err)
+	}
+}
+
+func TestParseIndexLineRejectsDotDirs(t *testing.T) {
+	if _, _, _, ok := parseIndexLine("- [1](./memory.md) summary"); ok {
+		t.Fatal("expected . dir to be rejected")
+	}
+	if _, _, _, ok := parseIndexLine("- [1](../memory.md) summary"); ok {
+		t.Fatal("expected .. dir to be rejected")
+	}
+	if idx, d, s, ok := parseIndexLine("- [7](foo/memory.md) bar"); !ok || idx != 7 || d != "foo" || s != "bar" {
+		t.Fatalf("parseIndexLine(normal) = %d,%q,%q,%v", idx, d, s, ok)
+	}
+}
+
+func TestWriteFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.md")
+	if err := writeFileAtomic(path, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, path); got != "hello" {
+		t.Fatalf("content = %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "out.md" {
+		t.Fatalf("unexpected files after atomic write: %v", entries)
+	}
+}
+
+func TestSummarySpecialCharsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s1 := newTestManager(t, dir, "").NewStore()
+	e, err := s1.WriteMemory(ScopeGlobal, "paren) bracket] tab\there", "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := newTestManager(t, dir, "").NewStore()
+	got, err := s2.GetMemory(ScopeGlobal, e.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Summary != e.Summary {
+		t.Fatalf("summary after reload = %q, want %q", got.Summary, e.Summary)
+	}
+	if got.Content != "body" {
+		t.Fatalf("content after reload = %q", got.Content)
+	}
+}
