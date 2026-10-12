@@ -716,10 +716,103 @@ func (m *SessionManager) Shutdown() error {
 	return errors.Join(errs...)
 }
 
-// buildSession builds one session's runtime and transcript. It must be called
-// without m.mu held, because building opens a transport session.
-func (m *SessionManager) buildSession(ctx context.Context, id, name string) (*Runtime, sessions.Transcript, error) {
+// Import creates a new session seeded with the given top-level history and
+// metadata, so a finished session can be continued. The metadata is sanitized
+// against the current configuration so stale model/channel/approval/agent-type
+// names fall back to defaults instead of failing the build.
+func (m *SessionManager) Import(ctx context.Context, name string, history []llm.Item, meta sessions.TranscriptMeta) (sessions.Handle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	auto := name == ""
+	if !auto {
+		trimmed, err := sessions.ValidateName(name)
+		if err != nil {
+			return nil, err
+		}
+		name = trimmed
+	}
+
 	opts := m.build
+	// Start from defaults and apply only overrides that still exist.
+	opts.Agent = ""
+	if _, ok := m.cfg.Agents[meta.AgentType]; ok {
+		opts.Agent = meta.AgentType
+	}
+	opts.Model = ""
+	if _, ok := m.cfg.Models[meta.Model]; ok {
+		opts.Model = meta.Model
+	}
+	opts.Channel = ""
+	for _, c := range m.cfg.Channels {
+		if c.Name == meta.Channel {
+			opts.Channel = meta.Channel
+			break
+		}
+	}
+	opts.Approval = ""
+	switch meta.Approval {
+	case config.ApprovalModeAsk, config.ApprovalModeAllowAll:
+		opts.Approval = meta.Approval
+	}
+	opts.SeedHistory = history
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, sessions.ErrClosed
+	}
+	if len(m.sessions)+m.building >= m.max {
+		m.mu.Unlock()
+		return nil, sessions.ErrLimitReached
+	}
+	id := m.newID()
+	if id == m.defaultID || m.sessions[id] != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("app: session id %q is already in use", id)
+	}
+	if auto {
+		// The number is assigned under the lock and is not rolled back on a
+		// failed build, so concurrent imports can never reuse one.
+		m.nextNumber++
+		name = fmt.Sprintf("Session %d", m.nextNumber)
+	}
+	m.building++
+	m.mu.Unlock()
+
+	rt, transcript, err := m.buildSessionOpts(ctx, id, name, opts)
+
+	m.mu.Lock()
+	m.building--
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	if m.closed {
+		m.mu.Unlock()
+		cerr := rt.Close()
+		if transcript != nil {
+			cerr = errors.Join(cerr, transcript.Close())
+		}
+		return nil, errors.Join(sessions.ErrClosed, cerr)
+	}
+	s := newSession(id, name, rt, transcript)
+	m.sessions[id] = s
+	m.order = append(m.order, id)
+	m.mu.Unlock()
+	return s, nil
+}
+
+// buildSession builds one session's runtime and transcript using the manager's
+// default build options. It must be called without m.mu held.
+func (m *SessionManager) buildSession(ctx context.Context, id, name string) (*Runtime, sessions.Transcript, error) {
+	return m.buildSessionOpts(ctx, id, name, m.build)
+}
+
+// buildSessionOpts builds one session's runtime and transcript from the given
+// options. It must be called without m.mu held, because building opens a
+// transport session.
+func (m *SessionManager) buildSessionOpts(ctx context.Context, id, name string, opts Options) (*Runtime, sessions.Transcript, error) {
 	observer, transcript, err := sessionTranscript(opts, id, name)
 	if err != nil {
 		return nil, nil, err

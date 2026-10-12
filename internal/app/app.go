@@ -39,6 +39,11 @@ type Options struct {
 	Model      string // override model config name
 	Approval   string // override approval mode
 
+	// SeedHistory, when set, initializes the top-level agent's history so a
+	// finished conversation can be continued. It is applied only to the
+	// top-level agent, never to subagents.
+	SeedHistory []llm.Item
+
 	// Observer, when set, receives every history item appended by any agent (the
 	// top-level agent and all subagents), enabling a full conversation log.
 	Observer agent.HistoryObserver
@@ -402,7 +407,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		CallerID:      "",
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
-	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel}, observer, controller, title)
+	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel, SeedHistory: opts.SeedHistory}, observer, controller, title)
 	if err != nil {
 		return nil, err
 	}
@@ -434,6 +439,9 @@ type agentOverrides struct {
 	PromptFile string
 	Model      string
 	Channel    string
+	// SeedHistory seeds the top-level agent's history for an imported
+	// (continued) session.
+	SeedHistory []llm.Item
 }
 
 // buildAgent resolves an agent type, model, and channel; opens a dedicated
@@ -528,6 +536,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		TranscriptItems:  cfg.Limits.TranscriptMaxItems,
 		TranscriptBytes:  cfg.Limits.TranscriptMaxBytes,
 		Observer:         observer,
+		SeedHistory:      o.SeedHistory,
 		Cleanup:          cleanup,
 	})
 	return a, nil

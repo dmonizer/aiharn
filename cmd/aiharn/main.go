@@ -169,6 +169,7 @@ func run(args []string) int {
 			Listen: apiCfg.Listen, AuthFile: apiCfg.AuthFile,
 			AllowedOrigins: apiCfg.AllowOrigins,
 			Sessions:       sessionsMgr,
+			AiharnHome:     cfg.AiharnHome,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)

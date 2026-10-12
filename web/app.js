@@ -75,6 +75,7 @@
     endpoint: loadEndpoint(),
     sessionId: localStorage.getItem(SESSION_KEY) || "",
     sessions: [],
+    archived: [],
     defaultSessionId: "",
     snapshots: new Map(),
     selectedAgents: new Map(),
@@ -95,6 +96,7 @@
     sessionMode: "create",
     renameTarget: "",
     resumeSelected: "",
+    resumeSelectedArchived: false,
     credentials: null
   };
 
@@ -444,6 +446,7 @@
 
   function clearSessionState() {
     state.sessions = [];
+    state.archived = [];
     state.defaultSessionId = "";
     state.snapshots = new Map();
     state.selectedAgents = new Map();
@@ -1881,42 +1884,62 @@
     }, 0);
   }
 
-  function openResumeDialog() {
+  async function openResumeDialog() {
     if (state.sessionSupport === false) {
       showConnection(LEGACY_SERVER_NOTICE);
       return;
     }
     state.resumeSelected = "";
+    state.resumeSelectedArchived = false;
     elements.resumePreview.replaceChildren(emptyResumePreview("Select a session to preview its opening messages."));
     showDialogError(elements.resumeError, "");
     elements.resumeLoad.disabled = true;
     renderResumeList();
     elements.resumeDialog.showModal();
+    try {
+      const payload = await apiCall("/sessions/archived");
+      state.archived = Array.isArray(payload.sessions) ? payload.sessions : [];
+    } catch (error) {
+      state.archived = [];
+      const hasLive = state.sessions.some((session) => session.id !== state.sessionId);
+      if (!hasLive && !(error && error.status === 404)) {
+        showDialogError(elements.resumeError, error.message || "Could not load previous sessions.");
+      }
+    }
+    renderResumeList();
   }
 
   function renderResumeList() {
     elements.resumeList.replaceChildren();
-    const previous = state.sessions.filter((session) => session.id !== state.sessionId);
+    const live = state.sessions.filter((session) => session.id !== state.sessionId);
+    const liveIDs = new Set(live.map((session) => session.id));
+    const archived = state.archived.filter((session) => !liveIDs.has(session.id));
+    const previous = live.concat(archived);
     if (!previous.length) {
       elements.resumeList.append(emptyResumePreview("No previous sessions."));
       return;
     }
     for (const session of previous) {
+      const isArchived = Boolean(session.archived);
+      const isSelected = isArchived
+        ? (session.key === state.resumeSelected && state.resumeSelectedArchived)
+        : (session.id === state.resumeSelected && !state.resumeSelectedArchived);
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "resume-item" + (session.id === state.resumeSelected ? " active" : "");
+      item.className = "resume-item" + (isSelected ? " active" : "") + (isArchived ? " archived" : "");
       item.setAttribute("role", "option");
-      item.setAttribute("aria-selected", session.id === state.resumeSelected ? "true" : "false");
+      item.setAttribute("aria-selected", isSelected ? "true" : "false");
       item.addEventListener("click", () => previewResume(session));
       const copy = document.createElement("span");
       copy.className = "resume-item-copy";
       const name = document.createElement("strong");
-      name.textContent = session.name || session.id;
+      name.textContent = session.name || session.id || session.key;
       const meta = document.createElement("span");
       const parts = [];
       if (session.title) parts.push(session.title);
       if (session.model) parts.push(session.model);
-      meta.textContent = parts.join(" · ") || session.id;
+      if (isArchived) parts.push("previous run");
+      meta.textContent = parts.join(" · ") || session.id || session.key;
       copy.append(name, meta);
       item.append(copy);
       elements.resumeList.append(item);
@@ -1924,13 +1947,18 @@
   }
 
   async function previewResume(session) {
-    state.resumeSelected = session.id;
+    const isArchived = Boolean(session.archived);
+    state.resumeSelected = isArchived ? session.key : session.id;
+    state.resumeSelectedArchived = isArchived;
     renderResumeList();
     elements.resumeLoad.disabled = true;
     elements.resumePreview.replaceChildren(emptyResumePreview("Loading preview…"));
     showDialogError(elements.resumeError, "");
     try {
-      const snapshot = await apiCall("/session?session_id=" + encodeURIComponent(session.id));
+      const path = isArchived
+        ? "/sessions/archived/" + encodeURIComponent(session.key)
+        : "/session?session_id=" + encodeURIComponent(session.id);
+      const snapshot = await apiCall(path);
       const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
       const preview = messages
         .filter((message) => message && message.type === "message" &&
@@ -1940,6 +1968,9 @@
         .slice(0, 5);
       renderResumePreview(preview);
       elements.resumeLoad.disabled = false;
+      if (isArchived) {
+        showDialogError(elements.resumeError, "This session is from a previous run. Loading it starts a new session from this conversation.");
+      }
     } catch (error) {
       elements.resumePreview.replaceChildren();
       showDialogError(elements.resumeError, error.message || "Could not load the session preview.");
@@ -1978,11 +2009,26 @@
     return text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
   }
 
-  function loadResume() {
+  async function loadResume() {
     const id = state.resumeSelected;
     if (!id) return;
-    elements.resumeDialog.close();
-    selectSession(id);
+    elements.resumeLoad.disabled = true;
+    try {
+      if (state.resumeSelectedArchived) {
+        const created = await apiCall("/sessions/archived/" + encodeURIComponent(id), {
+          method: "POST",
+          body: "{}"
+        });
+        elements.resumeDialog.close();
+        selectSession(created.id);
+      } else {
+        elements.resumeDialog.close();
+        selectSession(id);
+      }
+    } catch (error) {
+      elements.resumeLoad.disabled = false;
+      showDialogError(elements.resumeError, error.message || "Could not load the session.");
+    }
   }
 
   function resetSendButton() {
