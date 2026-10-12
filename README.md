@@ -367,3 +367,13 @@ make run      # build and run ./aiharn
 - `BUGS.md` tracks known issues.
 - `internal/execution/ssh/harness` supplies an in-process SSH server for
   transport and session tests.
+
+## Continuous integration
+
+GitHub Actions runs `go vet`, `go test`, and `go test -race` on every pull
+request and on `master` after merge (`.github/workflows/test.yml`).
+
+SonarCloud analysis runs on the same triggers
+(`.github/workflows/sonarcloud.yml`). It requires a `SONAR_TOKEN` repository
+secret and a `sonar-project.properties` whose `sonar.organization` and
+`sonar.projectKey` match the project created on SonarCloud.
