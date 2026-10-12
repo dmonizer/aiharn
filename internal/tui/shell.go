@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -54,19 +55,42 @@ var (
 	styleShellBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
 )
 
-// toolCallText renders a non-execute tool call as a single transcript line.
+// toolCallText renders a non-execute tool call as a readable transcript line.
+// When arguments are JSON they are re-indented on their own lines; a bare
+// non-JSON argument (e.g. a filename) stays on the same line as the tool name.
 func toolCallText(call llm.Item) string {
-	return sanitizeTerminalText(fmt.Sprintf("[tool] %s %s", call.Name, call.Args))
+	args := prettyToolArgs(call.Args)
+	if args == "" {
+		return sanitizeTerminalText(fmt.Sprintf("[tool] %s", call.Name))
+	}
+	if strings.Contains(args, "\n") {
+		return sanitizeTerminalText(fmt.Sprintf("[tool] %s\n%s", call.Name, args))
+	}
+	return sanitizeTerminalText(fmt.Sprintf("[tool] %s %s", call.Name, args))
+}
+
+// prettyToolArgs re-indents valid JSON arguments for readability and falls back
+// to the raw text for non-JSON arguments. json.Indent preserves the original
+// tokens without HTML escaping.
+func prettyToolArgs(args string) string {
+	if args == "" {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(args), "", "  "); err != nil {
+		return args
+	}
+	return strings.TrimSpace(buf.String())
 }
 
 // appendToolCall records a tool call. execute_command becomes a clickable shell
 // command; every other tool call is coalesced into a collapsible tool-call group line.
 func (m *Model) appendToolCall(call llm.Item) {
 	if call.Name == tools.NameExecuteCommand {
-		cmd := shellCmd{id: call.CallID, command: normalizeCommand(extractCommand(call.Args))}
+		cmd := shellCmd{id: call.CallID, command: displayCommand(call.Args)}
 		m.shellCmds = append(m.shellCmds, cmd)
 		idx := len(m.shellCmds) - 1
-		preview, truncated := previewCommand(cmd.command, commandPreviewLen)
+		preview, truncated := previewCommand(normalizeCommand(cmd.command), commandPreviewLen)
 		if truncated {
 			preview += "..."
 		}
@@ -139,8 +163,14 @@ func (m *Model) rebuildShellFlat() {
 		if !c.done {
 			status = " …"
 		}
-		m.shellFlat = append(m.shellFlat, "$ "+c.command+status)
-		m.shellRowCmd = append(m.shellRowCmd, i)
+		for lineIdx, cl := range strings.Split(c.command, "\n") {
+			if lineIdx == 0 {
+				m.shellFlat = append(m.shellFlat, "$ "+cl+status)
+			} else {
+				m.shellFlat = append(m.shellFlat, "  "+cl)
+			}
+			m.shellRowCmd = append(m.shellRowCmd, i)
+		}
 		for _, ol := range strings.Split(c.output, "\n") {
 			// Command output is untrusted: strip control sequences and expand
 			// tabs so each row's measured width matches what it renders.
@@ -553,6 +583,14 @@ func extractCommand(args string) string {
 		return p.Command
 	}
 	return args
+}
+
+// displayCommand returns the sanitized, newline-preserved shell command from an
+// execute_command argument payload, trimming only surrounding newlines so a
+// multi-line command renders exactly as the model wrote it instead of being
+// collapsed onto a single line.
+func displayCommand(args string) string {
+	return strings.Trim(sanitizeTerminalText(extractCommand(args)), "\n")
 }
 
 // normalizeCommand collapses whitespace (including newlines) to single spaces.

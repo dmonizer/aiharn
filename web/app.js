@@ -1224,6 +1224,12 @@
     return { title: parts.join(" · ") || "Activity", status, active: false, calls };
   }
 
+  function toolCallCommand(call) {
+    const args = call && call.arguments;
+    if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+    return typeof args.command === "string" ? args.command : "";
+  }
+
   function renderActivityBlock(group, expanded) {
     const presentation = activityPresentation(group);
     const details = document.createElement("details");
@@ -1281,7 +1287,10 @@
       ));
       step.append(heading);
       if (call) {
-        appendToolSection(step, "Call", call.arguments,
+        const value = call.name === "execute_command"
+          ? (toolCallCommand(call) || call.arguments)
+          : call.arguments;
+        appendToolSection(step, "Call", value,
           "activity:" + group.key + ":" + index + ":call");
       }
       if (result) {
