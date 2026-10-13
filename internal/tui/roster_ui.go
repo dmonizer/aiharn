@@ -73,40 +73,58 @@ func (m *Model) renderRoster(rows, x, width, topY int) string {
 }
 
 func (m *Model) clickRoster(x, y int) (bool, tea.Cmd) {
-	for _, hit := range m.rosterHits {
-		if y != hit.y || x < hit.x || x >= hit.x+hit.width {
-			continue
-		}
-		switch hit.action {
-		case rosterFocus:
-			m.focusAgent(hit.id)
-			if m.thinking {
-				return true, tickThinking()
-			}
-		case rosterPause:
-			sub := m.manager.Agent(hit.id)
-			if sub == nil {
-				return true, nil
-			}
-			paused := false
-			for _, status := range m.subagents {
-				if status.ID == hit.id {
-					paused = status.Paused
-					break
-				}
-			}
-			if err := m.manager.SetSubagentPaused(m.ctx, m.agent.ID(), hit.id, !paused); err != nil {
-				m.appendLine(kindError, "pause subagent: "+err.Error())
-			} else {
-				m.refreshSubagents()
-			}
-		case rosterClose:
-			id := hit.id
-			return true, func() tea.Msg {
-				return subagentClosedMsg{gen: m.sessionGen, id: id, err: m.manager.CloseSubagent(m.ctx, m.agent.ID(), id)}
-			}
-		}
-		return true, nil
+	hit, ok := m.rosterHitAt(x, y)
+	if !ok {
+		return false, nil
 	}
-	return false, nil
+	return m.applyRosterAction(hit)
+}
+
+// rosterHitAt returns the roster hit box containing (x, y), if any.
+func (m *Model) rosterHitAt(x, y int) (rosterHit, bool) {
+	for _, hit := range m.rosterHits {
+		if y == hit.y && x >= hit.x && x < hit.x+hit.width {
+			return hit, true
+		}
+	}
+	return rosterHit{}, false
+}
+
+// applyRosterAction performs the action associated with a clicked roster hit.
+func (m *Model) applyRosterAction(hit rosterHit) (bool, tea.Cmd) {
+	switch hit.action {
+	case rosterFocus:
+		m.focusAgent(hit.id)
+		if m.thinking {
+			return true, tickThinking()
+		}
+	case rosterPause:
+		m.pauseSubagent(hit.id)
+	case rosterClose:
+		id := hit.id
+		return true, func() tea.Msg {
+			return subagentClosedMsg{gen: m.sessionGen, id: id, err: m.manager.CloseSubagent(m.ctx, m.agent.ID(), id)}
+		}
+	}
+	return true, nil
+}
+
+// pauseSubagent toggles the paused state of a subagent, reporting any error.
+func (m *Model) pauseSubagent(id string) {
+	sub := m.manager.Agent(id)
+	if sub == nil {
+		return
+	}
+	paused := false
+	for _, status := range m.subagents {
+		if status.ID == id {
+			paused = status.Paused
+			break
+		}
+	}
+	if err := m.manager.SetSubagentPaused(m.ctx, m.agent.ID(), id, !paused); err != nil {
+		m.appendLine(kindError, "pause subagent: "+err.Error())
+	} else {
+		m.refreshSubagents()
+	}
 }

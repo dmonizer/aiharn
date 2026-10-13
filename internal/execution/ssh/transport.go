@@ -76,55 +76,72 @@ func NewTransport(opts Options) (*Transport, error) {
 	if opts.Host == "" {
 		return nil, errors.New("ssh: host is required")
 	}
-	if opts.SSHConfigAlias && !isIPLiteral(opts.Host) {
-		configPath, err := defaultSSHConfigPath()
-		if err != nil {
-			return nil, err
-		}
-		if aliasOnly(opts) {
-			opts, err = resolveAlias(opts, configPath)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			resolved, found, err := tryResolveAlias(opts, configPath)
-			if err != nil {
-				return nil, err
-			}
-			if found {
-				opts = resolved
-			}
-		}
+	var err error
+	opts, err = resolveAliasIfNeeded(opts)
+	if err != nil {
+		return nil, err
 	}
-	if opts.Port == 0 {
-		opts.Port = 22
-	}
-	if opts.Port < 1 || opts.Port > 65535 {
-		return nil, fmt.Errorf("ssh: port must be between 1 and 65535, got %d", opts.Port)
-	}
-	if opts.User == "" {
-		return nil, errors.New("ssh: user is required")
-	}
-	if opts.KeyFile != "" && opts.Password != "" {
-		return nil, errors.New("ssh: key_file and password are mutually exclusive")
-	}
-	if opts.KeyFile != "" {
-		if err := validateLocalFile(opts.KeyFile, 1<<20, "key_file"); err != nil {
-			return nil, err
-		}
-	}
-	if !opts.Insecure && opts.KnownHosts == "" {
-		return nil, errors.New("ssh: known_hosts is required (or set insecure)")
-	}
-	if opts.KnownHosts != "" {
-		if err := validateLocalFile(opts.KnownHosts, 64<<20, "known_hosts"); err != nil {
-			return nil, err
-		}
+	if err := validateTransportOptions(&opts); err != nil {
+		return nil, err
 	}
 	if opts.DefaultShell == "" {
 		opts.DefaultShell = "/bin/bash"
 	}
 	return &Transport{opts: opts}, nil
+}
+
+// resolveAliasIfNeeded resolves the host against ~/.ssh/config when the channel
+// opts into alias handling and the host is not an IP literal.
+func resolveAliasIfNeeded(opts Options) (Options, error) {
+	if !opts.SSHConfigAlias || isIPLiteral(opts.Host) {
+		return opts, nil
+	}
+	configPath, err := defaultSSHConfigPath()
+	if err != nil {
+		return opts, err
+	}
+	if aliasOnly(opts) {
+		return resolveAlias(opts, configPath)
+	}
+	resolved, found, err := tryResolveAlias(opts, configPath)
+	if err != nil {
+		return opts, err
+	}
+	if found {
+		return resolved, nil
+	}
+	return opts, nil
+}
+
+// validateTransportOptions applies transport defaults and validates the fields
+// that do not depend on ~/.ssh/config.
+func validateTransportOptions(opts *Options) error {
+	if opts.Port == 0 {
+		opts.Port = 22
+	}
+	if opts.Port < 1 || opts.Port > 65535 {
+		return fmt.Errorf("ssh: port must be between 1 and 65535, got %d", opts.Port)
+	}
+	if opts.User == "" {
+		return errors.New("ssh: user is required")
+	}
+	if opts.KeyFile != "" && opts.Password != "" {
+		return errors.New("ssh: key_file and password are mutually exclusive")
+	}
+	if opts.KeyFile != "" {
+		if err := validateLocalFile(opts.KeyFile, 1<<20, "key_file"); err != nil {
+			return err
+		}
+	}
+	if !opts.Insecure && opts.KnownHosts == "" {
+		return errors.New("ssh: known_hosts is required (or set insecure)")
+	}
+	if opts.KnownHosts != "" {
+		if err := validateLocalFile(opts.KnownHosts, 64<<20, "known_hosts"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateLocalFile(path string, maxBytes int64, name string) error {

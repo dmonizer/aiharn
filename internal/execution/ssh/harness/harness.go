@@ -179,107 +179,120 @@ func (s *Server) handleChannel(newCh ssh.NewChannel) {
 	if err != nil {
 		return
 	}
+	st := &channelState{}
+	go s.serveRequests(ch, reqs, st)
+}
 
-	var (
-		mu   sync.Mutex
-		cmd  *exec.Cmd
-		done bool
-	)
+// channelState tracks the per-channel command and reap state shared between the
+// request loop and the reap goroutine.
+type channelState struct {
+	mu   sync.Mutex
+	cmd  *exec.Cmd
+	done bool
+}
 
-	reap := func(c *exec.Cmd) {
-		c.Wait()
-		s.mu.Lock()
-		delete(s.procs, c)
-		s.mu.Unlock()
-		mu.Lock()
-		done = true
-		mu.Unlock()
+// serveRequests consumes request messages until the channel closes, then kills
+// any live command.
+func (s *Server) serveRequests(ch ssh.Channel, reqs <-chan *ssh.Request, st *channelState) {
+	for req := range reqs {
+		s.handleRequest(ch, req, st)
+	}
+	st.kill()
+}
 
-		status := uint32(0)
-		if c.ProcessState != nil {
-			if ee, ok := c.ProcessState.Sys().(interface{ ExitCode() int }); ok {
-				status = uint32(ee.ExitCode())
-			} else if !c.ProcessState.Success() {
-				status = 1
-			}
+// handleRequest services one exec/shell/signal request on a session channel.
+func (s *Server) handleRequest(ch ssh.Channel, req *ssh.Request, st *channelState) {
+	switch req.Type {
+	case "exec":
+		atomic.AddInt64(&s.sessions, 1)
+		var p struct{ Command string }
+		if err := ssh.Unmarshal(req.Payload, &p); err != nil {
+			req.Reply(false, nil)
+			return
 		}
-		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ ExitStatus uint32 }{status}))
+		st.run(s, ch, s.shell, []string{"-c", p.Command}, req)
+	case "shell":
+		st.run(s, ch, s.shell, []string{"--noprofile", "--norc", "-s"}, req)
+	case "signal":
+		var p struct{ Signal string }
+		ssh.Unmarshal(req.Payload, &p)
+		req.Reply(true, nil)
+		st.mu.Lock()
+		c := st.cmd
+		st.mu.Unlock()
+		if c != nil && c.Process != nil {
+			_ = c.Process.Signal(signalByName(p.Signal))
+		}
+	default:
+		req.Reply(false, nil)
+	}
+}
+
+// run starts a command for the channel, records it, and replies to the request.
+// A non-nil command is reaped asynchronously; otherwise the channel is closed.
+func (st *channelState) run(s *Server, ch ssh.Channel, name string, args []string, req *ssh.Request) {
+	c := st.start(s, ch, name, args...)
+	st.mu.Lock()
+	st.cmd = c
+	st.mu.Unlock()
+	req.Reply(true, nil)
+	if c != nil {
+		go st.reap(s, ch, c)
+	} else {
 		ch.Close()
 	}
+}
 
-	kill := func() {
-		mu.Lock()
-		c := cmd
-		reaped := done
-		mu.Unlock()
-		if c != nil && !reaped && c.Process != nil {
-			_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+// reap waits for a command to exit, records its exit status on the channel, and
+// closes the channel.
+func (st *channelState) reap(s *Server, ch ssh.Channel, c *exec.Cmd) {
+	c.Wait()
+	s.mu.Lock()
+	delete(s.procs, c)
+	s.mu.Unlock()
+	st.mu.Lock()
+	st.done = true
+	st.mu.Unlock()
+
+	status := uint32(0)
+	if c.ProcessState != nil {
+		if ee, ok := c.ProcessState.Sys().(interface{ ExitCode() int }); ok {
+			status = uint32(ee.ExitCode())
+		} else if !c.ProcessState.Success() {
+			status = 1
 		}
 	}
+	ch.SendRequest("exit-status", false, ssh.Marshal(struct{ ExitStatus uint32 }{status}))
+	ch.Close()
+}
 
-	start := func(name string, args ...string) *exec.Cmd {
-		c := exec.Command(name, args...)
-		c.Stdin = ch
-		c.Stdout = ch
-		c.Stderr = ch.Stderr()
-		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := c.Start(); err != nil {
-			s.publishErr(fmt.Errorf("start %s: %w", name, err))
-			return nil
-		}
-		s.mu.Lock()
-		s.procs[c] = struct{}{}
-		s.mu.Unlock()
-		return c
+// kill terminates the live command's process group, if any.
+func (st *channelState) kill() {
+	st.mu.Lock()
+	c := st.cmd
+	reaped := st.done
+	st.mu.Unlock()
+	if c != nil && !reaped && c.Process != nil {
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
 	}
+}
 
-	go func() {
-		for req := range reqs {
-			switch req.Type {
-			case "exec":
-				atomic.AddInt64(&s.sessions, 1)
-				var p struct{ Command string }
-				if err := ssh.Unmarshal(req.Payload, &p); err != nil {
-					req.Reply(false, nil)
-					continue
-				}
-				c := start(s.shell, "-c", p.Command)
-				mu.Lock()
-				cmd = c
-				mu.Unlock()
-				req.Reply(true, nil)
-				if c != nil {
-					go reap(c)
-				} else {
-					ch.Close()
-				}
-			case "shell":
-				c := start(s.shell, "--noprofile", "--norc", "-s")
-				mu.Lock()
-				cmd = c
-				mu.Unlock()
-				req.Reply(true, nil)
-				if c != nil {
-					go reap(c)
-				} else {
-					ch.Close()
-				}
-			case "signal":
-				var p struct{ Signal string }
-				ssh.Unmarshal(req.Payload, &p)
-				req.Reply(true, nil)
-				mu.Lock()
-				c := cmd
-				mu.Unlock()
-				if c != nil && c.Process != nil {
-					_ = c.Process.Signal(signalByName(p.Signal))
-				}
-			default:
-				req.Reply(false, nil)
-			}
-		}
-		kill()
-	}()
+// start launches a command attached to the channel and registers it with the
+// server's process table.
+func (st *channelState) start(s *Server, ch ssh.Channel, name string, args ...string) *exec.Cmd {
+	c := exec.Command(name, args...)
+	c.Stdin = ch
+	c.Stdout = ch
+	c.Stderr = ch.Stderr()
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := c.Start(); err != nil {
+		s.publishErr(fmt.Errorf("start %s: %w", name, err))
+		return nil
+	}
+	s.mu.Lock()
+	s.procs[c] = struct{}{}
+	s.mu.Unlock()
+	return c
 }
 
 // Close stops the server, closes connections, and kills any live processes.
