@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -166,5 +167,89 @@ func TestBuildRequestRoundTrip(t *testing.T) {
 	tool := messages[3].(map[string]any)
 	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" || tool["content"] != "/work" {
 		t.Fatalf("tool message = %#v", tool)
+	}
+}
+
+func TestBuildRequestErrorPaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []llm.Item
+		tools   []llm.ToolDefinition
+		wantErr string
+	}{
+		{
+			name:    "invalid message role",
+			input:   []llm.Item{{Type: llm.ItemMessage, Role: "system", Content: "x"}},
+			wantErr: "invalid message role",
+		},
+		{
+			name:    "function call output without call id",
+			input:   []llm.Item{{Type: llm.ItemFunctionCallOutput, Content: "x"}},
+			wantErr: "requires call id",
+		},
+		{
+			name:    "unsupported item type",
+			input:   []llm.Item{{Type: llm.ItemType("bogus")}},
+			wantErr: "unsupported item type",
+		},
+		{
+			name:    "function call without call id and name",
+			input:   []llm.Item{{Type: llm.ItemFunctionCall}},
+			wantErr: "requires call id and name",
+		},
+		{
+			name:    "tool without name",
+			input:   nil,
+			tools:   []llm.ToolDefinition{{Name: ""}},
+			wantErr: "name is required",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildRequest(llm.Request{Input: tc.input, Tools: tc.tools})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("buildRequest() err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCollectStreamErrorPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "stream ends without finish reason",
+			body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+			want: "ended before a finish reason",
+		},
+		{
+			name: "malformed json chunk",
+			body: "data: not-json\n\n",
+			want: "chat completions: stream",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, tc.body)
+			}))
+			defer server.Close()
+
+			events, err := NewAdapter(server.URL+"/", "key").Stream(context.Background(), llm.Request{Model: "m"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			all := drain(t, events)
+			if len(all) == 0 || all[len(all)-1].Type != llm.EventFailed {
+				t.Fatalf("events = %+v, want terminal failure", all)
+			}
+			if !strings.Contains(all[len(all)-1].Err.Error(), tc.want) {
+				t.Fatalf("last error = %v, want containing %q", all[len(all)-1].Err, tc.want)
+			}
+		})
 	}
 }

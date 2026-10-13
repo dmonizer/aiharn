@@ -76,21 +76,8 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "aiharn: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
-	if !specified["config"] {
-		var err error
-		*configPath, err = config.DefaultConfigPath()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "aiharn: resolve default config path: %v\n", err)
-			return 1
-		}
-		created, err := config.EnsureDefaultConfig(*configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "aiharn: initialize default config: %v\n", err)
-			return 1
-		}
-		if created {
-			fmt.Fprintf(os.Stderr, "aiharn: created starter config at %s\n", *configPath)
-		}
+	if code, done := ensureConfig(specified, configPath); done {
+		return code
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -99,21 +86,7 @@ func run(args []string) int {
 		return 1
 	}
 	apiCfg := cfg.API
-	if path := os.Getenv("AIHARN_AUTH_FILE"); path != "" {
-		apiCfg.AuthFile = path
-	}
-	if specified["api-listen"] {
-		apiCfg.Listen = *apiListen
-	}
-	if specified["api-auth-file"] {
-		apiCfg.AuthFile = *apiAuthFile
-	}
-	if specified["api-allow-origin"] {
-		apiCfg.AllowOrigins = commaList(*apiOrigins)
-	}
-	if specified["api-only"] {
-		apiCfg.Only = *apiOnly
-	}
+	applyAPIFlags(&apiCfg, specified, *apiListen, *apiAuthFile, *apiOrigins, *apiOnly)
 	if apiCfg.Only && apiCfg.Listen == "" {
 		fmt.Fprintln(os.Stderr, "aiharn: API-only mode requires an API listen address")
 		return 2
@@ -165,23 +138,12 @@ func run(args []string) int {
 
 	var api *webapi.Server
 	if apiCfg.Listen != "" {
-		api, err = webapi.New(webapi.Config{
-			Listen: apiCfg.Listen, AuthFile: apiCfg.AuthFile,
-			AllowedOrigins: apiCfg.AllowOrigins,
-			Sessions:       sessionsMgr,
-			AiharnHome:     cfg.AiharnHome,
-		})
+		api, err = startAPI(cfg, sessionsMgr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
 			return 1
 		}
-		if err := api.Start(); err != nil {
-			api.Close()
-			fmt.Fprintf(os.Stderr, "aiharn: %v\n", err)
-			return 1
-		}
 		defer api.Close()
-		fmt.Fprintf(os.Stderr, "aiharn: session API listening on %s (up to %d sessions)\n", api.Addr(), sessionLimit(apiCfg.MaxSessions))
 	}
 	if apiCfg.Only {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -199,23 +161,7 @@ func run(args []string) int {
 		AiharnHome: cfg.AiharnHome,
 	})
 	m.SetClearFunc(func(ctx context.Context) (tui.ClearResult, error) {
-		handle, err := sessionsMgr.Clear(ctx, "")
-		if err != nil {
-			return tui.ClearResult{}, err
-		}
-		top, ok := handle.Agent().(*agent.Agent)
-		if !ok {
-			return tui.ClearResult{}, fmt.Errorf("aiharn: cleared session returned unexpected agent type %T", handle.Agent())
-		}
-		return tui.ClearResult{
-			Manager:   handle.Manager(),
-			Agent:     top,
-			Gate:      handle.Gate(),
-			Model:     handle.Model(),
-			AgentType: top.Type(),
-			Channel:   handle.Channel(),
-			Approval:  handle.Gate().Mode().String(),
-		}, nil
+		return clearedRuntime(ctx, sessionsMgr)
 	})
 	p := tea.NewProgram(m, tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
@@ -238,7 +184,9 @@ func transcriptFactory(aiharnHome, logPath string, logOverridden bool) (func(str
 	if logOverridden && logPath == "" {
 		// A nil factory leaves Options.NewTranscript unset, which means "no
 		// transcript" for every session.
-		return nil, func() {}, nil
+		return nil, func() {
+			// No-op: no transcript is created when logging is fully disabled.
+		}, nil
 	}
 	if logOverridden {
 		// One shared recorder for every session, created on first use.
@@ -261,12 +209,14 @@ func transcriptFactory(aiharnHome, logPath string, logOverridden bool) (func(str
 		}, nil
 	}
 	return func(string, string) (sessions.Transcript, error) {
-		rec, _, err := recorder.NewSessionFile(aiharnHome)
-		if err != nil {
-			return nil, err
-		}
-		return rec, nil
-	}, func() {}, nil
+			rec, _, err := recorder.NewSessionFile(aiharnHome)
+			if err != nil {
+				return nil, err
+			}
+			return rec, nil
+		}, func() {
+			// No-op: per-session transcripts close themselves on their own Close.
+		}, nil
 }
 
 // sessionLimit reports the session bound the API will enforce.
@@ -294,4 +244,89 @@ func commaList(value string) []string {
 		}
 	}
 	return values
+}
+
+// ensureConfig resolves and initializes the default config path when --config
+// was not supplied. done reports whether run should return with the given exit
+// code.
+func ensureConfig(specified map[string]bool, configPath *string) (code int, done bool) {
+	if specified["config"] {
+		return 0, false
+	}
+	path, err := config.DefaultConfigPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aiharn: resolve default config path: %v\n", err)
+		return 1, true
+	}
+	created, err := config.EnsureDefaultConfig(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "aiharn: initialize default config: %v\n", err)
+		return 1, true
+	}
+	*configPath = path
+	if created {
+		fmt.Fprintf(os.Stderr, "aiharn: created starter config at %s\n", path)
+	}
+	return 0, false
+}
+
+// applyAPIFlags applies the environment and --api-* overrides to apiCfg.
+func applyAPIFlags(apiCfg *config.APIConfig, specified map[string]bool, apiListen, apiAuthFile, apiOrigins string, apiOnly bool) {
+	if path := os.Getenv("AIHARN_AUTH_FILE"); path != "" {
+		apiCfg.AuthFile = path
+	}
+	if specified["api-listen"] {
+		apiCfg.Listen = apiListen
+	}
+	if specified["api-auth-file"] {
+		apiCfg.AuthFile = apiAuthFile
+	}
+	if specified["api-allow-origin"] {
+		apiCfg.AllowOrigins = commaList(apiOrigins)
+	}
+	if specified["api-only"] {
+		apiCfg.Only = apiOnly
+	}
+}
+
+// startAPI builds and starts the web API server. The caller owns closing the
+// returned server.
+func startAPI(cfg *config.Config, sessionsMgr *app.SessionManager) (*webapi.Server, error) {
+	api, err := webapi.New(webapi.Config{
+		Listen: cfg.API.Listen, AuthFile: cfg.API.AuthFile,
+		AllowedOrigins: cfg.API.AllowOrigins,
+		Sessions:       sessionsMgr,
+		AiharnHome:     cfg.AiharnHome,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := api.Start(); err != nil {
+		api.Close()
+		return nil, err
+	}
+	fmt.Fprintf(os.Stderr, "aiharn: session API listening on %s (up to %d sessions)\n", api.Addr(), sessionLimit(cfg.API.MaxSessions))
+	return api, nil
+}
+
+// clearedRuntime clears the default session and maps it back onto the pieces
+// the TUI needs to rebind after a clear.
+func clearedRuntime(ctx context.Context, sessionsMgr *app.SessionManager) (tui.ClearResult, error) {
+	handle, err := sessionsMgr.Clear(ctx, "")
+	if err != nil {
+		return tui.ClearResult{}, err
+	}
+	top, ok := handle.Agent().(*agent.Agent)
+	if !ok {
+		return tui.ClearResult{}, fmt.Errorf("aiharn: cleared session returned unexpected agent type %T", handle.Agent())
+	}
+	return tui.ClearResult{
+		Manager:   handle.Manager(),
+		Agent:     top,
+		Gate:      handle.Gate(),
+		Model:     handle.Model(),
+		AgentType: top.Type(),
+		Channel:   handle.Channel(),
+		Approval:  handle.Gate().Mode().String(),
+	}, nil
 }

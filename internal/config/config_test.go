@@ -772,3 +772,66 @@ func TestToolSelectionStringAndArray(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateErrorBranches(t *testing.T) {
+	providers := map[string]bool{ProviderOpenAIResponses: true, ProviderOpenAIChatCompletions: true}
+	channelTypes := map[string]bool{ChannelTypeSSH: true, ChannelTypeLocal: true}
+	knownTools := map[string]bool{}
+
+	base := func() *Config {
+		return &Config{
+			AiharnHome: "/tmp/aiharn",
+			Models:     map[string]ModelConfig{"m": {Provider: ProviderOpenAIResponses, Model: "gpt", APIKey: "k"}},
+			Channels:   []ChannelConfig{{Name: "local", Type: ChannelTypeLocal}},
+			Agents:     map[string]AgentConfig{"main": {Model: "m", Channel: "local", SystemPrompt: ""}},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"unsupported provider", func(c *Config) { c.Models["m"] = ModelConfig{Provider: "bogus", Model: "g", APIKey: "k"} }, "unsupported"},
+		{"model required", func(c *Config) { c.Models["m"] = ModelConfig{Provider: ProviderOpenAIResponses, APIKey: "k"} }, "model is required"},
+		{"api key required", func(c *Config) { c.Models["m"] = ModelConfig{Provider: ProviderOpenAIResponses, Model: "g"} }, "api_key is required"},
+		{"invalid reasoning effort", func(c *Config) { m := c.Models["m"]; m.ReasoningEffort = "bogus"; c.Models["m"] = m }, "reasoning_effort"},
+		{"reasoning summary wrong provider", func(c *Config) {
+			m := c.Models["m"]
+			m.Provider = ProviderOpenAIChatCompletions
+			m.ReasoningSummary = "auto"
+			c.Models["m"] = m
+		}, "reasoning_summary requires"},
+		{"unsupported channel type", func(c *Config) { c.Channels = []ChannelConfig{{Name: "c", Type: "bogus"}} }, "unsupported"},
+		{"empty channel name", func(c *Config) { c.Channels = []ChannelConfig{{Type: ChannelTypeLocal}} }, "name is required"},
+		{"duplicate channel", func(c *Config) {
+			c.Channels = []ChannelConfig{{Name: "c", Type: ChannelTypeLocal}, {Name: "c", Type: ChannelTypeLocal}}
+		}, "duplicate name"},
+		{"ssh missing host", func(c *Config) { c.Channels = []ChannelConfig{{Name: "s", Type: ChannelTypeSSH}} }, "host is required"},
+		{"ssh missing auth", func(c *Config) { c.Channels = []ChannelConfig{{Name: "s", Type: ChannelTypeSSH, Host: "h", User: "u"}} }, "one of key_file or password"},
+		{"ssh known_hosts required", func(c *Config) {
+			c.Channels = []ChannelConfig{{Name: "s", Type: ChannelTypeSSH, Host: "h", User: "u", Auth: AuthConfig{Password: "p"}}}
+		}, "known_hosts is required"},
+		{"agent model required", func(c *Config) { c.Agents["main"] = AgentConfig{Channel: "local"} }, "model is required"},
+		{"agent undefined model", func(c *Config) { c.Agents["main"] = AgentConfig{Model: "nope", Channel: "local"} }, "not defined"},
+		{"agent undefined channel", func(c *Config) { a := c.Agents["main"]; a.Channel = "nope"; c.Agents["main"] = a }, "channel"},
+		{"agent tools invalid mode", func(c *Config) { a := c.Agents["main"]; a.Tools = ToolSelection{Mode: "bogus"}; c.Agents["main"] = a }, "invalid mode"},
+		{"agent tools unknown", func(c *Config) {
+			a := c.Agents["main"]
+			a.Tools = ToolSelection{Mode: ToolModeList, Names: []string{"nope"}}
+			c.Agents["main"] = a
+		}, "unknown tool"},
+		{"negative limit", func(c *Config) { c.Limits.MaxOpenAgents = -1 }, "max_open_agents"},
+		{"invalid approval", func(c *Config) { c.Approval.Mode = "bogus" }, "approval.mode"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mutate(cfg)
+			err := Validate(cfg, ValidateOptions{KnownProviders: providers, KnownChannelTypes: channelTypes, KnownTools: knownTools})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

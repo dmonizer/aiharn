@@ -15,8 +15,8 @@ func (h approvalHit) contains(x, y int) bool {
 }
 
 var (
-	styleApprovalLink = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Underline(true).Bold(true)
-	styleApprovalFull = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	styleApprovalLink   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Underline(true).Bold(true)
+	styleApprovalFull   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	styleApprovalPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 )
 
@@ -180,32 +180,15 @@ func (m *Model) approvalPopoverBody(rows int) string {
 	if startX < 0 {
 		startX = 0
 	}
-	label := " full command "
-	if boxWidth < 22 {
-		label = " cmd "
-	}
-	space := boxWidth - 2 - uniseg.StringWidth(label) - 3
-	if space < 0 {
-		space = 0
-	}
-	closeX := startX + 1 + uniseg.StringWidth(label) + space
-	m.approvalCloseHit = approvalHit{x: closeX, y: startY, width: 3}
-	closeStyle := styleApprovalLink
-	if m.approvalCloseHit.contains(m.hoverX, m.hoverY) {
-		closeStyle = closeStyle.Reverse(true)
-	}
-	top := "╭" + label + strings.Repeat("─", space) + closeStyle.Render("[x]") + "╮"
+	top, hit := m.approvalPopoverHeader(boxWidth, startX, startY)
+	m.approvalCloseHit = hit
 	box := []string{top}
 	for i := 0; i < contentRows; i++ {
 		line := ""
 		if at := m.approvalScroll + i; at < len(wrapped) {
 			line = wrapped[at]
 		}
-		padding := contentWidth - uniseg.StringWidth(line)
-		if padding < 0 {
-			padding = 0
-		}
-		box = append(box, "│ "+styleApprovalFull.Render(line)+strings.Repeat(" ", padding)+" │")
+		box = append(box, "│ "+styleApprovalFull.Render(line)+strings.Repeat(" ", approvalPadding(contentWidth, line))+" │")
 	}
 	if boxHeight >= 2 {
 		box = append(box, "╰"+strings.Repeat("─", boxWidth-2)+"╯")
@@ -217,4 +200,34 @@ func (m *Model) approvalPopoverBody(rows int) string {
 		}
 	}
 	return strings.Join(visual, "\n")
+}
+
+// approvalPopoverHeader renders the popover's top border and computes the
+// [x] close-button hit box.
+func (m *Model) approvalPopoverHeader(boxWidth, startX, startY int) (string, approvalHit) {
+	label := " full command "
+	if boxWidth < 22 {
+		label = " cmd "
+	}
+	space := boxWidth - 2 - uniseg.StringWidth(label) - 3
+	if space < 0 {
+		space = 0
+	}
+	closeX := startX + 1 + uniseg.StringWidth(label) + space
+	hit := approvalHit{x: closeX, y: startY, width: 3}
+	closeStyle := styleApprovalLink
+	if hit.contains(m.hoverX, m.hoverY) {
+		closeStyle = closeStyle.Reverse(true)
+	}
+	return "╭" + label + strings.Repeat("─", space) + closeStyle.Render("[x]") + "╮", hit
+}
+
+// approvalPadding returns the trailing spaces needed to right-align a content
+// line to contentWidth cells, clamped to zero for over-long lines.
+func approvalPadding(contentWidth int, line string) int {
+	padding := contentWidth - uniseg.StringWidth(line)
+	if padding < 0 {
+		return 0
+	}
+	return padding
 }

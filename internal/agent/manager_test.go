@@ -713,13 +713,9 @@ func TestSubagentDeliversExactlyOnceAtTurnBoundary(t *testing.T) {
 	if err := mgr.StartTopLoop("main"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 2*time.Second, "main loop to deliver the subagent report", func() bool {
-		for _, it := range top.History() {
-			if strings.Contains(it.Content, "sub done") {
-				return true
-			}
-		}
-		return false
+	waitFor(t, 2*time.Second, "main loop to deliver the subagent report and reply", func() bool {
+		hist := top.History()
+		return len(hist) >= 2 && strings.Contains(hist[0].Content, "sub done") && hist[1].Content == "top done"
 	})
 
 	hist := top.History()

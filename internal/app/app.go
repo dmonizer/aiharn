@@ -474,7 +474,9 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	if channel != nil {
 		executor = channel
 		defaultCwd = channel.Cwd()
-		cleanup = func() {}
+		cleanup = func() {
+			// No-op: the shared channel owns its own lifecycle; nothing to release.
+		}
 	} else {
 		channelCfg, err := selectChannel(cfg, agentCfg.Channel, o.Channel)
 		if err != nil {

@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"aiharn/internal/agent"
+	"aiharn/internal/app"
+	"aiharn/internal/approval"
+	"aiharn/internal/authfile"
+	"aiharn/internal/config"
 	"aiharn/internal/sessions"
+	testllm "aiharn/internal/testutil/llm"
 )
 
 // transcriptFiles returns the files in <home>/transcripts.
@@ -124,4 +131,141 @@ func TestSessionLimit(t *testing.T) {
 			t.Fatalf("sessionLimit(%d) = %d, want %d", tc.configured, got, tc.want)
 		}
 	}
+}
+
+func TestEnsureConfigSpecified(t *testing.T) {
+	path := "already-set"
+	code, done := ensureConfig(map[string]bool{"config": true}, &path)
+	if done || code != 0 {
+		t.Fatalf("ensureConfig(specified) = (%d, %v), want (0, false)", code, done)
+	}
+	if path != "already-set" {
+		t.Fatalf("config path changed to %q", path)
+	}
+}
+
+func TestEnsureConfigCreatesDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	var path string
+	code, done := ensureConfig(map[string]bool{}, &path)
+	if done || code != 0 {
+		t.Fatalf("ensureConfig() = (%d, %v), want (0, false)", code, done)
+	}
+	if path == "" {
+		t.Fatal("config path was not resolved")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("default config was not created: %v", err)
+	}
+}
+
+func TestApplyAPIFlags(t *testing.T) {
+	t.Setenv("AIHARN_AUTH_FILE", "/tmp/auth-from-env")
+
+	api := config.APIConfig{AuthFile: "original", Listen: "original", AllowOrigins: []string{"a"}}
+	applyAPIFlags(&api, map[string]bool{
+		"api-listen":       true,
+		"api-auth-file":    true,
+		"api-allow-origin": true,
+		"api-only":         true,
+	}, "127.0.0.1:7331", "/tmp/auth-from-flag", "https://a.example,https://b.example", true)
+
+	if api.Listen != "127.0.0.1:7331" {
+		t.Fatalf("Listen = %q", api.Listen)
+	}
+	if api.AuthFile != "/tmp/auth-from-flag" {
+		t.Fatalf("AuthFile = %q", api.AuthFile)
+	}
+	if api.Only != true {
+		t.Fatalf("Only = %v", api.Only)
+	}
+	want := []string{"https://a.example", "https://b.example"}
+	if len(api.AllowOrigins) != len(want) || api.AllowOrigins[0] != want[0] || api.AllowOrigins[1] != want[1] {
+		t.Fatalf("AllowOrigins = %v", api.AllowOrigins)
+	}
+}
+
+func TestApplyAPIFlagsEnvOnly(t *testing.T) {
+	t.Setenv("AIHARN_AUTH_FILE", "/tmp/auth-from-env")
+
+	api := config.APIConfig{AuthFile: "original"}
+	applyAPIFlags(&api, map[string]bool{}, "", "", "", false)
+
+	if api.AuthFile != "/tmp/auth-from-env" {
+		t.Fatalf("AuthFile = %q, want env override", api.AuthFile)
+	}
+	if api.Listen != "" || api.Only {
+		t.Fatalf("unexpected override: %+v", api)
+	}
+}
+
+// newTestSessionManager builds a SessionManager backed by a scripted in-memory
+// top-level agent, avoiding real transports and model providers.
+func newTestSessionManager(t *testing.T) *app.SessionManager {
+	t.Helper()
+	cfg := &config.Config{
+		Agents:   map[string]config.AgentConfig{"main": {Model: "m", Channel: "local"}},
+		Models:   map[string]config.ModelConfig{"m": {Provider: "openai", Model: "m"}},
+		Channels: []config.ChannelConfig{{Name: "local", Type: "local"}},
+	}
+	m, err := app.NewSessionManager(context.Background(), app.SessionManagerOptions{
+		Config: cfg,
+		BuildRuntime: func(_ context.Context, _ *config.Config, _ app.Options) (*app.Runtime, error) {
+			mgr := agent.NewManager(agent.ManagerOptions{})
+			top := agent.New(agent.Spec{ID: "main", Type: "main", Client: &testllm.FakeClient{}})
+			if err := mgr.RegisterTop(top); err != nil {
+				return nil, err
+			}
+			return &app.Runtime{
+				Manager: mgr,
+				Agent:   top,
+				Gate:    approval.NewGate(approval.ModeAsk),
+				Summary: app.Summary{AgentType: "main", Model: "m", Channel: "local", Approval: "ask"},
+			}, nil
+		},
+		ID: func() string { return "s1" },
+	})
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown() })
+	return m
+}
+
+func TestStartAPIInvalidListen(t *testing.T) {
+	mgr := newTestSessionManager(t)
+	cfg := &config.Config{API: config.APIConfig{Listen: "invalid-listen"}}
+	if _, err := startAPI(cfg, mgr); err == nil {
+		t.Fatal("startAPI() error = nil, want invalid listen error")
+	}
+}
+
+func TestClearedRuntime(t *testing.T) {
+	mgr := newTestSessionManager(t)
+	res, err := clearedRuntime(context.Background(), mgr)
+	if err != nil {
+		t.Fatalf("clearedRuntime: %v", err)
+	}
+	if res.Agent == nil || res.Manager == nil || res.Gate == nil {
+		t.Fatalf("clearedRuntime returned incomplete result: %+v", res)
+	}
+}
+
+func TestStartAPISuccess(t *testing.T) {
+	mgr := newTestSessionManager(t)
+	authPath := filepath.Join(t.TempDir(), "users")
+	if err := authfile.Set(authPath, "alice", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{API: config.APIConfig{Listen: "127.0.0.1:0", AuthFile: authPath}}
+	api, err := startAPI(cfg, mgr)
+	if err != nil {
+		t.Fatalf("startAPI: %v", err)
+	}
+	if api == nil {
+		t.Fatal("api is nil")
+	}
+	_ = api.Close()
 }

@@ -96,3 +96,38 @@ func TestBuildClientConfigHostKeyAlgorithms(t *testing.T) {
 		}
 	}
 }
+
+func TestNewTransportValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    Options
+		wantErr string
+	}{
+		{name: "host required", opts: Options{}, wantErr: "host is required"},
+		{name: "port out of range", opts: Options{Host: "h", Port: 70000}, wantErr: "port must be between"},
+		{name: "user required", opts: Options{Host: "h"}, wantErr: "user is required"},
+		{name: "key and password", opts: Options{Host: "h", User: "u", KeyFile: "k", Password: "p"}, wantErr: "mutually exclusive"},
+		{name: "known_hosts required", opts: Options{Host: "h", User: "u"}, wantErr: "known_hosts is required"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewTransport(tc.opts)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("NewTransport() err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewTransportInsecureDefaults(t *testing.T) {
+	tr, err := NewTransport(Options{Host: "h", User: "u", Insecure: true})
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+	if tr.opts.Port != 22 {
+		t.Fatalf("default port = %d, want 22", tr.opts.Port)
+	}
+	if tr.opts.DefaultShell != "/bin/bash" {
+		t.Fatalf("default shell = %q, want /bin/bash", tr.opts.DefaultShell)
+	}
+}

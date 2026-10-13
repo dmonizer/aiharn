@@ -38,12 +38,30 @@ func interpolateEnv(s string, lookup func(string) (string, bool)) (string, error
 // templates are NOT interpolated here (their ${...} are runtime placeholders).
 func interpolate(cfg *Config) error {
 	lookup := func(name string) (string, bool) { return os.LookupEnv(name) }
-	if v, err := interpolateEnv(cfg.AiharnHome, lookup); err != nil {
+
+	v, err := interpolateEnv(cfg.AiharnHome, lookup)
+	if err != nil {
 		return fmt.Errorf("aiharn_home: %w", err)
-	} else {
-		cfg.AiharnHome = v
 	}
-	shortcutFields := []struct {
+	cfg.AiharnHome = v
+
+	if err := interpolateShortcuts(cfg, lookup); err != nil {
+		return err
+	}
+	if err := interpolateModels(cfg, lookup); err != nil {
+		return err
+	}
+	if err := interpolateChannels(cfg, lookup); err != nil {
+		return err
+	}
+	if err := interpolateAPI(cfg, lookup); err != nil {
+		return err
+	}
+	return nil
+}
+
+func interpolateShortcuts(cfg *Config, lookup func(string) (string, bool)) error {
+	fields := []struct {
 		name  string
 		value *string
 	}{
@@ -55,28 +73,34 @@ func interpolate(cfg *Config) error {
 		{"shrink_input", &cfg.Shortcuts.ShrinkInput},
 		{"insert_newline", &cfg.Shortcuts.InsertNewline},
 	}
-	for _, field := range shortcutFields {
+	for _, field := range fields {
 		v, err := interpolateEnv(*field.value, lookup)
 		if err != nil {
 			return fmt.Errorf("shortcuts.%s: %w", field.name, err)
 		}
 		*field.value = v
 	}
+	return nil
+}
 
+func interpolateModels(cfg *Config, lookup func(string) (string, bool)) error {
 	for name, m := range cfg.Models {
-		if v, err := interpolateEnv(m.BaseURL, lookup); err != nil {
+		v, err := interpolateEnv(m.BaseURL, lookup)
+		if err != nil {
 			return fmt.Errorf("models[%q].base_url: %w", name, err)
-		} else {
-			m.BaseURL = v
 		}
-		if v, err := interpolateEnv(m.APIKey, lookup); err != nil {
+		m.BaseURL = v
+		v, err = interpolateEnv(m.APIKey, lookup)
+		if err != nil {
 			return fmt.Errorf("models[%q].api_key: %w", name, err)
-		} else {
-			m.APIKey = v
 		}
+		m.APIKey = v
 		cfg.Models[name] = m
 	}
+	return nil
+}
 
+func interpolateChannels(cfg *Config, lookup func(string) (string, bool)) error {
 	for i := range cfg.Channels {
 		c := &cfg.Channels[i]
 		fields := []struct {
@@ -97,17 +121,22 @@ func interpolate(cfg *Config) error {
 			*f.value = v
 		}
 	}
+	return nil
+}
 
-	if v, err := interpolateEnv(cfg.API.Listen, lookup); err != nil {
+func interpolateAPI(cfg *Config, lookup func(string) (string, bool)) error {
+	v, err := interpolateEnv(cfg.API.Listen, lookup)
+	if err != nil {
 		return fmt.Errorf("api.listen: %w", err)
-	} else {
-		cfg.API.Listen = v
 	}
-	if v, err := interpolateEnv(cfg.API.AuthFile, lookup); err != nil {
+	cfg.API.Listen = v
+
+	v, err = interpolateEnv(cfg.API.AuthFile, lookup)
+	if err != nil {
 		return fmt.Errorf("api.auth_file: %w", err)
-	} else {
-		cfg.API.AuthFile = v
 	}
+	cfg.API.AuthFile = v
+
 	for i, origin := range cfg.API.AllowOrigins {
 		v, err := interpolateEnv(origin, lookup)
 		if err != nil {

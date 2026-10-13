@@ -199,70 +199,77 @@ func wrapFrameErr(err error) error {
 func readToMarker(r *bufio.Reader, marker string, out *bytes.Buffer, sink io.Writer, cap int64) (truncated bool, err error) {
 	m := []byte(marker)
 	var carry []byte
-	var written int64
-	var writeErr error
-
-	commit := func(b []byte) {
-		if len(b) == 0 {
-			return
-		}
-		if cap < 0 {
-			if out != nil {
-				_, _ = out.Write(b)
-			}
-			if sink != nil && writeErr == nil {
-				if n, err := sink.Write(b); err != nil {
-					writeErr = err
-				} else if n != len(b) {
-					writeErr = io.ErrShortWrite
-				}
-			}
-			return
-		}
-		if written >= cap {
-			truncated = true
-			return
-		}
-		take := b
-		if int64(len(b)) > cap-written {
-			truncated = true
-			take = b[:cap-written]
-		}
-		written += int64(len(take))
-		if out != nil {
-			_, _ = out.Write(take)
-		}
-		if sink != nil && writeErr == nil {
-			if n, err := sink.Write(take); err != nil {
-				writeErr = err
-			} else if n != len(take) {
-				writeErr = io.ErrShortWrite
-			}
-		}
-	}
+	w := &markerWriter{out: out, sink: sink, cap: cap}
 
 	for {
 		c, err := r.ReadByte()
 		if err != nil {
 			if len(carry) > 0 {
-				commit(carry)
+				w.commit(carry)
 			}
 			logging.Debug("shell: readToMarker error", slog.String("component", "shell"), slog.Any("err", err))
-			return truncated, err
+			return w.truncated, err
 		}
 		carry = append(carry, c)
 		if bytes.HasSuffix(carry, m) {
-			commit(carry[:len(carry)-len(m)])
-			if writeErr != nil {
-				return truncated, &StreamWriteError{Err: writeErr}
+			w.commit(carry[:len(carry)-len(m)])
+			if w.writeErr != nil {
+				return w.truncated, &StreamWriteError{Err: w.writeErr}
 			}
-			return truncated, nil
+			return w.truncated, nil
 		}
 		if len(carry) >= len(m) {
 			n := len(carry) - (len(m) - 1)
-			commit(carry[:n])
+			w.commit(carry[:n])
 			carry = append(carry[:0], carry[n:]...)
 		}
+	}
+}
+
+// markerWriter accumulates bytes committed out of a marker-bounded stream. It
+// enforces an optional cap, mirrors committed bytes to an optional sink, and
+// records the first write error and whether truncation occurred.
+type markerWriter struct {
+	out       *bytes.Buffer
+	sink      io.Writer
+	cap       int64
+	written   int64
+	truncated bool
+	writeErr  error
+}
+
+func (w *markerWriter) commit(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	if w.cap < 0 {
+		w.writeAll(b)
+		return
+	}
+	if w.written >= w.cap {
+		w.truncated = true
+		return
+	}
+	take := b
+	if int64(len(b)) > w.cap-w.written {
+		w.truncated = true
+		take = b[:w.cap-w.written]
+	}
+	w.written += int64(len(take))
+	w.writeAll(take)
+}
+
+func (w *markerWriter) writeAll(b []byte) {
+	if w.out != nil {
+		_, _ = w.out.Write(b)
+	}
+	if w.sink == nil || w.writeErr != nil {
+		return
+	}
+	if n, err := w.sink.Write(b); err != nil {
+		w.writeErr = err
+	} else if n != len(b) {
+		w.writeErr = io.ErrShortWrite
 	}
 }
 

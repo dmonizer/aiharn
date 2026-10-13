@@ -25,6 +25,9 @@ const (
 	NameCloseSubagent       = "close_subagent"
 )
 
+// spawnSubagentResultMsg is the shared debug message for spawn results.
+const spawnSubagentResultMsg = "tool: spawn_subagent result"
+
 // SubagentType describes one configured type that spawn_subagent accepts.
 type SubagentType struct {
 	Name           string
@@ -193,20 +196,20 @@ func (t *spawnSubagent) Run(ctx context.Context, args json.RawMessage) (string, 
 		Args:      string(args),
 	})
 	if err != nil {
-		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))
+		logging.Debug(spawnSubagentResultMsg, slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))
 		return "", err
 	}
 	if d == approval.DecisionDenied {
-		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.String("decision", "denied"))
+		logging.Debug(spawnSubagentResultMsg, slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.String("decision", "denied"))
 		return "denied by user", nil
 	}
 
 	id, err := t.backend.SpawnSubagent(ctx, t.callerID, p.AgentType, name, p.Prompt)
 	if err != nil {
-		logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))
+		logging.Debug(spawnSubagentResultMsg, slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.Any("err", err))
 		return "", err
 	}
-	logging.Debug("tool: spawn_subagent result", slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.String("subagent_id", id))
+	logging.Debug(spawnSubagentResultMsg, slog.String("component", "tool"), slog.String("tool", NameSpawnSubagent), slog.String("subagent_id", id))
 	return fmt.Sprintf("spawned subagent %s", id), nil
 }
 

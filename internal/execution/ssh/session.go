@@ -22,6 +22,9 @@ import (
 // escalating from SIGTERM to SIGKILL.
 const killGrace = 3 * time.Second
 
+// execFailMsg is the shared debug message for failed Exec calls.
+const execFailMsg = "ssh: Exec fail"
+
 // Session implements execution.Session over one persistent non-PTY shell.
 // It is not safe for concurrent use; the agent serializes access.
 type Session struct {
@@ -180,13 +183,13 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 
 	if s.isDead() {
 		err := fmt.Errorf("%w: session is no longer usable", execution.ErrSessionReset)
-		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
+		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
 		return execution.Result{}, err
 	}
 
 	m, err := shell.NewMarkers()
 	if err != nil {
-		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
+		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
 		return execution.Result{}, err
 	}
 	script := shell.BuildWrapperScript(m, opts.Cwd, cmd)
@@ -203,12 +206,12 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 		}
 		s.closeDead()
 		werr := fmt.Errorf("%w: write: %v", execution.ErrSessionReset, err)
-		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", werr))
+		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", werr))
 		return execution.Result{}, werr
 	case <-ctx.Done():
 		s.Close()
 		cerr := fmt.Errorf("%w: cancelled while writing command: %v", execution.ErrSessionReset, ctx.Err())
-		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
+		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
 		return execution.Result{}, cerr
 	}
 
@@ -228,7 +231,7 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	case <-ctx.Done():
 		s.Close()
 		cerr := fmt.Errorf("%w: cancelled before command started: %v", execution.ErrSessionReset, ctx.Err())
-		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
+		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
 		return execution.Result{}, cerr
 	}
 	if err != nil {
@@ -238,7 +241,7 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 			s.Close()
 		}
 		berr := fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", interpreterCommand(s.opts), err)
-		logging.Debug("ssh: Exec fail", slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", berr))
+		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", berr))
 		return execution.Result{}, berr
 	}
 
