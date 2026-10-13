@@ -269,3 +269,32 @@ func TestStreamCancel(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildRequestErrorPaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []llm.Item
+		tools   []llm.ToolDefinition
+		wantErr string
+	}{
+		{name: "invalid message role", input: []llm.Item{{Type: llm.ItemMessage, Role: "system"}}, wantErr: "invalid message role"},
+		{name: "function call without id and name", input: []llm.Item{{Type: llm.ItemFunctionCall}}, wantErr: "requires call id and name"},
+		{name: "function call output without call id", input: []llm.Item{{Type: llm.ItemFunctionCallOutput}}, wantErr: "requires call id"},
+		{name: "unsupported item type", input: []llm.Item{{Type: llm.ItemType("bogus")}}, wantErr: "unsupported item type"},
+		{name: "tool without name", input: nil, tools: []llm.ToolDefinition{{}}, wantErr: "name is required"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildRequest(llm.Request{Input: tc.input, Tools: tc.tools})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("buildRequest() err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTranslateOutputItemsErrorPaths(t *testing.T) {
+	if _, err := translateOutputItems([]any{map[string]any{"type": "function_call"}}); err == nil || !strings.Contains(err.Error(), "requires call_id and name") {
+		t.Fatalf("translateOutputItems(function_call) err = %v", err)
+	}
+}
