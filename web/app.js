@@ -2207,7 +2207,7 @@
     elements.loginDialog.close();
     refreshAfterEndpointChange();
     renderWaiting();
-    pollSessions();
+    void pollSessions();
     void poll();
   });
   document.querySelector("#open-login").addEventListener("click", () => {
