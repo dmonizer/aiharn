@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"aiharn/internal/agent"
+	"aiharn/internal/app"
+	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/sessions"
+	testllm "aiharn/internal/testutil/llm"
 )
 
 // transcriptFiles returns the files in <home>/transcripts.
@@ -192,5 +197,57 @@ func TestApplyAPIFlagsEnvOnly(t *testing.T) {
 	}
 	if api.Listen != "" || api.Only {
 		t.Fatalf("unexpected override: %+v", api)
+	}
+}
+
+// newTestSessionManager builds a SessionManager backed by a scripted in-memory
+// top-level agent, avoiding real transports and model providers.
+func newTestSessionManager(t *testing.T) *app.SessionManager {
+	t.Helper()
+	cfg := &config.Config{
+		Agents:   map[string]config.AgentConfig{"main": {Model: "m", Channel: "local"}},
+		Models:   map[string]config.ModelConfig{"m": {Provider: "openai", Model: "m"}},
+		Channels: []config.ChannelConfig{{Name: "local", Type: "local"}},
+	}
+	m, err := app.NewSessionManager(context.Background(), app.SessionManagerOptions{
+		Config: cfg,
+		BuildRuntime: func(_ context.Context, _ *config.Config, _ app.Options) (*app.Runtime, error) {
+			mgr := agent.NewManager(agent.ManagerOptions{})
+			top := agent.New(agent.Spec{ID: "main", Type: "main", Client: &testllm.FakeClient{}})
+			if err := mgr.RegisterTop(top); err != nil {
+				return nil, err
+			}
+			return &app.Runtime{
+				Manager: mgr,
+				Agent:   top,
+				Gate:    approval.NewGate(approval.ModeAsk),
+				Summary: app.Summary{AgentType: "main", Model: "m", Channel: "local", Approval: "ask"},
+			}, nil
+		},
+		ID: func() string { return "s1" },
+	})
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown() })
+	return m
+}
+
+func TestStartAPIInvalidListen(t *testing.T) {
+	mgr := newTestSessionManager(t)
+	cfg := &config.Config{API: config.APIConfig{Listen: "invalid-listen"}}
+	if _, err := startAPI(cfg, mgr); err == nil {
+		t.Fatal("startAPI() error = nil, want invalid listen error")
+	}
+}
+
+func TestClearedRuntime(t *testing.T) {
+	mgr := newTestSessionManager(t)
+	res, err := clearedRuntime(context.Background(), mgr)
+	if err != nil {
+		t.Fatalf("clearedRuntime: %v", err)
+	}
+	if res.Agent == nil || res.Manager == nil || res.Gate == nil {
+		t.Fatalf("clearedRuntime returned incomplete result: %+v", res)
 	}
 }
