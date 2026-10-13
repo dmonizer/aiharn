@@ -2211,3 +2211,16 @@ func TestArchivedSessionImport(t *testing.T) {
 		t.Fatalf("no-home import status = %d: %s", got.Code, got.Body.String())
 	}
 }
+
+func TestArchivedSessionRoutesRequireHome(t *testing.T) {
+	h := newHarness(t, "")
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		w := request(t, h.server, method, "/api/v1/sessions/archived/x.jsonl", "", nil)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s archived item = %d, want 404", method, w.Code)
+		}
+	}
+	if w := request(t, h.server, http.MethodGet, "/api/v1/sessions/archived", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET archived list = %d, want 200", w.Code)
+	}
+}

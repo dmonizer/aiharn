@@ -224,3 +224,30 @@ func TestArchivedHistoryDefaultsAgentAndValidatesKey(t *testing.T) {
 		t.Fatalf("ArchivedHistory(\"\") error = %v, want ErrArchivedNotFound", err)
 	}
 }
+
+func TestArchivedSessionDetailMalformedHeader(t *testing.T) {
+	home := t.TempDir()
+	writeArchivedFile(t, home, "broken.jsonl", `not json`, `{"type":"user","content":"x"}`)
+
+	if _, err := ArchivedSessionDetail(home, "broken.jsonl", 0); err == nil {
+		t.Fatal("ArchivedSessionDetail() error = nil, want a header parse error")
+	}
+	if _, _, err := ArchivedHistory(home, "broken.jsonl"); err == nil {
+		t.Fatal("ArchivedHistory() error = nil, want a header parse error")
+	}
+}
+
+func TestArchivedSessionDetailEmptyFile(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "transcripts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "empty.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ArchivedSessionDetail(home, "empty.jsonl", 0); err == nil {
+		t.Fatal("ArchivedSessionDetail() error = nil, want a read-header error")
+	}
+}

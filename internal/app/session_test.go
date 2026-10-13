@@ -958,3 +958,32 @@ func TestSessionManagerImportAutoNamesAndValidates(t *testing.T) {
 		t.Fatalf("Import invalid name err = %v, want ErrNameInvalid", err)
 	}
 }
+
+func TestSessionManagerImportSanitizesMetadata(t *testing.T) {
+	cfg := &config.Config{
+		Agents:   map[string]config.AgentConfig{"main": {Model: "model", Channel: "local"}},
+		Models:   map[string]config.ModelConfig{"model": {Provider: "openai", Model: "m"}},
+		Channels: []config.ChannelConfig{{Name: "local", Type: "local"}},
+	}
+	m := newTestManager(t, SessionManagerOptions{ID: counterIDs(), Config: cfg})
+
+	// Every metadata field matches the configuration, so each override branch
+	// is taken and the import still succeeds.
+	meta := sessions.TranscriptMeta{
+		ID: "archived", Name: "Archived", Model: "model",
+		AgentType: "main", Channel: "local", Approval: config.ApprovalModeAllowAll,
+	}
+	h, err := m.Import(context.Background(), "Imported", nil, meta)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if h.Name() != "Imported" {
+		t.Fatalf("name = %q, want Imported", h.Name())
+	}
+
+	// Stale metadata fields fall back to defaults without failing the build.
+	stale := sessions.TranscriptMeta{AgentType: "ghost", Model: "ghost", Channel: "ghost", Approval: "weird"}
+	if _, err := m.Import(context.Background(), "Fallback", nil, stale); err != nil {
+		t.Fatalf("Import fallback: %v", err)
+	}
+}
