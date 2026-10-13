@@ -32,6 +32,12 @@ const (
 	StateErrored
 )
 
+// Shared debug log messages (avoid repeated literals).
+const (
+	turnEndMsg         = "agent: turn end"
+	collectTerminalMsg = "agent: collect terminal"
+)
+
 func (s State) String() string {
 	switch s {
 	case StateStarting:
@@ -473,7 +479,7 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 	}
 	start := time.Now()
 	fail := func(err error) error {
-		logging.Debug("agent: turn end",
+		logging.Debug(turnEndMsg,
 			slog.String("component", "agent"),
 			slog.String("agent_id", a.id),
 			slog.String("agent_type", a.typ),
@@ -493,7 +499,7 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 	}
 	if a.state == StateClosed {
 		a.mu.Unlock()
-		logging.Debug("agent: turn end",
+		logging.Debug(turnEndMsg,
 			slog.String("component", "agent"),
 			slog.String("agent_id", a.id),
 			slog.String("agent_type", a.typ),
@@ -609,7 +615,7 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 		if len(calls) == 0 {
 			a.trimHistory()
 			a.setState(StateIdle)
-			logging.Debug("agent: turn end",
+			logging.Debug(turnEndMsg,
 				slog.String("component", "agent"),
 				slog.String("agent_id", a.id),
 				slog.String("agent_type", a.typ),
@@ -935,7 +941,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event, budget *re
 			a.emit(Event{Type: EventText, Text: ev.Text})
 		case llm.EventCompleted:
 			if ev.FinishReason != "" && ev.FinishReason != "stop" {
-				logging.Debug("agent: collect terminal",
+				logging.Debug(collectTerminalMsg,
 					slog.String("component", "agent"),
 					slog.String("agent_id", a.id),
 					slog.String("reason", "completed"),
@@ -945,7 +951,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event, budget *re
 				return nil, partial.String(), fmt.Errorf("llm response incomplete: %s", ev.FinishReason)
 			}
 			output = ev.Items
-			logging.Debug("agent: collect terminal",
+			logging.Debug(collectTerminalMsg,
 				slog.String("component", "agent"),
 				slog.String("agent_id", a.id),
 				slog.String("reason", "completed"),
@@ -954,7 +960,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event, budget *re
 				slog.Int("items", len(ev.Items)),
 			)
 		case llm.EventFailed:
-			logging.Debug("agent: collect terminal",
+			logging.Debug(collectTerminalMsg,
 				slog.String("component", "agent"),
 				slog.String("agent_id", a.id),
 				slog.String("reason", "failed"),
@@ -966,7 +972,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event, budget *re
 	}
 	if output == nil {
 		if err := ctx.Err(); err != nil {
-			logging.Debug("agent: collect terminal",
+			logging.Debug(collectTerminalMsg,
 				slog.String("component", "agent"),
 				slog.String("agent_id", a.id),
 				slog.String("reason", "context"),
@@ -975,7 +981,7 @@ func (a *Agent) collect(ctx context.Context, stream <-chan llm.Event, budget *re
 			)
 			return nil, partial.String(), err
 		}
-		logging.Debug("agent: collect terminal",
+		logging.Debug(collectTerminalMsg,
 			slog.String("component", "agent"),
 			slog.String("agent_id", a.id),
 			slog.String("reason", "no_terminal"),

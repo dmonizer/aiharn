@@ -238,7 +238,9 @@ func transcriptFactory(aiharnHome, logPath string, logOverridden bool) (func(str
 	if logOverridden && logPath == "" {
 		// A nil factory leaves Options.NewTranscript unset, which means "no
 		// transcript" for every session.
-		return nil, func() {}, nil
+		return nil, func() {
+			// No-op: no transcript is created when logging is fully disabled.
+		}, nil
 	}
 	if logOverridden {
 		// One shared recorder for every session, created on first use.
@@ -261,12 +263,14 @@ func transcriptFactory(aiharnHome, logPath string, logOverridden bool) (func(str
 		}, nil
 	}
 	return func(string, string) (sessions.Transcript, error) {
-		rec, _, err := recorder.NewSessionFile(aiharnHome)
-		if err != nil {
-			return nil, err
-		}
-		return rec, nil
-	}, func() {}, nil
+			rec, _, err := recorder.NewSessionFile(aiharnHome)
+			if err != nil {
+				return nil, err
+			}
+			return rec, nil
+		}, func() {
+			// No-op: per-session transcripts close themselves on their own Close.
+		}, nil
 }
 
 // sessionLimit reports the session bound the API will enforce.

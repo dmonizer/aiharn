@@ -21,6 +21,9 @@ type Executor interface {
 
 var _ Executor = (execution.Session)(nil)
 
+// execCommandResultMsg is the shared debug message for command completion.
+const execCommandResultMsg = "tool: execute_command result"
+
 // ExecuteCommand returns a tool that runs a shell command on the agent's
 // executor, gated by the approval Gate. maxOutput caps retained stdout+stderr
 // (0 = unlimited), and defaultCwd applies when the model omits cwd. The timeout
@@ -80,7 +83,7 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		Args:      string(args),
 	})
 	if err != nil {
-		logging.Debug("tool: execute_command result",
+		logging.Debug(execCommandResultMsg,
 			slog.String("component", "tool"),
 			slog.String("tool", NameExecuteCommand),
 			slog.String("command", p.Command),
@@ -108,7 +111,9 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		cwd = t.defaultCwd
 	}
 	execCtx := ctx
-	cancel := func() {}
+	cancel := func() {
+		// No-op: no timeout was configured, so there is nothing to cancel.
+	}
 	if t.timeout > 0 {
 		execCtx, cancel = context.WithTimeout(ctx, t.timeout)
 	}
@@ -118,7 +123,7 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		MaxOutputBytes: t.maxOutput,
 	})
 	if err != nil {
-		logging.Debug("tool: execute_command result",
+		logging.Debug(execCommandResultMsg,
 			slog.String("component", "tool"),
 			slog.String("tool", NameExecuteCommand),
 			slog.String("command", p.Command),
@@ -129,7 +134,7 @@ func (t *execCommand) Run(ctx context.Context, args json.RawMessage) (string, er
 		)
 		return "", err
 	}
-	logging.Debug("tool: execute_command result",
+	logging.Debug(execCommandResultMsg,
 		slog.String("component", "tool"),
 		slog.String("tool", NameExecuteCommand),
 		slog.String("command", p.Command),

@@ -46,7 +46,11 @@ const (
 	// errArchivedNotFound is the shared not-found message for archive routes.
 	errArchivedNotFound = "archived session not found"
 	// archiveExt is the file extension of archived transcript files.
-	archiveExt = ".jsonl"
+	archiveExt            = ".jsonl"
+	errSessionNotFound    = "session not found"
+	errAgentNotFound      = "agent not found"
+	errSessionStoreClosed = "session store is closed"
+	errSessionClosed      = "session is closed"
 )
 
 // Config configures one API server. Sessions is required and owns every
@@ -434,7 +438,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, ok := s.resolve(r.URL.Query().Get("session_id"))
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	agents, agentsErr := s.agentSummaries(r.Context(), handle)
@@ -450,12 +454,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 		manager := handle.Manager()
 		if !found || manager == nil {
-			writeError(w, http.StatusNotFound, "agent not found")
+			writeError(w, http.StatusNotFound, errAgentNotFound)
 			return
 		}
 		sub := manager.Agent(selectedID)
 		if sub == nil {
-			writeError(w, http.StatusNotFound, "agent not found")
+			writeError(w, http.StatusNotFound, errAgentNotFound)
 			return
 		}
 		selected = sub
@@ -538,7 +542,7 @@ func (s *Server) handleToolLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	var a interface{ DecideToolLimit(string, string) error }
@@ -548,7 +552,7 @@ func (s *Server) handleToolLimit(w http.ResponseWriter, r *http.Request) {
 		a = handle.Manager().Agent(body.AgentID)
 	}
 	if a == nil {
-		writeError(w, http.StatusNotFound, "agent not found")
+		writeError(w, http.StatusNotFound, errAgentNotFound)
 		return
 	}
 	if err := a.DecideToolLimit(id, body.Decision); err != nil {
@@ -597,7 +601,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, sessions.ErrLimitReached):
 		writeError(w, http.StatusConflict, "maximum number of sessions reached")
 	case errors.Is(err, sessions.ErrClosed):
-		writeError(w, http.StatusConflict, "session store is closed")
+		writeError(w, http.StatusConflict, errSessionStoreClosed)
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "cannot create session")
 	default:
@@ -610,14 +614,14 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSessionItem(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, sessionItemPrefix)
 	if id == "" || strings.Contains(id, "/") {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
 		handle, ok := s.resolve(id)
 		if !ok {
-			writeError(w, http.StatusNotFound, "session not found")
+			writeError(w, http.StatusNotFound, errSessionNotFound)
 			return
 		}
 		writeJSON(w, http.StatusOK, s.describe(r.Context(), handle, handle.ID() == s.defaultSessionID()))
@@ -633,9 +637,9 @@ func (s *Server) handleSessionItem(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, sessions.ErrNameInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, sessions.ErrNotFound):
-			writeError(w, http.StatusNotFound, "session not found")
+			writeError(w, http.StatusNotFound, errSessionNotFound)
 		case errors.Is(err, sessions.ErrClosed):
-			writeError(w, http.StatusConflict, "session store is closed")
+			writeError(w, http.StatusConflict, errSessionStoreClosed)
 		case err != nil:
 			writeError(w, http.StatusInternalServerError, "cannot rename session")
 		default:
@@ -646,7 +650,7 @@ func (s *Server) handleSessionItem(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, sessions.ErrDefault):
 			writeError(w, http.StatusConflict, "the default session cannot be closed")
 		case errors.Is(err, sessions.ErrNotFound):
-			writeError(w, http.StatusNotFound, "session not found")
+			writeError(w, http.StatusNotFound, errSessionNotFound)
 		case err != nil:
 			writeError(w, http.StatusInternalServerError, "cannot close session")
 		default:
@@ -680,7 +684,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	// A subagent message goes to that agent's inbox, so it never occupies the
@@ -691,11 +695,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	switch err := handle.Submit(r.Context(), body.AgentID, body.Content); {
 	case errors.Is(err, sessions.ErrAgentNotFound):
-		writeError(w, http.StatusNotFound, "agent not found")
+		writeError(w, http.StatusNotFound, errAgentNotFound)
 	case errors.Is(err, sessions.ErrNotFound):
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 	case errors.Is(err, sessions.ErrClosed):
-		writeError(w, http.StatusConflict, "session is closed")
+		writeError(w, http.StatusConflict, errSessionClosed)
 	case errors.Is(err, sessions.ErrQueueFull):
 		writeError(w, http.StatusConflict, "message queue is full")
 	case err != nil:
@@ -728,7 +732,7 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	// session; the decision must be applied to the addressed session's gate.
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	gate := handle.Gate()
@@ -781,7 +785,7 @@ func (s *Server) handleSessionApproval(w http.ResponseWriter, r *http.Request) {
 	// Like handleMessages, an empty session_id addresses the default session.
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	gate := handle.Gate()
@@ -804,12 +808,12 @@ func (s *Server) handleSessionLoop(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	if err := handle.Agent().SetMainLoopActive(body.Active); err != nil {
 		if errors.Is(err, agent.ErrAgentClosed) {
-			writeError(w, http.StatusConflict, "session is closed")
+			writeError(w, http.StatusConflict, errSessionClosed)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "cannot change main loop: "+err.Error())
@@ -837,7 +841,7 @@ func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	if err := handle.SetChannel(r.Context(), body.Channel); err != nil {
@@ -845,7 +849,7 @@ func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, sessions.ErrChannelNotFound):
 			writeError(w, http.StatusNotFound, "channel not found")
 		case errors.Is(err, sessions.ErrClosed):
-			writeError(w, http.StatusConflict, "session is closed")
+			writeError(w, http.StatusConflict, errSessionClosed)
 		default:
 			writeError(w, http.StatusBadGateway, "cannot change channel: "+err.Error())
 		}
@@ -871,9 +875,9 @@ func (s *Server) handleSessionClear(w http.ResponseWriter, r *http.Request) {
 	handle, err := s.cfg.Sessions.Clear(r.Context(), body.SessionID)
 	switch {
 	case errors.Is(err, sessions.ErrNotFound):
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 	case errors.Is(err, sessions.ErrClosed):
-		writeError(w, http.StatusConflict, "session store is closed")
+		writeError(w, http.StatusConflict, errSessionStoreClosed)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The client is gone; there is nothing left to write.
 		return
@@ -900,14 +904,14 @@ func (s *Server) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, ok := s.resolve(body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "session not found")
+		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	affected, err := handle.Cancel(r.Context())
 	if err != nil {
 		switch {
 		case errors.Is(err, sessions.ErrClosed):
-			writeError(w, http.StatusConflict, "session is closed")
+			writeError(w, http.StatusConflict, errSessionClosed)
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			// The client is gone; there is nothing left to write.
 			return
@@ -1360,7 +1364,7 @@ func (s *Server) importArchivedSessionItem(w http.ResponseWriter, r *http.Reques
 	case errors.Is(err, sessions.ErrLimitReached):
 		writeError(w, http.StatusConflict, "maximum number of sessions reached")
 	case errors.Is(err, sessions.ErrClosed):
-		writeError(w, http.StatusConflict, "session store is closed")
+		writeError(w, http.StatusConflict, errSessionStoreClosed)
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "cannot import session")
 	default:

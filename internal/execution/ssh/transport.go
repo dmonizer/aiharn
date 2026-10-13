@@ -25,6 +25,12 @@ import (
 	"aiharn/internal/logging"
 )
 
+// Shared debug log messages (avoid repeated literals).
+const (
+	acquireClientMsg = "ssh: acquireClient"
+	dialFailMsg      = "ssh: dial fail"
+)
+
 // Options are the channel settings needed to dial and authenticate an SSH
 // transport. It deliberately duplicates config.ChannelConfig rather than
 // importing it, keeping execution independent of the config package.
@@ -191,7 +197,7 @@ func (t *Transport) acquireClient(ctx context.Context) (*ssh.Client, bool, error
 		if t.shared == nil {
 			c, err := dial(ctx, t.opts)
 			if err != nil {
-				logging.Debug("ssh: acquireClient",
+				logging.Debug(acquireClientMsg,
 					slog.String("component", "ssh"),
 					slog.Bool("shared", true),
 					slog.Bool("reused", false),
@@ -201,7 +207,7 @@ func (t *Transport) acquireClient(ctx context.Context) (*ssh.Client, bool, error
 			}
 			t.shared = c
 		}
-		logging.Debug("ssh: acquireClient",
+		logging.Debug(acquireClientMsg,
 			slog.String("component", "ssh"),
 			slog.Bool("shared", true),
 			slog.Bool("reused", reused),
@@ -210,14 +216,14 @@ func (t *Transport) acquireClient(ctx context.Context) (*ssh.Client, bool, error
 	}
 	c, err := dial(ctx, t.opts)
 	if err != nil {
-		logging.Debug("ssh: acquireClient",
+		logging.Debug(acquireClientMsg,
 			slog.String("component", "ssh"),
 			slog.Bool("shared", false),
 			slog.Any("err", err),
 		)
 		return nil, false, err
 	}
-	logging.Debug("ssh: acquireClient",
+	logging.Debug(acquireClientMsg,
 		slog.String("component", "ssh"),
 		slog.Bool("shared", false),
 	)
@@ -243,13 +249,13 @@ func dial(ctx context.Context, opts Options) (*ssh.Client, error) {
 	logging.Debug("ssh: dial start", slog.String("component", "ssh"), slog.String("addr", addr))
 	cfg, release, err := buildClientConfigContext(ctx, opts)
 	if err != nil {
-		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
+		logging.Debug(dialFailMsg, slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, err
 	}
 	defer release()
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
-		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
+		logging.Debug(dialFailMsg, slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, sanitizeSSHError(err, opts)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
@@ -267,12 +273,12 @@ func dial(ctx context.Context, opts Options) (*ssh.Client, error) {
 	close(done)
 	if err != nil {
 		raw.Close()
-		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
+		logging.Debug(dialFailMsg, slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, sanitizeSSHError(err, opts)
 	}
 	if err := ctx.Err(); err != nil {
 		conn.Close()
-		logging.Debug("ssh: dial fail", slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
+		logging.Debug(dialFailMsg, slog.String("component", "ssh"), slog.String("addr", addr), slog.Any("err", err))
 		return nil, err
 	}
 	_ = raw.SetDeadline(time.Time{})
@@ -308,7 +314,9 @@ var preferredHostKeyAlgorithms = []string{
 // returned release func closes any agent connection and must be called after
 // the handshake completes.
 func buildClientConfigContext(ctx context.Context, opts Options) (*ssh.ClientConfig, func(), error) {
-	release := func() {}
+	release := func() {
+		// No-op until an SSH-agent connection is established below.
+	}
 	var auth ssh.AuthMethod
 	authMethod := "ssh-agent"
 	switch {
@@ -382,23 +390,28 @@ func buildClientConfigContext(ctx context.Context, opts Options) (*ssh.ClientCon
 // agentAuth returns an auth method backed by the SSH agent at $SSH_AUTH_SOCK,
 // plus a release func that closes the agent connection.
 func agentAuthContext(ctx context.Context) (ssh.AuthMethod, func(), error) {
+	// noRelease is returned on every error path: no agent connection was
+	// opened, so callers can still call the returned release func safely.
+	noRelease := func() {
+		// No-op: no agent connection was opened on these error paths.
+	}
 	sock := os.Getenv("SSH_AUTH_SOCK")
 	if sock == "" {
-		return nil, func() {}, errors.New("ssh: no key_file, password, or SSH agent (SSH_AUTH_SOCK unset)")
+		return nil, noRelease, errors.New("ssh: no key_file, password, or SSH agent (SSH_AUTH_SOCK unset)")
 	}
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	if err != nil {
-		return nil, func() {}, fmt.Errorf("ssh: connect to SSH agent %s: %w", sock, err)
+		return nil, noRelease, fmt.Errorf("ssh: connect to SSH agent %s: %w", sock, err)
 	}
 	client := agent.NewClient(conn)
 	signers, err := client.Signers()
 	if err != nil {
 		conn.Close()
-		return nil, func() {}, fmt.Errorf("ssh: list SSH agent keys: %w", err)
+		return nil, noRelease, fmt.Errorf("ssh: list SSH agent keys: %w", err)
 	}
 	if len(signers) == 0 {
 		conn.Close()
-		return nil, func() {}, errors.New("ssh: SSH agent has no keys")
+		return nil, noRelease, errors.New("ssh: SSH agent has no keys")
 	}
 	return ssh.PublicKeys(signers...), func() { conn.Close() }, nil
 }

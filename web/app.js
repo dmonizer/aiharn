@@ -574,7 +574,7 @@
         close.setAttribute("aria-label", "Close session " + (session.name || session.id));
         close.addEventListener("click", (event) => {
           event.stopPropagation();
-          closeSession(session.id);
+          void closeSession(session.id);
         });
         actions.append(close);
       }
@@ -637,7 +637,7 @@
     elements.message.disabled = true;
     resetSendButton();
     elements.transcript.replaceChildren(emptyState("Loading agent…", id));
-    poll();
+    void poll();
     setMenuOpen(false);
   }
 
@@ -656,7 +656,7 @@
     clearTimeout(state.timer);
     renderSessionList();
     renderWaiting();
-    poll();
+    void poll();
     setMenuOpen(false);
   }
 
@@ -676,7 +676,7 @@
     }
     state.fingerprint = "";
     await pollSessions();
-    poll(true);
+    void poll(true);
   }
 
   function showConnection(message) {
@@ -964,7 +964,7 @@
 
       option.addEventListener("click", () => {
         closeChannelMenu();
-        selectChannel(channel.name);
+        void selectChannel(channel.name);
       });
       menu.append(option);
     }
@@ -1591,7 +1591,7 @@
             await apiCall("/tool-limits/" + encodeURIComponent(limit.id), {
               method: "POST", body: JSON.stringify(payload)
             });
-            poll(true);
+            void poll(true);
           } catch (error) {
             showConnection(error.message || "Could not resolve tool-call limit.");
             for (const sibling of actions.children) sibling.disabled = false;
@@ -1652,7 +1652,7 @@
         state.fingerprint = "";
         state.selectedAgents.delete(state.sessionId);
         renderWaiting();
-        poll(true);
+        void poll(true);
       }
     } catch (error) {
       if (error.name === "AbortError") return;
@@ -2173,14 +2173,14 @@
       renderWaiting();
       const hasCredentials = await loadCredentials();
       if (hasCredentials) {
-        pollSessions();
-        poll();
+        void pollSessions();
+        void poll();
       } else {
         openLoginDialog();
       }
     } else {
       refreshAfterEndpointChange();
-      poll(true);
+      void poll(true);
     }
   });
   elements.settingsUrl.addEventListener("input", () => showDialogError(elements.settingsError, ""));
@@ -2272,7 +2272,7 @@
   elements.message.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      sendMessage();
+      void sendMessage();
     }
   });
 

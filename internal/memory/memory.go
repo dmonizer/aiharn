@@ -25,6 +25,9 @@ const (
 	ScopeGlobal Scope = "global"
 )
 
+// indexFilename is the single file name used for every memory store.
+const indexFilename = "index.md"
+
 // ParseScope converts a tool argument to a Scope.
 func ParseScope(s string) (Scope, error) {
 	switch Scope(s) {
@@ -281,12 +284,12 @@ func (m *Manager) load(scope Scope, dir string) error {
 	if dir == "" {
 		return nil
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "index.md"))
+	data, err := os.ReadFile(filepath.Join(dir, indexFilename))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("memory: read %s: %w", filepath.Join(dir, "index.md"), err)
+		return fmt.Errorf("memory: read %s: %w", filepath.Join(dir, indexFilename), err)
 	}
 	src := m.global
 	if scope == ScopeLocal {
@@ -335,7 +338,7 @@ func (m *Manager) writeIndex(scope Scope) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("memory: create memory dir %s: %w", dir, err)
 	}
-	if err := writeFileAtomic(filepath.Join(dir, "index.md"), []byte(b.String()), 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, indexFilename), []byte(b.String()), 0o600); err != nil {
 		return fmt.Errorf("memory: write index: %w", err)
 	}
 	return nil

@@ -9,6 +9,9 @@ case "$port" in
 		echo "usage: $0 [port]" >&2
 		exit 2
 		;;
+	*)
+		# Numeric port: the range check below rejects out-of-range values.
+		;;
 esac
 
 if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
