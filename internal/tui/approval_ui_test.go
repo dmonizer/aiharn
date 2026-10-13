@@ -72,3 +72,23 @@ func TestApprovalPreviewLimitsAndUnicode(t *testing.T) {
 		}
 	}
 }
+
+func TestApprovalPaddingClamps(t *testing.T) {
+	if got := approvalPadding(5, "longer"); got != 0 {
+		t.Fatalf("approvalPadding(negative) = %d, want 0", got)
+	}
+	if got := approvalPadding(10, "abc"); got != 7 {
+		t.Fatalf("approvalPadding = %d, want 7", got)
+	}
+}
+
+func TestApprovalPopoverHeaderSmallWidth(t *testing.T) {
+	m := newTestModel(t)
+	top, hit := m.approvalPopoverHeader(20, 0, 0)
+	if !strings.Contains(top, "cmd") {
+		t.Fatalf("small header label = %q", top)
+	}
+	if hit.width != 3 {
+		t.Fatalf("hit width = %d", hit.width)
+	}
+}
