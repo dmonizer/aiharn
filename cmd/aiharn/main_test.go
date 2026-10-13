@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"aiharn/internal/config"
 	"aiharn/internal/sessions"
 )
 
@@ -123,5 +124,73 @@ func TestSessionLimit(t *testing.T) {
 		if got := sessionLimit(tc.configured); got != tc.want {
 			t.Fatalf("sessionLimit(%d) = %d, want %d", tc.configured, got, tc.want)
 		}
+	}
+}
+
+func TestEnsureConfigSpecified(t *testing.T) {
+	path := "already-set"
+	code, done := ensureConfig(map[string]bool{"config": true}, &path)
+	if done || code != 0 {
+		t.Fatalf("ensureConfig(specified) = (%d, %v), want (0, false)", code, done)
+	}
+	if path != "already-set" {
+		t.Fatalf("config path changed to %q", path)
+	}
+}
+
+func TestEnsureConfigCreatesDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	var path string
+	code, done := ensureConfig(map[string]bool{}, &path)
+	if done || code != 0 {
+		t.Fatalf("ensureConfig() = (%d, %v), want (0, false)", code, done)
+	}
+	if path == "" {
+		t.Fatal("config path was not resolved")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("default config was not created: %v", err)
+	}
+}
+
+func TestApplyAPIFlags(t *testing.T) {
+	t.Setenv("AIHARN_AUTH_FILE", "/tmp/auth-from-env")
+
+	api := config.APIConfig{AuthFile: "original", Listen: "original", AllowOrigins: []string{"a"}}
+	applyAPIFlags(&api, map[string]bool{
+		"api-listen":       true,
+		"api-auth-file":    true,
+		"api-allow-origin": true,
+		"api-only":         true,
+	}, "127.0.0.1:7331", "/tmp/auth-from-flag", "https://a.example,https://b.example", true)
+
+	if api.Listen != "127.0.0.1:7331" {
+		t.Fatalf("Listen = %q", api.Listen)
+	}
+	if api.AuthFile != "/tmp/auth-from-flag" {
+		t.Fatalf("AuthFile = %q", api.AuthFile)
+	}
+	if api.Only != true {
+		t.Fatalf("Only = %v", api.Only)
+	}
+	want := []string{"https://a.example", "https://b.example"}
+	if len(api.AllowOrigins) != len(want) || api.AllowOrigins[0] != want[0] || api.AllowOrigins[1] != want[1] {
+		t.Fatalf("AllowOrigins = %v", api.AllowOrigins)
+	}
+}
+
+func TestApplyAPIFlagsEnvOnly(t *testing.T) {
+	t.Setenv("AIHARN_AUTH_FILE", "/tmp/auth-from-env")
+
+	api := config.APIConfig{AuthFile: "original"}
+	applyAPIFlags(&api, map[string]bool{}, "", "", "", false)
+
+	if api.AuthFile != "/tmp/auth-from-env" {
+		t.Fatalf("AuthFile = %q, want env override", api.AuthFile)
+	}
+	if api.Listen != "" || api.Only {
+		t.Fatalf("unexpected override: %+v", api)
 	}
 }

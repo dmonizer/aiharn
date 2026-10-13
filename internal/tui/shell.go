@@ -391,18 +391,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		m.approvalPopover = false
 	}
 	if m.approvalPopover {
-		m.hoverX, m.hoverY = msg.X, msg.Y
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			m.scrollApproval(-3)
-		case tea.MouseButtonWheelDown:
-			m.scrollApproval(3)
-		case tea.MouseButtonLeft:
-			if msg.Action == tea.MouseActionPress && m.approvalCloseHit.contains(msg.X, msg.Y) {
-				m.approvalPopover = false
-			}
-		}
-		return nil
+		return m.handleApprovalPopoverMouse(msg)
 	}
 	if msg.Action == tea.MouseActionMotion {
 		m.hoverX, m.hoverY = msg.X, msg.Y
@@ -413,50 +402,71 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
-		if m.wheelOverApprovalPrompt(msg.Y) {
-			return nil
-		}
-		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
-			m.scrollInput(-3)
-			return nil
-		}
-		if m.wheelOverShellPane(msg.Y) {
-			m.scrollShell(-3)
-			return nil
-		}
-		m.scrollChat(-3)
+		return m.scrollWheel(msg, -3)
 	case tea.MouseButtonWheelDown:
-		if m.wheelOverApprovalPrompt(msg.Y) {
-			return nil
-		}
-		if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
-			m.scrollInput(3)
-			return nil
-		}
-		if m.wheelOverShellPane(msg.Y) {
-			m.scrollShell(3)
-			return nil
-		}
-		m.scrollChat(3)
+		return m.scrollWheel(msg, 3)
 	case tea.MouseButtonLeft:
-		if msg.Action == tea.MouseActionPress {
-			if m.pending != nil && m.approvalLinkHit.contains(msg.X, msg.Y) {
-				m.approvalPopover = true
-				m.approvalScroll = 0
-				return nil
-			}
-			if m.clickShellScrollbar(msg.X, msg.Y) {
-				return nil
-			}
-			if handled, cmd := m.clickRoster(msg.X, msg.Y); handled {
-				return cmd
-			}
-			if m.clickShellButton(msg.X, msg.Y) {
-				return nil
-			}
-			m.clickTranscript(msg.X, msg.Y)
+		return m.handleLeftClick(msg)
+	}
+	return nil
+}
+
+// handleApprovalPopoverMouse routes mouse input while the approval popover is
+// open: wheel events scroll it and a left press on [x] closes it.
+func (m *Model) handleApprovalPopoverMouse(msg tea.MouseMsg) tea.Cmd {
+	m.hoverX, m.hoverY = msg.X, msg.Y
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.scrollApproval(-3)
+	case tea.MouseButtonWheelDown:
+		m.scrollApproval(3)
+	case tea.MouseButtonLeft:
+		if msg.Action == tea.MouseActionPress && m.approvalCloseHit.contains(msg.X, msg.Y) {
+			m.approvalPopover = false
 		}
 	}
+	return nil
+}
+
+// scrollWheel applies a wheel delta to the region under the cursor: approval
+// prompt, input, shell pane, or chat.
+func (m *Model) scrollWheel(msg tea.MouseMsg, delta int) tea.Cmd {
+	if m.wheelOverApprovalPrompt(msg.Y) {
+		return nil
+	}
+	if m.pending == nil && m.shellMode != shellMaximized && msg.Y >= m.rows() && msg.Y < m.height-1 {
+		m.scrollInput(delta)
+		return nil
+	}
+	if m.wheelOverShellPane(msg.Y) {
+		m.scrollShell(delta)
+		return nil
+	}
+	m.scrollChat(delta)
+	return nil
+}
+
+// handleLeftClick routes a left-button press to the popover link, scrollbar,
+// roster, shell buttons, or transcript, in that order.
+func (m *Model) handleLeftClick(msg tea.MouseMsg) tea.Cmd {
+	if msg.Action != tea.MouseActionPress {
+		return nil
+	}
+	if m.pending != nil && m.approvalLinkHit.contains(msg.X, msg.Y) {
+		m.approvalPopover = true
+		m.approvalScroll = 0
+		return nil
+	}
+	if m.clickShellScrollbar(msg.X, msg.Y) {
+		return nil
+	}
+	if handled, cmd := m.clickRoster(msg.X, msg.Y); handled {
+		return cmd
+	}
+	if m.clickShellButton(msg.X, msg.Y) {
+		return nil
+	}
+	m.clickTranscript(msg.X, msg.Y)
 	return nil
 }
 
