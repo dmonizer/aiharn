@@ -19,11 +19,11 @@ func Emit(ctx context.Context, out chan<- Event, e Event) bool {
 // StartStream runs collect in a goroutine that closes out and calls closeFn
 // (typically the SDK stream's Close) when collect returns. It returns the
 // buffered event channel.
-func StartStream(ctx context.Context, closeFn func(), collect func(context.Context, chan<- Event)) <-chan Event {
+func StartStream(ctx context.Context, closeFn func() error, collect func(context.Context, chan<- Event)) <-chan Event {
 	out := make(chan Event, StreamBuffer)
 	go func() {
 		defer close(out)
-		defer closeFn()
+		defer func() { _ = closeFn() }()
 		collect(ctx, out)
 	}()
 	return out

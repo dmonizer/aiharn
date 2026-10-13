@@ -137,7 +137,14 @@ func newSSHSession(ctx context.Context, client *ssh.Client) (*ssh.Session, error
 	}
 }
 
+// Stdin returns the persistent shell's stdin stream.
+func (s *Session) Stdin() io.Writer { return s.stdin }
+
+// Reader returns the persistent shell's framed stdout stream.
+func (s *Session) Reader() *bufio.Reader { return s.reader }
+
 func (s *Session) markDead() {
+
 	s.deadMu.Lock()
 	already := s.dead
 	s.dead = true
@@ -154,7 +161,7 @@ func (s *Session) markClosed() {
 	s.deadMu.Unlock()
 }
 
-func (s *Session) isDead() bool {
+func (s *Session) IsDead() bool {
 	s.deadMu.Lock()
 	defer s.deadMu.Unlock()
 	return s.dead
@@ -165,14 +172,8 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return shell.Exec(ctx, cmd, opts, shell.ExecHooks{
+	return shell.Exec(ctx, cmd, opts, s, shell.ExecConfig{
 		Component: "ssh",
-		Stdin:     s.stdin,
-		Reader:    s.reader,
-		IsDead:    s.isDead,
-		OnReset:   s.closeDead,
-		OnCancel:  func() { _ = s.Close() },
-		Signal:    s.signal,
 		ShellName: func() string { return interpreterCommand(s.opts) },
 		BeforeOutputErr: func(name string, err error) error {
 			return fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", name, err)
@@ -206,7 +207,7 @@ func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, 
 
 // signal sends sig to the command's remote process group via a throwaway
 // channel on the same client connection. It is best-effort and bounded.
-func (s *Session) signal(pid int, sig string) {
+func (s *Session) Signal(pid int, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	sess, err := newSSHSession(ctx, s.client)
@@ -217,7 +218,7 @@ func (s *Session) signal(pid int, sig string) {
 	go func() {
 		defer close(done)
 		defer sess.Close()
-		_ = sess.Run(fmt.Sprintf("kill -%s -- -%d 2>/dev/null || true", sig, pid))
+		_ = sess.Run(fmt.Sprintf("kill -%s -- -%d 2>/dev/null || true", name, pid))
 	}()
 	select {
 	case <-done:
@@ -243,7 +244,7 @@ func (s *Session) Close() error {
 	return nil
 }
 
-func (s *Session) closeDead() {
+func (s *Session) Reset() {
 	logging.Debug("ssh: closeDead", slog.String("component", "ssh"))
 	s.markDead()
 	_ = s.Close()

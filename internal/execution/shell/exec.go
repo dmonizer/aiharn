@@ -17,61 +17,70 @@ import (
 // escalating from SIGTERM to SIGKILL.
 const killGrace = 3 * time.Second
 
-// ExecHooks carries the transport-specific operations the shared Exec runner
-// needs. Component names the transport in debug logs ("local" or "ssh").
-type ExecHooks struct {
-	Component string
-	Stdin     io.Writer
-	Reader    *bufio.Reader
-
-	// IsDead reports whether the session is no longer usable.
-	IsDead func() bool
-	// OnReset marks the session dead and closes it after a stream reset.
-	OnReset func()
-	// OnCancel closes the session after cancellation or a non-reset failure.
-	OnCancel func()
+// Stream is the persistent-shell stream a transport owns. The shared Exec
+// runner reads/writes the stream and drives the transport's lifecycle and
+// signaling through these methods.
+type Stream interface {
+	Stdin() io.Writer
+	Reader() *bufio.Reader
+	IsDead() bool
+	// Reset marks the session dead and closes it after a stream reset.
+	Reset()
+	// Close terminates the session (cancellation / non-reset failures).
+	Close() error
 	// Signal sends the named signal ("TERM" or "KILL") to the command's
 	// process group. Best-effort.
-	Signal func(pid int, name string)
-	// ShellName returns the interpreter name used in error messages.
-	ShellName func() string
-	// BeforeOutputErr builds the error reported when the shell dies before
-	// producing framed output.
-	BeforeOutputErr func(shellName string, err error) error
-	// LogFinish records the outcome of a completed Exec.
-	LogFinish func(start time.Time, pid int, res execution.Result, err error)
+	Signal(pid int, name string)
 }
 
-// Exec runs one framed command over the persistent shell stream described by h.
-// The caller must serialize concurrent Exec calls (each transport's Session
-// holds a mutex). This is the shared implementation used by the local and ssh
-// transports; their only differences are the process signaling, interpreter
-// naming, and debug logging supplied through h.
-func Exec(ctx context.Context, cmd string, opts execution.ExecOptions, h ExecHooks) (execution.Result, error) {
+// ExecConfig carries the transport-specific details the shared Exec runner
+// needs beyond the stream itself: the debug log component name, the interpreter
+// name used in errors, and the per-transport error/log formatting.
+type ExecConfig struct {
+	Component       string
+	ShellName       func() string
+	BeforeOutputErr func(shellName string, err error) error
+	LogFinish       func(start time.Time, pid int, res execution.Result, err error)
+	// KillGrace overrides how long Exec waits between escalation signals; zero
+	// uses the default (killGrace).
+	KillGrace time.Duration
+}
+
+// Exec runs one framed command over the persistent shell stream described by
+// stream. The caller must serialize concurrent Exec calls (each transport's
+// Session holds a mutex). This is the shared implementation used by the local
+// and ssh transports; their only differences are the process signaling,
+// interpreter naming, and debug logging supplied through cfg.
+func Exec(ctx context.Context, cmd string, opts execution.ExecOptions, stream Stream, cfg ExecConfig) (execution.Result, error) {
+	component := cfg.Component
+	grace := cfg.KillGrace
+	if grace <= 0 {
+		grace = killGrace
+	}
 	start := time.Now()
-	logging.Debug(h.Component+": Exec start",
-		slog.String("component", h.Component),
+	logging.Debug(component+": Exec start",
+		slog.String("component", component),
 		slog.String("cmd", cmd),
 		slog.String("cwd", opts.Cwd),
 		slog.Int64("max_output", opts.MaxOutputBytes),
 	)
 
-	if h.IsDead() {
+	if stream.IsDead() {
 		err := fmt.Errorf("%w: session is no longer usable", execution.ErrSessionReset)
-		logExecFail(h.Component, start, err)
+		logExecFail(component, start, err)
 		return execution.Result{}, err
 	}
 
 	m, err := NewMarkers()
 	if err != nil {
-		logExecFail(h.Component, start, err)
+		logExecFail(component, start, err)
 		return execution.Result{}, err
 	}
 	script := BuildWrapperScript(m, opts.Cwd, cmd)
 
 	writeDone := make(chan error, 1)
 	go func() {
-		_, err := io.WriteString(h.Stdin, script)
+		_, err := io.WriteString(stream.Stdin(), script)
 		writeDone <- err
 	}()
 	select {
@@ -79,14 +88,14 @@ func Exec(ctx context.Context, cmd string, opts execution.ExecOptions, h ExecHoo
 		if err == nil {
 			break
 		}
-		h.OnReset()
+		stream.Reset()
 		werr := fmt.Errorf("%w: write: %v", execution.ErrSessionReset, err)
-		logExecFail(h.Component, start, werr)
+		logExecFail(component, start, werr)
 		return execution.Result{}, werr
 	case <-ctx.Done():
-		h.OnCancel()
+		_ = stream.Close()
 		cerr := fmt.Errorf("%w: cancelled while writing command: %v", execution.ErrSessionReset, ctx.Err())
-		logExecFail(h.Component, start, cerr)
+		logExecFail(component, start, cerr)
 		return execution.Result{}, cerr
 	}
 
@@ -96,7 +105,7 @@ func Exec(ctx context.Context, cmd string, opts execution.ExecOptions, h ExecHoo
 	}
 	beginDone := make(chan beginResult, 1)
 	go func() {
-		pid, err := ReadBegin(h.Reader, m)
+		pid, err := ReadBegin(stream.Reader(), m)
 		beginDone <- beginResult{pid: pid, err: err}
 	}()
 	var pid int
@@ -104,19 +113,19 @@ func Exec(ctx context.Context, cmd string, opts execution.ExecOptions, h ExecHoo
 	case r := <-beginDone:
 		pid, err = r.pid, r.err
 	case <-ctx.Done():
-		h.OnCancel()
+		_ = stream.Close()
 		cerr := fmt.Errorf("%w: cancelled before command started: %v", execution.ErrSessionReset, ctx.Err())
-		logExecFail(h.Component, start, cerr)
+		logExecFail(component, start, cerr)
 		return execution.Result{}, cerr
 	}
 	if err != nil {
 		if errors.Is(err, execution.ErrSessionReset) {
-			h.OnReset()
+			stream.Reset()
 		} else {
-			h.OnCancel()
+			_ = stream.Close()
 		}
-		berr := h.BeforeOutputErr(h.ShellName(), err)
-		logExecFail(h.Component, start, berr)
+		berr := cfg.BeforeOutputErr(cfg.ShellName(), err)
+		logExecFail(component, start, berr)
 		return execution.Result{}, berr
 	}
 
@@ -126,49 +135,49 @@ func Exec(ctx context.Context, cmd string, opts execution.ExecOptions, h ExecHoo
 	}
 	ch := make(chan bodyResult, 1)
 	go func() {
-		f, err := ReadBody(h.Reader, m, opts.MaxOutputBytes, opts.Stream)
+		f, err := ReadBody(stream.Reader(), m, opts.MaxOutputBytes, opts.Stream)
 		ch <- bodyResult{f, err}
 	}()
 
 	for {
 		select {
 		case r := <-ch:
-			res, err := finishBody(h, r.f, r.err)
-			h.LogFinish(start, pid, res, err)
+			res, err := finishBody(stream, r.f, r.err)
+			cfg.LogFinish(start, pid, res, err)
 			return res, err
 		case <-ctx.Done():
 			for _, sig := range []string{"TERM", "KILL"} {
-				logging.Debug(h.Component+": Exec cancellation signal",
-					slog.String("component", h.Component),
+				logging.Debug(component+": Exec cancellation signal",
+					slog.String("component", component),
 					slog.String("signal", sig),
 					slog.Int("pid", pid),
 				)
-				h.Signal(pid, sig)
+				stream.Signal(pid, sig)
 				select {
 				case r := <-ch:
-					res, err := finishBody(h, r.f, r.err)
-					h.LogFinish(start, pid, res, err)
+					res, err := finishBody(stream, r.f, r.err)
+					cfg.LogFinish(start, pid, res, err)
 					return res, err
-				case <-time.After(killGrace):
+				case <-time.After(grace):
 				}
 			}
-			h.OnCancel()
+			_ = stream.Close()
 			serr := fmt.Errorf("%w: command survived TERM and KILL", execution.ErrSessionReset)
-			h.LogFinish(start, pid, execution.Result{}, serr)
+			cfg.LogFinish(start, pid, execution.Result{}, serr)
 			return execution.Result{}, serr
 		}
 	}
 }
 
-// finishBody maps a completed body read onto a Result, closing the session on
-// a stream reset and on any non-stream error.
-func finishBody(h ExecHooks, f Frame, err error) (execution.Result, error) {
+// finishBody maps a completed body read onto a Result, resetting the session on
+// a stream reset and closing it on any non-stream error.
+func finishBody(stream Stream, f Frame, err error) (execution.Result, error) {
 	if errors.Is(err, execution.ErrSessionReset) {
-		h.OnReset()
+		stream.Reset()
 	} else if err != nil {
 		var streamErr *StreamWriteError
 		if !errors.As(err, &streamErr) {
-			h.OnCancel()
+			_ = stream.Close()
 		}
 	}
 	return toResult(f, err)

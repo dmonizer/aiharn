@@ -39,7 +39,7 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 		return nil, fmt.Errorf("responses: create stream: %w", err)
 	}
 
-	return llm.StartStream(ctx, func() { _ = stream.Close() }, func(ctx context.Context, out chan<- llm.Event) {
+	return llm.StartStream(ctx, stream.Close, func(ctx context.Context, out chan<- llm.Event) {
 		collectStream(ctx, stream, out)
 	}), nil
 }

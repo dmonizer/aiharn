@@ -91,7 +91,14 @@ func shellName(opts Options) string {
 	return opts.DefaultShell
 }
 
+// Stdin returns the persistent shell's stdin stream.
+func (s *Session) Stdin() io.Writer { return s.stdin }
+
+// Reader returns the persistent shell's framed stdout stream.
+func (s *Session) Reader() *bufio.Reader { return s.reader }
+
 func (s *Session) markDead() {
+
 	s.deadMu.Lock()
 	already := s.dead
 	s.dead = true
@@ -105,7 +112,7 @@ func (s *Session) markClosed() {
 	s.deadMu.Unlock()
 }
 
-func (s *Session) isDead() bool {
+func (s *Session) IsDead() bool {
 	s.deadMu.Lock()
 	defer s.deadMu.Unlock()
 	return s.dead
@@ -116,14 +123,8 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return shell.Exec(ctx, cmd, opts, shell.ExecHooks{
+	return shell.Exec(ctx, cmd, opts, s, shell.ExecConfig{
 		Component: "local",
-		Stdin:     s.stdin,
-		Reader:    s.reader,
-		IsDead:    s.isDead,
-		OnReset:   s.closeDead,
-		OnCancel:  func() { _ = s.Close() },
-		Signal:    s.signal,
 		ShellName: func() string { return shellName(s.opts) },
 		BeforeOutputErr: func(name string, err error) error {
 			return fmt.Errorf("local: persistent shell failed before producing output (is %q a valid local shell?): %w", name, err)
@@ -155,7 +156,7 @@ func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, 
 
 // signal sends the named signal ("TERM" or "KILL") to the command's local
 // process group. It is best-effort.
-func (s *Session) signal(pid int, name string) {
+func (s *Session) Signal(pid int, name string) {
 	if pid <= 0 {
 		return
 	}
@@ -180,7 +181,7 @@ func (s *Session) Close() error {
 	return nil
 }
 
-func (s *Session) closeDead() {
+func (s *Session) Reset() {
 	logging.Debug("local: closeDead", slog.String("component", "local"))
 	s.markDead()
 	_ = s.Close()
