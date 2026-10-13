@@ -17,6 +17,7 @@ if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
 fi
 
 exec python3 - "$port" "$script_dir" <<'PY'
+import errno
 import sys
 from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -29,5 +30,14 @@ class NoStore(SimpleHTTPRequestHandler):
 port = int(sys.argv[1])
 directory = sys.argv[2]
 handler = partial(NoStore, directory=directory)
-HTTPServer(("0.0.0.0", port), handler).serve_forever()
+
+try:
+    httpd = HTTPServer(("0.0.0.0", port), handler)
+except OSError as e:
+    if e.errno == errno.EADDRINUSE:
+        print(f"serve.sh: port {port} already in use", file=sys.stderr)
+        sys.exit(3)
+    raise
+
+httpd.serve_forever()
 PY

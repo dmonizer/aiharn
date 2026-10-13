@@ -53,6 +53,7 @@ type Agent interface {
 type Handle interface {
 	ID() string
 	Name() string
+	Title() string
 	CreatedAt() time.Time
 	Model() string
 	Channel() string
@@ -86,6 +87,9 @@ type Store interface {
 	// that keeps the same id and name. The old session (and its transcript) is
 	// closed but not deleted, and the new session starts a new transcript.
 	Clear(ctx context.Context, id string) (Handle, error)
+	// Import creates a new session seeded with the given top-level history (from
+	// a prior conversation) and metadata, so a finished session can be continued.
+	Import(ctx context.Context, name string, history []llm.Item, meta TranscriptMeta) (Handle, error)
 	// Channels returns every configured execution channel, in config order.
 	Channels() []Channel
 }

@@ -128,7 +128,11 @@ type Spec struct {
 	TranscriptItems  int           // retained completed transcript items (0 = unlimited)
 	TranscriptBytes  int64         // retained completed transcript content bytes (0 = unlimited)
 	Observer         HistoryObserver
-	Cleanup          func() // invoked once at close (e.g. release the session)
+	// SeedHistory, when set, initializes the agent's conversation history. It
+	// is used to continue a prior conversation (for example one imported from
+	// an archived transcript). The slice is copied defensively.
+	SeedHistory []llm.Item
+	Cleanup     func() // invoked once at close (e.g. release the session)
 }
 
 const (
@@ -260,6 +264,7 @@ func New(spec Spec) *Agent {
 		transcriptBytes:  spec.TranscriptBytes,
 		cleanup:          spec.Cleanup,
 		observer:         spec.Observer,
+		history:          append([]llm.Item(nil), spec.SeedHistory...),
 		state:            StateStarting,
 		events:           make(chan Event, spec.EventCapacity),
 		inbox:            make(chan inboxItem, spec.InboxCapacity),

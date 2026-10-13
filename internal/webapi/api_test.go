@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/authfile"
 	"aiharn/internal/llm"
+	"aiharn/internal/recorder"
 	"aiharn/internal/sessions"
 	"aiharn/internal/tools"
 
@@ -117,6 +119,7 @@ func (a *fakeAgent) setState(state agent.State) {
 type fakeHandle struct {
 	id        string
 	name      string
+	title     string
 	createdAt time.Time
 	agent     sessions.Agent
 	manager   *agent.Manager
@@ -165,6 +168,12 @@ func (h *fakeHandle) setName(name string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.name = name
+}
+
+func (h *fakeHandle) Title() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.title
 }
 
 func (h *fakeHandle) Queued() int {
@@ -296,6 +305,35 @@ func (s *fakeStore) Create(ctx context.Context, name string) (sessions.Handle, e
 	}
 	s.list = append(s.list, created)
 	s.mu.Unlock()
+	return created, nil
+}
+
+func (s *fakeStore) Import(_ context.Context, name string, history []llm.Item, _ sessions.TranscriptMeta) (sessions.Handle, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if name != "" {
+		trimmed, err := sessions.ValidateName(name)
+		if err != nil {
+			return nil, err
+		}
+		name = trimmed
+	}
+	if s.max > 0 && len(s.list) >= s.max {
+		return nil, sessions.ErrLimitReached
+	}
+	s.seq++
+	if name == "" {
+		name = fmt.Sprintf("Session %d", s.seq)
+	}
+	source := s.list[0]
+	agent := newFakeAgent()
+	agent.history = append([]llm.Item(nil), history...)
+	created := &fakeHandle{
+		id: fmt.Sprintf("session-%d", s.seq), name: name, createdAt: time.Now(),
+		agent: agent, manager: source.manager, gate: approval.NewGate(approval.ModeAsk),
+		model: source.model, channel: source.channel, channels: s.channels,
+	}
+	s.list = append(s.list, created)
 	return created, nil
 }
 
@@ -1980,4 +2018,209 @@ func TestCapabilitiesKeyIsAlwaysPresent(t *testing.T) {
 	assertCapabilities(t, rawPayload(
 		request(t, h.server, http.MethodPatch, "/api/v1/sessions/default", "",
 			map[string]string{"name": "Renamed"})))
+}
+
+func TestArchivedSessionEndpoints(t *testing.T) {
+	home := t.TempDir()
+	transcripts := filepath.Join(home, "transcripts")
+	if err := os.MkdirAll(transcripts, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	key := "2024-01-02T03-04-05.123456789Z.jsonl"
+	writeTranscript := func(name, sessionID, agent string, entries ...string) {
+		t.Helper()
+		var b strings.Builder
+		fmt.Fprintf(&b, `{"type":"session","version":1,"started_at":"2024-01-02T03:04:05.123456789Z","model":"m","agent":"%s","channel":"local","approval":"ask","session_id":"%s","session_name":"Archived"}`+"\n", agent, sessionID)
+		for _, entry := range entries {
+			b.WriteString(entry)
+			b.WriteString("\n")
+		}
+		if err := os.WriteFile(filepath.Join(transcripts, name), []byte(b.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTranscript(key, "abc123", "main",
+		`{"time":"2024-01-02T03:04:06Z","type":"user","agent_id":"main","agent_type":"main","content":"hello"}`,
+		`{"time":"2024-01-02T03:04:07Z","type":"assistant","agent_id":"main","agent_type":"main","content":"hi"}`)
+	// This transcript belongs to the still-live default session, so it must be
+	// excluded from the archived list.
+	writeTranscript("default.jsonl", "default", "main",
+		`{"time":"2024-01-02T03:04:06Z","type":"user","agent_id":"main","agent_type":"main","content":"live"}`)
+
+	gate := approval.NewGate(approval.ModeAsk)
+	store := &fakeStore{
+		list: []*fakeHandle{{
+			id: "default", name: "Default", createdAt: time.Now(),
+			agent: newFakeAgent(), gate: gate, model: "model", channel: "channel",
+			channels: []sessions.Channel{{Name: "channel", Type: "ssh"}},
+		}},
+	}
+	t.Cleanup(func() { _ = gate.Close() })
+
+	s, err := New(Config{
+		Listen: "127.0.0.1:0", AuthFile: testAuthFile(t),
+		Sessions: store, AiharnHome: home,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	list := request(t, s, http.MethodGet, "/api/v1/sessions/archived", "", nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status = %d: %s", list.Code, list.Body.String())
+	}
+	var listBody struct {
+		APIVersion int `json:"api_version"`
+		Sessions   []struct {
+			Key      string `json:"key"`
+			ID       string `json:"id"`
+			Archived bool   `json:"archived"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	if listBody.APIVersion != 1 {
+		t.Fatalf("api_version = %d", listBody.APIVersion)
+	}
+	if len(listBody.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want 1 (the live default transcript must be excluded)", listBody.Sessions)
+	}
+	got := listBody.Sessions[0]
+	if got.ID != "abc123" || !got.Archived || got.Key != key {
+		t.Fatalf("session = %+v", got)
+	}
+
+	detail := request(t, s, http.MethodGet, "/api/v1/sessions/archived/"+key, "", nil)
+	if detail.Code != http.StatusOK {
+		t.Fatalf("detail status = %d: %s", detail.Code, detail.Body.String())
+	}
+	var detailBody struct {
+		Messages []recorder.ArchivedMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(detail.Body.Bytes(), &detailBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(detailBody.Messages) != 2 {
+		t.Fatalf("messages = %+v, want 2", detailBody.Messages)
+	}
+	if detailBody.Messages[0].Role != "user" || detailBody.Messages[0].Content != "hello" ||
+		detailBody.Messages[1].Role != "assistant" || detailBody.Messages[1].Content != "hi" {
+		t.Fatalf("messages = %+v", detailBody.Messages)
+	}
+
+	if got := request(t, s, http.MethodGet, "/api/v1/sessions/archived/nope.jsonl", "", nil); got.Code != http.StatusNotFound {
+		t.Fatalf("missing detail status = %d: %s", got.Code, got.Body.String())
+	}
+}
+
+func TestArchivedSessionImport(t *testing.T) {
+	home := t.TempDir()
+	transcripts := filepath.Join(home, "transcripts")
+	if err := os.MkdirAll(transcripts, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	key := "2024-01-02T03-04-05.123456789Z.jsonl"
+	var b strings.Builder
+	fmt.Fprintf(&b, `{"type":"session","version":1,"started_at":"2024-01-02T03:04:05.123456789Z","model":"m","agent":"main","channel":"local","approval":"ask","session_id":"abc123","session_name":"Archived"}`+"\n")
+	for _, entry := range []string{
+		`{"type":"user","agent_id":"main","content":"hello"}`,
+		`{"type":"tool_call","agent_id":"main","call_id":"c1","name":"execute_command","arguments":{"command":"pwd"}}`,
+		`{"type":"tool_result","agent_id":"main","call_id":"c1","content":"/home"}`,
+		`{"type":"assistant","agent_id":"main","content":"done"}`,
+	} {
+		b.WriteString(entry)
+		b.WriteString("\n")
+	}
+	if err := os.WriteFile(filepath.Join(transcripts, key), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := approval.NewGate(approval.ModeAsk)
+	store := &fakeStore{
+		list: []*fakeHandle{{
+			id: "default", name: "Default", createdAt: time.Now(),
+			agent: newFakeAgent(), gate: gate, model: "model", channel: "channel",
+			channels: []sessions.Channel{{Name: "channel", Type: "ssh"}},
+		}},
+	}
+	t.Cleanup(func() { _ = gate.Close() })
+
+	s, err := New(Config{
+		Listen: "127.0.0.1:0", AuthFile: testAuthFile(t),
+		Sessions: store, AiharnHome: home,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	w := request(t, s, http.MethodPost, "/api/v1/sessions/archived/"+key, "", map[string]string{"name": "Imported"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("import status = %d: %s", w.Code, w.Body.String())
+	}
+	var created sessionDescriptor
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.ID == "default" || created.Name != "Imported" {
+		t.Fatalf("created = %+v", created)
+	}
+
+	// The new live session's top-level history is the archived conversation.
+	store.mu.Lock()
+	var imported *fakeHandle
+	for _, h := range store.list {
+		if h.id == created.ID {
+			imported = h
+			break
+		}
+	}
+	store.mu.Unlock()
+	if imported == nil {
+		t.Fatalf("imported session %q not registered", created.ID)
+	}
+	history := imported.agent.History()
+	if len(history) != 4 {
+		t.Fatalf("history = %+v, want 4 items", history)
+	}
+	if history[0].Type != llm.ItemMessage || history[0].Role != llm.RoleUser || history[0].Content != "hello" {
+		t.Fatalf("history[0] = %+v", history[0])
+	}
+	if history[1].Type != llm.ItemFunctionCall || history[1].CallID != "c1" ||
+		history[1].Name != "execute_command" || history[1].Args != `{"command":"pwd"}` {
+		t.Fatalf("history[1] = %+v", history[1])
+	}
+	if history[2].Type != llm.ItemFunctionCallOutput || history[2].CallID != "c1" || history[2].Content != "/home" {
+		t.Fatalf("history[2] = %+v", history[2])
+	}
+	if history[3].Type != llm.ItemMessage || history[3].Role != llm.RoleAssistant || history[3].Content != "done" {
+		t.Fatalf("history[3] = %+v", history[3])
+	}
+
+	if got := request(t, s, http.MethodPost, "/api/v1/sessions/archived/nope.jsonl", "", map[string]string{"name": "X"}); got.Code != http.StatusNotFound {
+		t.Fatalf("missing import status = %d: %s", got.Code, got.Body.String())
+	}
+
+	// Without an archive home the import route reports the same not-found error.
+	noHome := newHarness(t, "")
+	if got := request(t, noHome.server, http.MethodPost, "/api/v1/sessions/archived/x.jsonl", "", map[string]string{"name": "X"}); got.Code != http.StatusNotFound {
+		t.Fatalf("no-home import status = %d: %s", got.Code, got.Body.String())
+	}
+}
+
+func TestArchivedSessionRoutesRequireHome(t *testing.T) {
+	h := newHarness(t, "")
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		w := request(t, h.server, method, "/api/v1/sessions/archived/x.jsonl", "", nil)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s archived item = %d, want 404", method, w.Code)
+		}
+	}
+	if w := request(t, h.server, http.MethodGet, "/api/v1/sessions/archived", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET archived list = %d, want 200", w.Code)
+	}
 }

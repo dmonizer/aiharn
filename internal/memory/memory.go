@@ -173,6 +173,9 @@ func (s *Store) WriteMemory(scope Scope, summary, content string) (Entry, error)
 		} else {
 			delete(m.global, idx)
 		}
+		if dir := m.scopeDir(scope); dir != "" {
+			_ = os.RemoveAll(filepath.Join(dir, entry.dir))
+		}
 		return Entry{}, err
 	}
 	return entry, nil
@@ -253,7 +256,8 @@ func (m *Manager) sortedEntries(scope Scope) []Entry {
 }
 
 // dirFor returns the on-disk subdirectory for a new entry, appending -<index>
-// when the sanitized prefix is already used by a different entry in the scope.
+// when the sanitized prefix is already used by a different entry in the scope
+// or by an orphaned directory left on disk from a failed earlier write.
 func (m *Manager) dirFor(scope Scope, index int, summary string) string {
 	base := sanitizeDir(summary)
 	src := m.global
@@ -262,6 +266,11 @@ func (m *Manager) dirFor(scope Scope, index int, summary string) string {
 	}
 	for _, e := range src {
 		if e.Index != index && e.dir == base {
+			return base + "-" + strconv.Itoa(index)
+		}
+	}
+	if dir := m.scopeDir(scope); dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, base)); err == nil {
 			return base + "-" + strconv.Itoa(index)
 		}
 	}
@@ -307,7 +316,7 @@ func (m *Manager) persist(scope Scope, entry Entry) error {
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		return fmt.Errorf("memory: create memory dir %s: %w", subdir, err)
 	}
-	if err := os.WriteFile(filepath.Join(subdir, "memory.md"), []byte(entry.Content), 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(subdir, "memory.md"), []byte(entry.Content), 0o600); err != nil {
 		return fmt.Errorf("memory: write memory %d: %w", entry.Index, err)
 	}
 	return m.writeIndex(scope)
@@ -326,8 +335,40 @@ func (m *Manager) writeIndex(scope Scope) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("memory: create memory dir %s: %w", dir, err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "index.md"), []byte(b.String()), 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, "index.md"), []byte(b.String()), 0o600); err != nil {
 		return fmt.Errorf("memory: write index: %w", err)
+	}
+	return nil
+}
+
+// writeFileAtomic writes data to path by way of a temporary file in the same
+// directory followed by an atomic rename. A crash can therefore never leave a
+// truncated or partially written file at path.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return err
 	}
 	return nil
 }
@@ -403,7 +444,7 @@ func parseIndexLine(line string) (int, string, string, bool) {
 		return 0, "", "", false
 	}
 	dir := strings.TrimSuffix(target, "/memory.md")
-	if dir == "" || strings.Contains(dir, "/") {
+	if dir == "" || dir == "." || dir == ".." || strings.Contains(dir, "/") {
 		return 0, "", "", false
 	}
 	summary := strings.TrimSpace(rest)

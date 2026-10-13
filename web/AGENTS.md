@@ -24,6 +24,12 @@ inside that disclosure rather than emitting adjacent standalone blocks.
 A `session_clear` capability shows a Clear chip in the session meta row; it posts
 `/api/v1/session/clear` and then re-polls the session list and snapshot.
 
+The Resume dialog lists live previous sessions plus archived previous-run
+sessions fetched from `GET /api/v1/sessions/archived`. Archived sessions are
+previewed via `GET /api/v1/sessions/archived/{key}` and can be continued: Load
+posts to that item route, which imports the transcript into a new live session
+and switches to it.
+
 Composer behavior is text-sensitive: while a session is busy, an empty composer
 shows Stop and posts `/api/v1/session/cancel`; any non-empty text shows Send and
 posts `/api/v1/messages`, allowing mid-run follow-ups to queue. Preserve this

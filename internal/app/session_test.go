@@ -60,7 +60,8 @@ func (b *fakeBuild) build(_ context.Context, _ *config.Config, opts Options) (*R
 	})
 	top := agent.New(agent.Spec{
 		ID: "main", Type: "main", AllowSubagents: true, Client: client(),
-		Observer: opts.Observer,
+		SeedHistory: opts.SeedHistory,
+		Observer:    opts.Observer,
 		Cleanup: func() {
 			b.mu.Lock()
 			b.closed++
@@ -887,5 +888,102 @@ func TestSessionManagerSharedObserverFallback(t *testing.T) {
 	}
 	if err := m.Shutdown(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSessionManagerImportSeedsHistory(t *testing.T) {
+	m := newTestManager(t, SessionManagerOptions{ID: counterIDs()})
+	ctx := context.Background()
+
+	seed := []llm.Item{
+		{Type: llm.ItemMessage, Role: llm.RoleUser, Content: "hello"},
+		{Type: llm.ItemFunctionCall, CallID: "c1", Name: "execute_command", Args: `{"command":"pwd"}`},
+		{Type: llm.ItemFunctionCallOutput, CallID: "c1", Content: "/home"},
+		{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: "done"},
+	}
+	meta := sessions.TranscriptMeta{
+		ID: "archived-1", Name: "Archived", Model: "model",
+		AgentType: "main", Channel: "local", Approval: "ask",
+	}
+
+	h, err := m.Import(ctx, "Imported", seed, meta)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if h.ID() == "" || h.ID() == "default" || h.Name() != "Imported" {
+		t.Fatalf("imported = id %q name %q", h.ID(), h.Name())
+	}
+
+	got := h.Agent().History()
+	if len(got) != len(seed) {
+		t.Fatalf("History() = %+v, want %d items", got, len(seed))
+	}
+	for i := range seed {
+		if got[i] != seed[i] {
+			t.Fatalf("History()[%d] = %+v, want %+v", i, got[i], seed[i])
+		}
+	}
+
+	// The imported session is usable and listed like any other live session.
+	if err := h.Submit(ctx, "", "continue"); err != nil {
+		t.Fatalf("Submit on imported session: %v", err)
+	}
+	waitFor(t, "the imported session turn to run", func() bool {
+		return historyContains(h.Agent().History(), "continue") && historyContains(h.Agent().History(), "reply 1")
+	})
+	found := false
+	for _, listed := range m.List() {
+		if listed.ID() == h.ID() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("imported session is not listed")
+	}
+}
+
+func TestSessionManagerImportAutoNamesAndValidates(t *testing.T) {
+	m := newTestManager(t, SessionManagerOptions{ID: counterIDs()})
+
+	auto, err := m.Import(context.Background(), "", nil, sessions.TranscriptMeta{AgentType: "main"})
+	if err != nil {
+		t.Fatalf("Import auto-name: %v", err)
+	}
+	if auto.Name() != "Session 1" {
+		t.Fatalf("auto name = %q, want Session 1", auto.Name())
+	}
+
+	if _, err := m.Import(context.Background(), "   ", nil, sessions.TranscriptMeta{AgentType: "main"}); !errors.Is(err, sessions.ErrNameInvalid) {
+		t.Fatalf("Import invalid name err = %v, want ErrNameInvalid", err)
+	}
+}
+
+func TestSessionManagerImportSanitizesMetadata(t *testing.T) {
+	cfg := &config.Config{
+		Agents:   map[string]config.AgentConfig{"main": {Model: "model", Channel: "local"}},
+		Models:   map[string]config.ModelConfig{"model": {Provider: "openai", Model: "m"}},
+		Channels: []config.ChannelConfig{{Name: "local", Type: "local"}},
+	}
+	m := newTestManager(t, SessionManagerOptions{ID: counterIDs(), Config: cfg})
+
+	// Every metadata field matches the configuration, so each override branch
+	// is taken and the import still succeeds.
+	meta := sessions.TranscriptMeta{
+		ID: "archived", Name: "Archived", Model: "model",
+		AgentType: "main", Channel: "local", Approval: config.ApprovalModeAllowAll,
+	}
+	h, err := m.Import(context.Background(), "Imported", nil, meta)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if h.Name() != "Imported" {
+		t.Fatalf("name = %q, want Imported", h.Name())
+	}
+
+	// Stale metadata fields fall back to defaults without failing the build.
+	stale := sessions.TranscriptMeta{AgentType: "ghost", Model: "ghost", Channel: "ghost", Approval: "weird"}
+	if _, err := m.Import(context.Background(), "Fallback", nil, stale); err != nil {
+		t.Fatalf("Import fallback: %v", err)
 	}
 }

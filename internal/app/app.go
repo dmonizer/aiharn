@@ -39,6 +39,11 @@ type Options struct {
 	Model      string // override model config name
 	Approval   string // override approval mode
 
+	// SeedHistory, when set, initializes the top-level agent's history so a
+	// finished conversation can be continued. It is applied only to the
+	// top-level agent, never to subagents.
+	SeedHistory []llm.Item
+
 	// Observer, when set, receives every history item appended by any agent (the
 	// top-level agent and all subagents), enabling a full conversation log.
 	Observer agent.HistoryObserver
@@ -94,6 +99,32 @@ type Runtime struct {
 	memory     *memory.Store // shared store binding; closed with the runtime
 	channel    *channelController
 	transports *transportCache
+	title      *titleBackend // routes set_session_title to the owning Session
+}
+
+// titleBackend routes the set_session_title tool to the conversation session
+// that owns the calling agent. The Runtime is built before its Session exists,
+// so Build installs this holder and the Session binds its setter afterwards.
+type titleBackend struct {
+	mu  sync.RWMutex
+	set func(string) error
+}
+
+// SetSessionTitle implements tools.SessionTitleBackend.
+func (b *titleBackend) SetSessionTitle(title string) error {
+	b.mu.RLock()
+	set := b.set
+	b.mu.RUnlock()
+	if set == nil {
+		return errors.New("app: session title is not available")
+	}
+	return set(title)
+}
+
+func (b *titleBackend) bind(set func(string) error) {
+	b.mu.Lock()
+	b.set = set
+	b.mu.Unlock()
 }
 
 // ChannelName returns the session's current execution channel name.
@@ -329,6 +360,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 			memStore.Close()
 		}
 	}()
+	title := &titleBackend{}
 	var controller *channelController
 	// mainChannel reports the main agent's current channel. It is read when a
 	// subagent is actually spawned (not at Build time), so a later channel
@@ -352,7 +384,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		},
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
 			return buildAgent(ctx, cfg, tc, mgr, gate, memStore, spec,
-				agentOverrides{Channel: mainChannel()}, observer, nil)
+				agentOverrides{Channel: mainChannel()}, observer, nil, title)
 		},
 	})
 
@@ -375,7 +407,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		CallerID:      "",
 		InboxCapacity: cfg.Limits.InboxDepth,
 		EventCapacity: cfg.Limits.EventCapacity,
-	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel}, observer, controller)
+	}, agentOverrides{PromptFile: opts.PromptFile, Model: opts.Model, Channel: opts.Channel, SeedHistory: opts.SeedHistory}, observer, controller, title)
 	if err != nil {
 		return nil, err
 	}
@@ -398,6 +430,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		},
 		channel:    controller,
 		transports: tc,
+		title:      title,
 	}, nil
 }
 
@@ -406,12 +439,15 @@ type agentOverrides struct {
 	PromptFile string
 	Model      string
 	Channel    string
+	// SeedHistory seeds the top-level agent's history for an imported
+	// (continued) session.
+	SeedHistory []llm.Item
 }
 
 // buildAgent resolves an agent type, model, and channel; opens a dedicated
 // session; reads the system prompt; and constructs a fully-wired Agent whose
 // cleanup closes its session.
-func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, mem memory.Backend, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController) (*agent.Agent, error) {
+func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, mem memory.Backend, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController, title tools.SessionTitleBackend) (*agent.Agent, error) {
 	agentCfg, ok := cfg.Agents[spec.Type]
 	if !ok {
 		return nil, fmt.Errorf("app: agent type %q is not defined", spec.Type)
@@ -470,7 +506,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	}
 
 	reg, err := buildRegistry(executor, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
-		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, mem, spec.ID, spec.Type)
+		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, mem, title, spec.ID, spec.Type)
 	if err != nil {
 		if cleanup != nil {
 			cleanup()
@@ -500,6 +536,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		TranscriptItems:  cfg.Limits.TranscriptMaxItems,
 		TranscriptBytes:  cfg.Limits.TranscriptMaxBytes,
 		Observer:         observer,
+		SeedHistory:      o.SeedHistory,
 		Cleanup:          cleanup,
 	})
 	return a, nil
@@ -689,7 +726,7 @@ func buildGate(mode string) (*approval.Gate, error) {
 // The session and gate are shared by all built-ins; backend (the Manager) and
 // callerID wire the subagent tools to the runtime. defaultCwd is the directory
 // execute_command falls back to when the model omits one.
-func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, mem memory.Backend, callerID, callerType string) (*tools.Registry, error) {
+func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, mem memory.Backend, title tools.SessionTitleBackend, callerID, callerType string) (*tools.Registry, error) {
 	reg := tools.New()
 	if mem == nil {
 		mgr, err := memory.NewManager("", "")
@@ -704,6 +741,7 @@ func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defa
 		tools.NameWriteMemory:         tools.WriteMemory(mem),
 		tools.NameListMemories:        tools.ListMemories(mem),
 		tools.NameGetMemory:           tools.GetMemory(mem),
+		tools.NameSetSessionTitle:     tools.SetSessionTitle(title),
 		tools.NameListSubagentTypes:   tools.ListSubagentTypes(backend, callerID, spawnToolEnabled),
 		tools.NameSpawnSubagent:       tools.SpawnSubagent(backend, gate, callerID, callerType),
 		tools.NameSendSubagentMessage: tools.SendSubagentMessage(backend, callerID),

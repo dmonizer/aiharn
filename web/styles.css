@@ -820,3 +820,33 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
 @media (max-width: 760px) {
   .mobile-session-meta .channel-menu { right: auto; left: 0; width: min(76vw, 280px); }
 }
+.side-heading-actions { display: flex; gap: 2px; }
+
+.session-copy .session-agent-title { color: var(--accent); }
+
+.resume-card { width: min(94vw, 520px); }
+.resume-list { display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow-y: auto; }
+.resume-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: #0c0f11;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+.resume-item:hover { border-color: var(--line-bright); }
+.resume-item.active { border-color: var(--accent); background: rgba(185, 244, 95, .06); }
+.resume-item-copy { min-width: 0; flex: 1; }
+.resume-item-copy strong, .resume-item-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resume-item-copy strong { font-size: 13px; }
+.resume-item-copy span { margin-top: 2px; color: var(--faint); font-size: 10px; }
+.resume-preview { display: flex; flex-direction: column; gap: 6px; max-height: 32vh; overflow-y: auto; }
+.resume-preview-empty { color: var(--faint); font-size: 11px; }
+.resume-bubble { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #0c0f11; color: var(--text); font-size: 11px; line-height: 1.5; }
+.resume-bubble .role { display: block; margin-bottom: 3px; color: var(--faint); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.resume-bubble.assistant { background: rgba(185, 244, 95, .04); }

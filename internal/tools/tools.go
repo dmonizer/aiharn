@@ -29,6 +29,7 @@ func Names() []string {
 		NameWriteMemory,
 		NameListMemories,
 		NameGetMemory,
+		NameSetSessionTitle,
 		NameListSubagentTypes,
 		NameSpawnSubagent,
 		NameSendSubagentMessage,

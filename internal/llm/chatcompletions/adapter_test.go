@@ -99,6 +99,29 @@ func TestStreamFragmentedToolCall(t *testing.T) {
 	}
 }
 
+func TestStreamArrayContentParts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeSSE(w, `{"choices":[{"index":0,"delta":{"reasoning_content":[{"type":"text","text":"Think"}],"content":[{"type":"text","text":"Hel"},{"type":"text","text":"lo"}]},"finish_reason":null}]}`)
+		writeSSE(w, `{"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}`)
+		writeSSE(w, "[DONE]")
+	}))
+	defer server.Close()
+
+	events, err := NewAdapter(server.URL+"/", "key").Stream(context.Background(), llm.Request{Model: "mistral"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := drain(t, events)
+	if all[0].Type != llm.EventReasoningDelta || all[0].Text != "Think" {
+		t.Fatalf("events[0] = %+v", all[0])
+	}
+	got := terminal(t, all)
+	if got.Type != llm.EventCompleted || got.FinishReason != "stop" || len(got.Items) != 1 || got.Items[0].Content != "Hello world" {
+		t.Fatalf("terminal = %+v", got)
+	}
+}
+
 func TestBuildRequestRoundTrip(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

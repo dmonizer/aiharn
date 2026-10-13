@@ -45,6 +45,7 @@ type queuedPrompt struct {
 type Session struct {
 	id         string
 	name       string
+	title      string
 	createdAt  time.Time
 	rt         *Runtime
 	queue      chan queuedPrompt
@@ -85,6 +86,9 @@ func newSession(id, name string, rt *Runtime, transcript sessions.Transcript) *S
 		ctx:        ctx,
 		cancel:     cancel,
 	}
+	if rt.title != nil {
+		rt.title.bind(s.setTitle)
+	}
 	s.wg.Add(1)
 	go s.runQueue()
 	if s.rt.Manager != nil {
@@ -105,6 +109,25 @@ func (s *Session) Name() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.name
+}
+
+// Title returns the agent-authored title, if any. It is display metadata only.
+func (s *Session) Title() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.title
+}
+
+// setTitle records the agent-authored title. It is bound to the runtime's
+// titleBackend so the set_session_title tool can reach this session.
+func (s *Session) setTitle(title string) error {
+	if s.isClosed() {
+		return sessions.ErrClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.title = title
+	return nil
 }
 
 // CreatedAt returns when the session was created.
@@ -488,15 +511,27 @@ func (m *SessionManager) Create(ctx context.Context, name string) (sessions.Hand
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	auto := name == ""
-	if !auto {
-		trimmed, err := sessions.ValidateName(name)
-		if err != nil {
-			return nil, err
-		}
-		name = trimmed
+	name, err := normalizeName(name)
+	if err != nil {
+		return nil, err
 	}
+	return m.start(ctx, name, m.buildSession)
+}
 
+// normalizeName returns an empty name unchanged so the caller can assign an
+// auto-generated one, and otherwise validates and trims name.
+func normalizeName(name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	return sessions.ValidateName(name)
+}
+
+// start registers and builds one session, then returns its handle. It must be
+// called without m.mu held, because building opens a transport session and can
+// block. An empty name selects an auto-generated one. The slot is reserved
+// under the lock so concurrent starts cannot exceed MaxSessions.
+func (m *SessionManager) start(ctx context.Context, name string, build func(context.Context, string, string) (*Runtime, sessions.Transcript, error)) (sessions.Handle, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -511,16 +546,16 @@ func (m *SessionManager) Create(ctx context.Context, name string) (sessions.Hand
 		m.mu.Unlock()
 		return nil, fmt.Errorf("app: session id %q is already in use", id)
 	}
-	if auto {
+	if name == "" {
 		// The number is assigned under the lock and is not rolled back on a
-		// failed build, so concurrent Creates can never reuse one.
+		// failed build, so concurrent starts can never reuse one.
 		m.nextNumber++
 		name = fmt.Sprintf("Session %d", m.nextNumber)
 	}
 	m.building++
 	m.mu.Unlock()
 
-	rt, transcript, err := m.buildSession(ctx, id, name)
+	rt, transcript, err := build(ctx, id, name)
 
 	m.mu.Lock()
 	m.building--
@@ -693,10 +728,58 @@ func (m *SessionManager) Shutdown() error {
 	return errors.Join(errs...)
 }
 
-// buildSession builds one session's runtime and transcript. It must be called
-// without m.mu held, because building opens a transport session.
-func (m *SessionManager) buildSession(ctx context.Context, id, name string) (*Runtime, sessions.Transcript, error) {
+// Import creates a new session seeded with the given top-level history and
+// metadata, so a finished session can be continued. The metadata is sanitized
+// against the current configuration so stale model/channel/approval/agent-type
+// names fall back to defaults instead of failing the build.
+func (m *SessionManager) Import(ctx context.Context, name string, history []llm.Item, meta sessions.TranscriptMeta) (sessions.Handle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	name, err := normalizeName(name)
+	if err != nil {
+		return nil, err
+	}
+
 	opts := m.build
+	// Start from defaults and apply only overrides that still exist.
+	opts.Agent = ""
+	if _, ok := m.cfg.Agents[meta.AgentType]; ok {
+		opts.Agent = meta.AgentType
+	}
+	opts.Model = ""
+	if _, ok := m.cfg.Models[meta.Model]; ok {
+		opts.Model = meta.Model
+	}
+	opts.Channel = ""
+	for _, c := range m.cfg.Channels {
+		if c.Name == meta.Channel {
+			opts.Channel = meta.Channel
+			break
+		}
+	}
+	opts.Approval = ""
+	switch meta.Approval {
+	case config.ApprovalModeAsk, config.ApprovalModeAllowAll:
+		opts.Approval = meta.Approval
+	}
+	opts.SeedHistory = history
+
+	return m.start(ctx, name, func(ctx context.Context, id, name string) (*Runtime, sessions.Transcript, error) {
+		return m.buildSessionOpts(ctx, id, name, opts)
+	})
+}
+
+// buildSession builds one session's runtime and transcript using the manager's
+// default build options. It must be called without m.mu held.
+func (m *SessionManager) buildSession(ctx context.Context, id, name string) (*Runtime, sessions.Transcript, error) {
+	return m.buildSessionOpts(ctx, id, name, m.build)
+}
+
+// buildSessionOpts builds one session's runtime and transcript from the given
+// options. It must be called without m.mu held, because building opens a
+// transport session.
+func (m *SessionManager) buildSessionOpts(ctx context.Context, id, name string, opts Options) (*Runtime, sessions.Transcript, error) {
 	observer, transcript, err := sessionTranscript(opts, id, name)
 	if err != nil {
 		return nil, nil, err

@@ -17,6 +17,8 @@ Registered routes:
 - `POST /api/v1/session/clear`
 - `GET`/`POST /api/v1/sessions`
 - `GET`/`PATCH`/`DELETE /api/v1/sessions/{id}`
+- `GET /api/v1/sessions/archived`
+- `GET`/`POST /api/v1/sessions/archived/{key}`
 
 The cancel endpoint mirrors TUI stop-everything behavior. `loop_active` exposes
 the top-level inbox-loop setting. `queued_messages` and `last_error` are returned
@@ -26,6 +28,10 @@ only when the top-level agent is selected.
 compatibility, but UI clients intentionally do not render it. Delivered
 agent-authored history items carry `origin` and `delivery` metadata so clients
 can render them exactly once and separately from human messages.
+
+The archived-session routes read per-session transcripts below `aiharn_home`.
+GET lists and previews them without mutating the live `sessions.Store`; POST
+imports one into a new live session seeded with its top-level history.
 
 Capabilities advertise optional routes/features. Keep session snapshots and
 session descriptors consistent when adding or changing a capability. API

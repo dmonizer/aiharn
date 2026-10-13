@@ -2,7 +2,13 @@
   "use strict";
 
   const ENDPOINT_KEY = "aiharn.remote.endpoint.v2";
-  const CREDENTIALS_PREFIX = "aiharn.remote.credentials.v1:";
+  const CREDENTIALS_PREFIX = "aiharn.remote.credentials.v2:";
+  const LEGACY_CREDENTIALS_PREFIX = "aiharn.remote.credentials.v1:";
+  const CREDENTIALS_DB = "aiharn-credentials";
+  const CREDENTIALS_STORE = "keys";
+  const CREDENTIALS_KEY_ID = "aes-gcm-256";
+  const CREDENTIALS_TTL_MS = 5 * 24 * 60 * 60 * 1000;
+  const CREDENTIALS_RENEW_BELOW_MS = 4 * 24 * 60 * 60 * 1000;
   const SESSION_KEY = "aiharn.remote.session.v2";
   const LEGACY_ENDPOINTS_KEY = "aiharn.remote.apis.v1";
   const LEGACY_ACTIVE_KEY = "aiharn.remote.active.v1";
@@ -43,23 +49,33 @@
     settingsForm: document.querySelector("#settings-form"),
     settingsName: document.querySelector("#settings-name"),
     settingsUrl: document.querySelector("#settings-url"),
-    settingsUsername: document.querySelector("#settings-username"),
-    settingsPassword: document.querySelector("#settings-password"),
     settingsUrlHelp: document.querySelector("#settings-url-help"),
-    settingsPasswordHelp: document.querySelector("#settings-password-help"),
     settingsError: document.querySelector("#settings-error"),
+    loginDialog: document.querySelector("#login-dialog"),
+    loginForm: document.querySelector("#login-form"),
+    loginUsername: document.querySelector("#login-username"),
+    loginPassword: document.querySelector("#login-password"),
+    loginHelp: document.querySelector("#login-help"),
+    loginError: document.querySelector("#login-error"),
+    logout: document.querySelector("#logout"),
     sessionDialog: document.querySelector("#session-dialog"),
     sessionForm: document.querySelector("#session-form"),
     sessionTitle: document.querySelector("#session-dialog-title"),
     sessionName: document.querySelector("#session-name"),
     sessionSubmit: document.querySelector("#session-submit"),
-    sessionError: document.querySelector("#session-error")
+    sessionError: document.querySelector("#session-error"),
+    resumeDialog: document.querySelector("#resume-dialog"),
+    resumeList: document.querySelector("#resume-list"),
+    resumePreview: document.querySelector("#resume-preview"),
+    resumeError: document.querySelector("#resume-error"),
+    resumeLoad: document.querySelector("#resume-load")
   };
 
   const state = {
     endpoint: loadEndpoint(),
     sessionId: localStorage.getItem(SESSION_KEY) || "",
     sessions: [],
+    archived: [],
     defaultSessionId: "",
     snapshots: new Map(),
     selectedAgents: new Map(),
@@ -78,7 +94,10 @@
     fingerprint: "",
     connected: false,
     sessionMode: "create",
-    renameTarget: ""
+    renameTarget: "",
+    resumeSelected: "",
+    resumeSelectedArchived: false,
+    credentials: null
   };
 
   let openChannelMenu = null;
@@ -155,24 +174,16 @@
     return CREDENTIALS_PREFIX + (endpoint?.url || "");
   }
 
-  function credentials() {
-    try {
-      return JSON.parse(sessionStorage.getItem(credentialsKey()) || "null") || {};
-    } catch {
-      return {};
-    }
+  function canEncrypt() {
+    return typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";
   }
 
   function username() {
-    return credentials().username || "";
+    return state.credentials?.username || "";
   }
 
   function password() {
-    return credentials().password || "";
-  }
-
-  function forgetCredentials(endpoint = state.endpoint) {
-    sessionStorage.removeItem(credentialsKey(endpoint));
+    return state.credentials?.password || "";
   }
 
   function basicAuthorization(user, pass) {
@@ -180,6 +191,193 @@
     let binary = "";
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return "Basic " + btoa(binary);
+  }
+
+  function toBase64(bytes) {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  function fromBase64(text) {
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      if (typeof indexedDB === "undefined") {
+        reject(new Error("indexedDB unavailable"));
+        return;
+      }
+      const request = indexedDB.open(CREDENTIALS_DB, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(CREDENTIALS_STORE)) {
+          db.createObjectStore(CREDENTIALS_STORE);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  function idbGetKey() {
+    return idbOpen().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction(CREDENTIALS_STORE, "readonly");
+      const request = tx.objectStore(CREDENTIALS_STORE).get(CREDENTIALS_KEY_ID);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+      tx.oncomplete = () => db.close();
+    }));
+  }
+
+  function idbPutKey(key) {
+    return idbOpen().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction(CREDENTIALS_STORE, "readwrite");
+      tx.objectStore(CREDENTIALS_STORE).put(key, CREDENTIALS_KEY_ID);
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    }));
+  }
+
+  async function credentialKey() {
+    const existing = await idbGetKey();
+    if (existing) return existing;
+    const key = await crypto.subtle.generateKey(
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+    await idbPutKey(key);
+    return key;
+  }
+
+  async function encryptCredentials(payload, key) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      new TextEncoder().encode(JSON.stringify(payload))
+    );
+    return {
+      v: 2,
+      iv: toBase64(iv),
+      ct: toBase64(new Uint8Array(ciphertext)),
+      expires_at: Date.now() + CREDENTIALS_TTL_MS
+    };
+  }
+
+  async function decryptCredentials(envelope, key) {
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: fromBase64(envelope.iv) },
+      key,
+      fromBase64(envelope.ct)
+    );
+    return JSON.parse(new TextDecoder().decode(plaintext));
+  }
+
+  async function storeCredentials(usernameValue, passwordValue) {
+    state.credentials = { username: usernameValue, password: passwordValue };
+    if (!state.endpoint) return;
+    const key = credentialsKey();
+    if (canEncrypt()) {
+      const cryptoKey = await credentialKey();
+      const envelope = await encryptCredentials(
+        { username: usernameValue, password: passwordValue }, cryptoKey);
+      localStorage.setItem(key, JSON.stringify(envelope));
+      return;
+    }
+    localStorage.setItem(key, JSON.stringify({
+      v: 1, username: usernameValue, password: passwordValue,
+      expires_at: Date.now() + CREDENTIALS_TTL_MS
+    }));
+  }
+
+  async function forgetCredentials(endpoint = state.endpoint) {
+    if (endpoint) localStorage.removeItem(credentialsKey(endpoint));
+    if (!endpoint || !state.endpoint || endpoint.url === state.endpoint.url) {
+      state.credentials = null;
+    }
+  }
+
+  async function renewCredentials() {
+    if (!state.credentials || !state.endpoint) return;
+    const raw = localStorage.getItem(credentialsKey());
+    if (!raw) return;
+    let remaining = 0;
+    try {
+      remaining = (JSON.parse(raw).expires_at || 0) - Date.now();
+    } catch {
+      return;
+    }
+    if (remaining >= CREDENTIALS_RENEW_BELOW_MS) return;
+    await storeCredentials(state.credentials.username, state.credentials.password);
+  }
+
+  async function loadCredentials() {
+    if (!state.endpoint) {
+      state.credentials = null;
+      return false;
+    }
+    const key = credentialsKey();
+    let raw = localStorage.getItem(key);
+
+    if (!raw) {
+      const legacy = sessionStorage.getItem(LEGACY_CREDENTIALS_PREFIX + state.endpoint.url);
+      if (legacy) {
+        try {
+          const parsed = JSON.parse(legacy);
+          if (parsed && parsed.username && parsed.password) {
+            await storeCredentials(parsed.username, parsed.password);
+            sessionStorage.removeItem(LEGACY_CREDENTIALS_PREFIX + state.endpoint.url);
+            return true;
+          }
+        } catch {
+          // fall through to logged-out state
+        }
+      }
+      state.credentials = null;
+      return false;
+    }
+
+    let envelope;
+    try {
+      envelope = JSON.parse(raw);
+    } catch {
+      localStorage.removeItem(key);
+      state.credentials = null;
+      return false;
+    }
+    if (!envelope || !envelope.expires_at || Date.now() >= envelope.expires_at) {
+      localStorage.removeItem(key);
+      state.credentials = null;
+      return false;
+    }
+
+    if (envelope.v === 1) {
+      state.credentials = { username: envelope.username, password: envelope.password };
+      await renewCredentials();
+      return true;
+    }
+    if (envelope.v === 2 && canEncrypt()) {
+      try {
+        const cryptoKey = await credentialKey();
+        const payload = await decryptCredentials(envelope, cryptoKey);
+        state.credentials = { username: payload.username, password: payload.password };
+        await renewCredentials();
+        return true;
+      } catch (error) {
+        console.warn("Could not decrypt saved login; sign in again.", error);
+        state.credentials = null;
+        return false;
+      }
+    }
+    localStorage.removeItem(key);
+    state.credentials = null;
+    return false;
   }
 
   function selectedAgentID() {
@@ -248,6 +446,7 @@
 
   function clearSessionState() {
     state.sessions = [];
+    state.archived = [];
     state.defaultSessionId = "";
     state.snapshots = new Map();
     state.selectedAgents = new Map();
@@ -271,6 +470,9 @@
       cache: "no-store",
       signal: options.signal
     });
+    if (response.status !== 401 && response.status !== 403 && state.credentials) {
+      renewCredentials().catch(() => {});
+    }
     let payload = {};
     try {
       payload = await response.json();
@@ -342,6 +544,12 @@
       detail.textContent = count > 0
         ? count + (count === 1 ? " subagent" : " subagents")
         : (session.model || session.id);
+      if (typeof session.title === "string" && session.title) {
+        const title = document.createElement("span");
+        title.className = "session-agent-title";
+        title.textContent = session.title;
+        copy.append(title);
+      }
       copy.append(name, detail);
 
       const actions = document.createElement("span");
@@ -1224,6 +1432,12 @@
     return { title: parts.join(" · ") || "Activity", status, active: false, calls };
   }
 
+  function toolCallCommand(call) {
+    const args = call && call.arguments;
+    if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+    return typeof args.command === "string" ? args.command : "";
+  }
+
   function renderActivityBlock(group, expanded) {
     const presentation = activityPresentation(group);
     const details = document.createElement("details");
@@ -1281,7 +1495,10 @@
       ));
       step.append(heading);
       if (call) {
-        appendToolSection(step, "Call", call.arguments,
+        const value = call.name === "execute_command"
+          ? (toolCallCommand(call) || call.arguments)
+          : call.arguments;
+        appendToolSection(step, "Call", value,
           "activity:" + group.key + ":" + index + ":call");
       }
       if (result) {
@@ -1408,6 +1625,10 @@
       renderSessionList();
       return;
     }
+    if (elements.loginDialog.open) {
+      state.sessionsTimer = setTimeout(pollSessions, SESSIONS_POLL_MS);
+      return;
+    }
     state.sessionsRequest?.abort();
     const request = new AbortController();
     state.sessionsRequest = request;
@@ -1449,9 +1670,11 @@
       }
       state.sessions = [];
       renderSessionList();
-      showConnection(error.status === 401
-        ? "Invalid username or password. Open settings to log in."
-        : error.message);
+      if (error.status === 401) {
+        requireLogin("Invalid username or password.");
+      } else {
+        showConnection(error.message);
+      }
     } finally {
       clearTimeout(state.sessionsTimer);
       state.sessionsTimer = setTimeout(pollSessions, SESSIONS_POLL_MS);
@@ -1462,6 +1685,10 @@
     clearTimeout(state.timer);
     if (!state.endpoint) {
       renderWaiting();
+      return;
+    }
+    if (elements.loginDialog.open) {
+      state.timer = setTimeout(poll, POLL_MS);
       return;
     }
     state.request?.abort();
@@ -1509,9 +1736,11 @@
       state.connected = false;
       elements.message.disabled = true;
       resetSendButton();
-      showConnection(error.status === 401
-        ? "Invalid username or password. Open settings to log in."
-        : error.message);
+      if (error.status === 401) {
+        requireLogin("Invalid username or password.");
+      } else {
+        showConnection(error.message);
+      }
     } finally {
       // Reschedule whenever this is still the newest poll. Comparing on the
       // session id instead would stop the loop for good whenever the active
@@ -1600,21 +1829,38 @@
     const endpoint = state.endpoint;
     elements.settingsName.value = endpoint?.name || "";
     elements.settingsUrl.value = endpoint?.url || "";
-    elements.settingsUsername.value = username();
-    elements.settingsPassword.value = "";
     elements.settingsUrl.readOnly = Boolean(endpoint?.deployed);
     elements.settingsUrlHelp.textContent = endpoint?.deployed
-      ? "Configured by deployment; login below is still editable."
-      : "";
-    if (!endpoint?.deployed) {
-      elements.settingsUrlHelp.textContent = "Use the server origin, without /api/v1.";
-    }
-    elements.settingsPasswordHelp.textContent = password()
-      ? "Leave blank to keep the password for this browser tab."
-      : "Enter your password to log in. Credentials stay in this browser tab.";
+      ? "Configured by deployment."
+      : "Use the server origin, without /api/v1.";
     showDialogError(elements.settingsError, "");
     elements.settingsDialog.showModal();
     setTimeout(() => elements.settingsName.focus(), 0);
+  }
+
+  function updateLoginState() {
+    const hasCredentials = Boolean(username() && password());
+    elements.logout.hidden = !hasCredentials;
+    elements.loginHelp.textContent = canEncrypt()
+      ? "Saved in this browser, encrypted, and renewed each time you use it."
+      : "This connection is not secure (HTTP), so the login cannot be encrypted at rest.";
+  }
+
+  function openLoginDialog(message = "") {
+    elements.loginUsername.value = username();
+    elements.loginPassword.value = "";
+    updateLoginState();
+    showDialogError(elements.loginError, message);
+    elements.loginDialog.showModal();
+    setTimeout(() => (username() ? elements.loginPassword : elements.loginUsername).focus(), 0);
+  }
+
+  function requireLogin(message) {
+    if (elements.loginDialog.open) {
+      showDialogError(elements.loginError, message);
+      return;
+    }
+    openLoginDialog(message);
   }
 
   function openSessionDialog(mode, session) {
@@ -1636,6 +1882,153 @@
       elements.sessionName.focus();
       elements.sessionName.select();
     }, 0);
+  }
+
+  async function openResumeDialog() {
+    if (state.sessionSupport === false) {
+      showConnection(LEGACY_SERVER_NOTICE);
+      return;
+    }
+    state.resumeSelected = "";
+    state.resumeSelectedArchived = false;
+    elements.resumePreview.replaceChildren(emptyResumePreview("Select a session to preview its opening messages."));
+    showDialogError(elements.resumeError, "");
+    elements.resumeLoad.disabled = true;
+    renderResumeList();
+    elements.resumeDialog.showModal();
+    try {
+      const payload = await apiCall("/sessions/archived");
+      state.archived = Array.isArray(payload.sessions) ? payload.sessions : [];
+    } catch (error) {
+      state.archived = [];
+      const hasLive = state.sessions.some((session) => session.id !== state.sessionId);
+      if (!hasLive && !(error && error.status === 404)) {
+        showDialogError(elements.resumeError, error.message || "Could not load previous sessions.");
+      }
+    }
+    renderResumeList();
+  }
+
+  function renderResumeList() {
+    elements.resumeList.replaceChildren();
+    const live = state.sessions.filter((session) => session.id !== state.sessionId);
+    const liveIDs = new Set(live.map((session) => session.id));
+    const archived = state.archived.filter((session) => !liveIDs.has(session.id));
+    const previous = live.concat(archived);
+    if (!previous.length) {
+      elements.resumeList.append(emptyResumePreview("No previous sessions."));
+      return;
+    }
+    for (const session of previous) {
+      const isArchived = Boolean(session.archived);
+      const isSelected = isArchived
+        ? (session.key === state.resumeSelected && state.resumeSelectedArchived)
+        : (session.id === state.resumeSelected && !state.resumeSelectedArchived);
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "resume-item" + (isSelected ? " active" : "") + (isArchived ? " archived" : "");
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", isSelected ? "true" : "false");
+      item.addEventListener("click", () => previewResume(session));
+      const copy = document.createElement("span");
+      copy.className = "resume-item-copy";
+      const name = document.createElement("strong");
+      name.textContent = session.name || session.id || session.key;
+      const meta = document.createElement("span");
+      const parts = [];
+      if (session.title) parts.push(session.title);
+      if (session.model) parts.push(session.model);
+      if (isArchived) parts.push("previous run");
+      meta.textContent = parts.join(" · ") || session.id || session.key;
+      copy.append(name, meta);
+      item.append(copy);
+      elements.resumeList.append(item);
+    }
+  }
+
+  async function previewResume(session) {
+    const isArchived = Boolean(session.archived);
+    state.resumeSelected = isArchived ? session.key : session.id;
+    state.resumeSelectedArchived = isArchived;
+    renderResumeList();
+    elements.resumeLoad.disabled = true;
+    elements.resumePreview.replaceChildren(emptyResumePreview("Loading preview…"));
+    showDialogError(elements.resumeError, "");
+    try {
+      const path = isArchived
+        ? "/sessions/archived/" + encodeURIComponent(session.key)
+        : "/session?session_id=" + encodeURIComponent(session.id);
+      const snapshot = await apiCall(path);
+      const messages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+      const preview = messages
+        .filter((message) => message && message.type === "message" &&
+          (message.role === "user" || message.role === "assistant") &&
+          message.origin !== "agent" &&
+          !message.delivery)
+        .slice(0, 5);
+      renderResumePreview(preview);
+      elements.resumeLoad.disabled = false;
+      if (isArchived) {
+        showDialogError(elements.resumeError, "This session is from a previous run. Loading it starts a new session from this conversation.");
+      }
+    } catch (error) {
+      elements.resumePreview.replaceChildren();
+      showDialogError(elements.resumeError, error.message || "Could not load the session preview.");
+      elements.resumeLoad.disabled = true;
+    }
+  }
+
+  function emptyResumePreview(text) {
+    const div = document.createElement("div");
+    div.className = "resume-preview-empty";
+    div.textContent = text;
+    return div;
+  }
+
+  function renderResumePreview(messages) {
+    elements.resumePreview.replaceChildren();
+    if (!messages.length) {
+      elements.resumePreview.append(emptyResumePreview("No messages in this session yet."));
+      return;
+    }
+    for (const message of messages) {
+      const bubble = document.createElement("div");
+      bubble.className = "resume-bubble " + (message.role || "");
+      const role = document.createElement("span");
+      role.className = "role";
+      role.textContent = message.role === "user" ? "You" : "Aiharn";
+      const content = document.createElement("div");
+      content.textContent = truncatePreview(message.content || "");
+      bubble.append(role, content);
+      elements.resumePreview.append(bubble);
+    }
+  }
+
+  function truncatePreview(text) {
+    const max = 240;
+    return text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
+  }
+
+  async function loadResume() {
+    const id = state.resumeSelected;
+    if (!id) return;
+    elements.resumeLoad.disabled = true;
+    try {
+      if (state.resumeSelectedArchived) {
+        const created = await apiCall("/sessions/archived/" + encodeURIComponent(id), {
+          method: "POST",
+          body: "{}"
+        });
+        elements.resumeDialog.close();
+        selectSession(created.id);
+      } else {
+        elements.resumeDialog.close();
+        selectSession(id);
+      }
+    } catch (error) {
+      elements.resumeLoad.disabled = false;
+      showDialogError(elements.resumeError, error.message || "Could not load the session.");
+    }
   }
 
   function resetSendButton() {
@@ -1737,12 +2130,17 @@
     button.addEventListener("click", () => elements.sessionDialog.close());
   });
   document.querySelector("#new-session").addEventListener("click", () => openSessionDialog("create"));
+  document.querySelector("#resume-session").addEventListener("click", openResumeDialog);
+  document.querySelectorAll(".close-resume").forEach((button) => {
+    button.addEventListener("click", () => elements.resumeDialog.close());
+  });
+  elements.resumeLoad.addEventListener("click", loadResume);
   document.querySelector("#mobile-menu").addEventListener("click", () => {
     setMenuOpen(!document.body.classList.contains("menu-open"));
   });
   document.querySelector("#sidebar-scrim").addEventListener("click", () => setMenuOpen(false));
 
-  elements.settingsForm.addEventListener("submit", (event) => {
+  elements.settingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     let url;
     try {
@@ -1761,46 +2159,71 @@
       }
     }
     const changed = !previous || previous.url !== url;
-    const enteredUsername = elements.settingsUsername.value.trim();
-    const enteredPassword = elements.settingsPassword.value;
-    if (!enteredUsername || (!enteredPassword && (changed || enteredUsername !== username() || !password()))) {
-      showDialogError(elements.settingsError, "Enter a username and password.");
-      return;
-    }
-    if (changed) forgetCredentials(previous);
     saveEndpoint({
       name: previous?.deployed ? previous.name : name,
       url,
       deployed: Boolean(previous?.deployed)
     });
-    sessionStorage.setItem(credentialsKey(), JSON.stringify({
-      username: enteredUsername,
-      password: enteredPassword || password()
-    }));
-    elements.settingsPassword.value = "";
     elements.settingsDialog.close();
     if (changed) {
-      // Session ids belong to one server, so a new URL starts a new selection.
       clearSessionState();
+      state.credentials = null;
       refreshAfterEndpointChange();
       renderSessionList();
       renderWaiting();
-      pollSessions();
+      const hasCredentials = await loadCredentials();
+      if (hasCredentials) {
+        pollSessions();
+        poll();
+      } else {
+        openLoginDialog();
+      }
     } else {
       refreshAfterEndpointChange();
       poll(true);
     }
   });
   elements.settingsUrl.addEventListener("input", () => showDialogError(elements.settingsError, ""));
-  document.querySelector("#forget-credentials").addEventListener("click", () => {
-    forgetCredentials();
-    elements.settingsUsername.value = "";
-    elements.settingsPassword.value = "";
-    elements.settingsPasswordHelp.textContent =
-      "Enter your password to log in. Credentials stay in this browser tab.";
-    showDialogError(elements.settingsError, "");
+
+  elements.loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.endpoint) {
+      showDialogError(elements.loginError, "Set an API URL in Settings first.");
+      return;
+    }
+    const enteredUsername = elements.loginUsername.value.trim();
+    const enteredPassword = elements.loginPassword.value;
+    if (!enteredUsername || !enteredPassword) {
+      showDialogError(elements.loginError, "Enter a username and password.");
+      return;
+    }
+    try {
+      await storeCredentials(enteredUsername, enteredPassword);
+    } catch (error) {
+      showDialogError(elements.loginError, "Could not save the login: " + (error.message || "unknown error"));
+      return;
+    }
+    elements.loginPassword.value = "";
+    elements.loginDialog.close();
     refreshAfterEndpointChange();
-    poll(true);
+    renderWaiting();
+    void pollSessions();
+    void poll();
+  });
+  document.querySelector("#open-login").addEventListener("click", () => {
+    elements.settingsDialog.close();
+    openLoginDialog();
+  });
+  document.querySelectorAll(".close-login").forEach((button) => {
+    button.addEventListener("click", () => elements.loginDialog.close());
+  });
+  elements.logout.addEventListener("click", async () => {
+    await forgetCredentials();
+    refreshAfterEndpointChange();
+    elements.loginUsername.value = "";
+    elements.loginPassword.value = "";
+    updateLoginState();
+    showDialogError(elements.loginError, "Signed out. Sign in to continue.");
   });
 
   elements.sessionForm.addEventListener("submit", async (event) => {
@@ -1897,11 +2320,19 @@
     window.visualViewport.addEventListener("scroll", syncVisualViewport);
   }
 
-  syncVisualViewport();
-  renderSessionList();
-  renderWaiting();
-  if (state.endpoint) {
-    pollSessions();
-    poll();
+  async function bootstrap() {
+    syncVisualViewport();
+    renderSessionList();
+    renderWaiting();
+    if (!state.endpoint) return;
+    const hasCredentials = await loadCredentials();
+    if (hasCredentials) {
+      void pollSessions();
+      void poll();
+    } else {
+      openLoginDialog();
+    }
   }
+
+  void bootstrap();
 })();

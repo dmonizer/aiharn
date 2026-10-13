@@ -324,6 +324,8 @@ session; optional `agent_id` selects an agent view. JSON bodies only.
 | GET | `/sessions/{id}` | Describe one session |
 | PATCH | `/sessions/{id}` | Rename a session |
 | DELETE | `/sessions/{id}` | Close a session (default session → 409) |
+| GET | `/sessions/archived` | List previous-run sessions from `<aiharn_home>/transcripts` |
+| GET | `/sessions/archived/{key}` | Preview one previous-run session (read-only) |
 
 ### CORS
 

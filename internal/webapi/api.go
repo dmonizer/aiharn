@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"aiharn/internal/authfile"
 	"aiharn/internal/llm"
 	"aiharn/internal/logging"
+	"aiharn/internal/recorder"
 	"aiharn/internal/sessions"
 )
 
@@ -37,6 +39,14 @@ const (
 	maxMessageBytes = 64 << 10
 	// sessionItemPrefix is the subtree pattern for one session's routes.
 	sessionItemPrefix = "/api/v1/sessions/"
+	// archiveSessionsPath is the archived-session collection route.
+	archiveSessionsPath = "/api/v1/sessions/archived"
+	// archiveSessionsItemPrefix is the subtree pattern for one archived session.
+	archiveSessionsItemPrefix = "/api/v1/sessions/archived/"
+	// errArchivedNotFound is the shared not-found message for archive routes.
+	errArchivedNotFound = "archived session not found"
+	// archiveExt is the file extension of archived transcript files.
+	archiveExt = ".jsonl"
 )
 
 // Config configures one API server. Sessions is required and owns every
@@ -47,6 +57,10 @@ type Config struct {
 	AuthFile       string
 	AllowedOrigins []string
 	Sessions       sessions.Store
+	// AiharnHome is the local data directory. When set, the server also serves
+	// read-only listings and previews of archived transcripts below
+	// <AiharnHome>/transcripts. Empty disables archive support.
+	AiharnHome string
 }
 
 // Server owns the HTTP listener and exposes the session store over JSON.
@@ -87,6 +101,8 @@ func New(cfg Config) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/sessions", s.handleSessions)
 	mux.HandleFunc(sessionItemPrefix, s.handleSessionItem)
+	mux.HandleFunc(archiveSessionsPath, s.handleArchivedSessions)
+	mux.HandleFunc(archiveSessionsItemPrefix, s.handleArchivedSessionItem)
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
 	mux.HandleFunc("/api/v1/session/channel", s.handleSessionChannel)
@@ -215,6 +231,7 @@ type agentSummary struct {
 type session struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
+	Title        string    `json:"title,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	AgentID      string    `json:"agent_id"`
 	AgentType    string    `json:"agent_type"`
@@ -236,6 +253,7 @@ type sessionListResponse struct {
 type sessionDescriptor struct {
 	ID             string         `json:"id"`
 	Name           string         `json:"name"`
+	Title          string         `json:"title,omitempty"`
 	CreatedAt      time.Time      `json:"created_at"`
 	Default        bool           `json:"default"`
 	Model          string         `json:"model,omitempty"`
@@ -398,6 +416,7 @@ func (s *Server) describe(ctx context.Context, handle sessions.Handle, isDefault
 	agents, agentsErr := s.agentSummaries(ctx, handle)
 	return sessionDescriptor{
 		ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
+		Title:   handle.Title(),
 		Default: isDefault, Model: handle.Model(), Channel: handle.Channel(),
 		State:          handle.Agent().State().String(),
 		Agents:         agents,
@@ -451,6 +470,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		Channels:   s.channelDescriptors(),
 		Session: session{
 			ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
+			Title:   handle.Title(),
 			AgentID: selected.ID(), AgentType: selected.Type(),
 			Model: model, Channel: channel,
 			State:        selected.State().String(),
@@ -1182,4 +1202,170 @@ func writeError(w http.ResponseWriter, status int, message string) {
 func methodNotAllowed(w http.ResponseWriter, allowed string) {
 	w.Header().Set("Allow", allowed)
 	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+// archivedSessionListResponse is the payload of GET /api/v1/sessions/archived.
+type archivedSessionListResponse struct {
+	APIVersion int                         `json:"api_version"`
+	Sessions   []archivedSessionDescriptor `json:"sessions"`
+}
+
+// archivedSessionDescriptor describes one archived transcript without its
+// messages.
+type archivedSessionDescriptor struct {
+	Key       string    `json:"key"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	Model     string    `json:"model,omitempty"`
+	Channel   string    `json:"channel,omitempty"`
+	AgentType string    `json:"agent_type,omitempty"`
+	Archived  bool      `json:"archived"`
+}
+
+// archivedSessionDetail is the payload of one archived transcript preview.
+type archivedSessionDetail struct {
+	Key       string                     `json:"key"`
+	ID        string                     `json:"id"`
+	Name      string                     `json:"name"`
+	CreatedAt time.Time                  `json:"created_at"`
+	Model     string                     `json:"model,omitempty"`
+	Channel   string                     `json:"channel,omitempty"`
+	Messages  []recorder.ArchivedMessage `json:"messages"`
+}
+
+// handleArchivedSessions lists archived transcripts, excluding any whose
+// session is still live.
+func (s *Server) handleArchivedSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if s.cfg.AiharnHome == "" {
+		writeJSON(w, http.StatusOK, archivedSessionListResponse{
+			APIVersion: 1,
+			Sessions:   []archivedSessionDescriptor{},
+		})
+		return
+	}
+
+	archived, err := recorder.ArchivedSessions(s.cfg.AiharnHome)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot list archived sessions")
+		return
+	}
+	live := make(map[string]bool)
+	for _, handle := range s.cfg.Sessions.List() {
+		live[handle.ID()] = true
+	}
+	list := make([]archivedSessionDescriptor, 0, len(archived))
+	for _, session := range archived {
+		if live[session.ID] {
+			continue
+		}
+		list = append(list, archivedSessionDescriptor{
+			Key:       session.Key,
+			ID:        session.ID,
+			Name:      session.Name,
+			CreatedAt: session.StartedAt,
+			Model:     session.Model,
+			Channel:   session.Channel,
+			AgentType: session.AgentType,
+			Archived:  true,
+		})
+	}
+	writeJSON(w, http.StatusOK, archivedSessionListResponse{
+		APIVersion: 1,
+		Sessions:   list,
+	})
+}
+
+// handleArchivedSessionItem dispatches a single archived-session route: GET
+// returns a bounded preview and POST imports the archived conversation into a
+// new live session.
+func (s *Server) handleArchivedSessionItem(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.getArchivedSessionItem(w, r)
+	case http.MethodPost:
+		s.importArchivedSessionItem(w, r)
+	default:
+		methodNotAllowed(w, "GET, POST")
+	}
+}
+
+// getArchivedSessionItem returns a bounded preview of one archived transcript.
+func (s *Server) getArchivedSessionItem(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AiharnHome == "" {
+		writeError(w, http.StatusNotFound, errArchivedNotFound)
+		return
+	}
+
+	key := strings.TrimPrefix(r.URL.Path, archiveSessionsItemPrefix)
+	detail, err := recorder.ArchivedSessionDetail(s.cfg.AiharnHome, key, 200)
+	if err != nil {
+		if errors.Is(err, recorder.ErrArchivedNotFound) {
+			writeError(w, http.StatusNotFound, errArchivedNotFound)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "cannot read archived session")
+		return
+	}
+	writeJSON(w, http.StatusOK, archivedSessionDetail{
+		Key:       detail.Key,
+		ID:        detail.ID,
+		Name:      detail.Name,
+		CreatedAt: detail.StartedAt,
+		Model:     detail.Model,
+		Channel:   detail.Channel,
+		Messages:  detail.Messages,
+	})
+}
+
+// importArchivedSessionItem imports an archived transcript into a new live
+// session whose top-level history is seeded from the archived conversation.
+func (s *Server) importArchivedSessionItem(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AiharnHome == "" {
+		writeError(w, http.StatusNotFound, errArchivedNotFound)
+		return
+	}
+
+	key := strings.TrimPrefix(r.URL.Path, archiveSessionsItemPrefix)
+	if key == "" || filepath.Base(key) != key || filepath.Ext(key) != archiveExt {
+		writeError(w, http.StatusNotFound, errArchivedNotFound)
+		return
+	}
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := decodeOptionalJSON(w, r, &body); err != nil {
+		return
+	}
+
+	history, meta, err := recorder.ArchivedHistory(s.cfg.AiharnHome, key)
+	if err != nil {
+		if errors.Is(err, recorder.ErrArchivedNotFound) {
+			writeError(w, http.StatusNotFound, errArchivedNotFound)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "cannot read archived session")
+		return
+	}
+
+	handle, err := s.cfg.Sessions.Import(r.Context(), body.Name, history, meta)
+	switch {
+	case errors.Is(err, sessions.ErrNameInvalid):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, sessions.ErrLimitReached):
+		writeError(w, http.StatusConflict, "maximum number of sessions reached")
+	case errors.Is(err, sessions.ErrClosed):
+		writeError(w, http.StatusConflict, "session store is closed")
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "cannot import session")
+	default:
+		// Building a session opens its execution session, so this call can block
+		// on a slow channel.
+		writeJSON(w, http.StatusCreated, s.describe(r.Context(), handle, false))
+	}
 }

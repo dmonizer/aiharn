@@ -4,6 +4,7 @@ package chatcompletions
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +59,66 @@ type callBuilder struct {
 	args strings.Builder
 }
 
+// streamChunk is a chat-completions stream event decoded leniently. The
+// go-openai SDK types delta content as a plain string, but some providers (for
+// example Mistral) send content as an array of content parts. Decoding into
+// json.RawMessage lets us accept both shapes without losing the SDK's
+// request-side types.
+type streamChunk struct {
+	Choices []streamChoice `json:"choices"`
+	Usage   *openai.Usage  `json:"usage"`
+}
+
+type streamChoice struct {
+	Index        int             `json:"index"`
+	Delta        streamDelta     `json:"delta"`
+	FinishReason json.RawMessage `json:"finish_reason"`
+}
+
+type streamDelta struct {
+	Content          json.RawMessage   `json:"content"`
+	ReasoningContent json.RawMessage   `json:"reasoning_content"`
+	Refusal          json.RawMessage   `json:"refusal"`
+	ToolCalls        []openai.ToolCall `json:"tool_calls"`
+}
+
+// streamText decodes a delta text field. Providers either send a plain JSON
+// string or an array of content parts (for example
+// [{"type":"text","text":"..."}]). Absent and null decode to the empty string;
+// any other shape is an error.
+func streamText(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return single, nil
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", err
+	}
+	var text strings.Builder
+	for _, part := range parts {
+		text.WriteString(part.Text)
+	}
+	return text.String(), nil
+}
+
+func streamFinishReason(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var reason string
+	if err := json.Unmarshal(raw, &reason); err != nil {
+		return ""
+	}
+	return reason
+}
+
 func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out chan<- llm.Event) {
 	var text strings.Builder
 	calls := make(map[int]*callBuilder)
@@ -66,7 +127,7 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 	usage := llm.Usage{}
 
 	for {
-		chunk, err := stream.Recv()
+		raw, err := stream.RecvRaw()
 		if err != nil {
 			switch {
 			case ctx.Err() != nil:
@@ -88,6 +149,11 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 			return
 		}
 
+		var chunk streamChunk
+		if err := json.Unmarshal(raw, &chunk); err != nil {
+			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+			return
+		}
 		if chunk.Usage != nil {
 			usage = llm.Usage{
 				InputTokens:  chunk.Usage.PromptTokens,
@@ -100,12 +166,29 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 				continue
 			}
 			sawChoice = true
-			if choice.Delta.ReasoningContent != "" {
-				if !emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: choice.Delta.ReasoningContent}) {
+
+			reasoning, err := streamText(choice.Delta.ReasoningContent)
+			if err != nil {
+				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+				return
+			}
+			if reasoning != "" {
+				if !emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: reasoning}) {
 					return
 				}
 			}
-			for _, delta := range []string{choice.Delta.Content, choice.Delta.Refusal} {
+
+			content, err := streamText(choice.Delta.Content)
+			if err != nil {
+				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+				return
+			}
+			refusal, err := streamText(choice.Delta.Refusal)
+			if err != nil {
+				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+				return
+			}
+			for _, delta := range []string{content, refusal} {
 				if delta != "" {
 					text.WriteString(delta)
 					if !emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: delta}) {
@@ -113,6 +196,7 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 					}
 				}
 			}
+
 			for position, call := range choice.Delta.ToolCalls {
 				if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
 					return
@@ -140,8 +224,9 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 				}
 				builder.args.WriteString(call.Function.Arguments)
 			}
-			if choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonNull {
-				finish = string(choice.FinishReason)
+
+			if reason := streamFinishReason(choice.FinishReason); reason != "" && reason != string(openai.FinishReasonNull) {
+				finish = reason
 			}
 		}
 	}
