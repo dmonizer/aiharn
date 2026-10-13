@@ -97,6 +97,17 @@ func applyDefaults(cfg *Config) {
 	if cfg.Agents == nil {
 		cfg.Agents = map[string]AgentConfig{}
 	}
+	applyChannelDefaults(cfg)
+	applyAgentDefaults(cfg)
+	applyLimitsDefaults(cfg)
+
+	if cfg.Approval.Mode == "" {
+		cfg.Approval.Mode = defaultApprovalMode
+	}
+	cfg.Shortcuts = cfg.Shortcuts.WithDefaults()
+}
+
+func applyChannelDefaults(cfg *Config) {
 	for i := range cfg.Channels {
 		c := &cfg.Channels[i]
 		if c.Type == "" {
@@ -113,14 +124,18 @@ func applyDefaults(cfg *Config) {
 			c.DefaultShell = defaultShell
 		}
 	}
+}
 
+func applyAgentDefaults(cfg *Config) {
 	for name, a := range cfg.Agents {
 		if a.Tools.Mode == "" {
 			a.Tools.Mode = defaultToolsMode
 		}
 		cfg.Agents[name] = a
 	}
+}
 
+func applyLimitsDefaults(cfg *Config) {
 	d := DefaultLimits()
 	if cfg.Limits.MaxAgentDepth == 0 {
 		cfg.Limits.MaxAgentDepth = d.MaxAgentDepth
@@ -158,11 +173,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Limits.TranscriptMaxBytes == 0 {
 		cfg.Limits.TranscriptMaxBytes = d.TranscriptMaxBytes
 	}
-
-	if cfg.Approval.Mode == "" {
-		cfg.Approval.Mode = defaultApprovalMode
-	}
-	cfg.Shortcuts = cfg.Shortcuts.WithDefaults()
 }
 
 // formatKeys renders []toml.Key as "a.b.c" for error messages.

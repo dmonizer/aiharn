@@ -286,31 +286,74 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, name, 
 		return "", err
 	}
 	m.mu.Lock()
-	if m.closed {
+	depth, id, name, builder, err := m.prepareSpawnLocked(callerID, agentType, name)
+	if err != nil {
 		m.mu.Unlock()
-		return "", ErrClosed
+		return "", err
+	}
+	m.mu.Unlock()
+	defer m.wg.Done()
+
+	if builder == nil {
+		m.rollbackSpawn()
+		return "", errors.New("agent: no subagent builder configured")
+	}
+
+	sub, err := builder(ctx, SpawnSpec{
+		ID: id, Name: name, Type: agentType, Depth: depth, CallerID: callerID,
+		InboxCapacity: m.inboxCap, EventCapacity: m.eventCap,
+	})
+	if err != nil {
+		m.rollbackSpawn()
+		return "", fmt.Errorf("agent: spawn %q: %w", agentType, err)
+	}
+	if sub == nil {
+		m.rollbackSpawn()
+		return "", fmt.Errorf("agent: spawn %q: builder returned nil agent", agentType)
+	}
+	if !spawnMatchesSpec(sub, id, name, agentType, depth, callerID) {
+		m.rollbackSpawn()
+		sub.Close()
+		return "", fmt.Errorf("agent: spawn %q: builder returned an agent that does not match its spawn spec", agentType)
+	}
+
+	if err := m.registerSpawn(ctx, callerID, agentType, id, name, sub); err != nil {
+		return "", err
+	}
+
+	m.notify()
+	// The initial task prompt is written by the parent model, not a person, and
+	// travels "down" to a descendant.
+	if sub.SendAgent(prompt, &llm.Delivery{
+		From: callerID, To: id, Direction: llm.DirectionDown, Kind: llm.KindTask,
+	}) {
+		sub.emit(Event{Type: EventTaskQueued, Text: prompt})
+	}
+	return id, nil
+}
+
+// prepareSpawnLocked validates a spawn request and reserves its slot and wait
+// group entry. The caller must hold m.mu.
+func (m *Manager) prepareSpawnLocked(callerID, agentType, name string) (int, string, string, Builder, error) {
+	if m.closed {
+		return 0, "", "", nil, ErrClosed
 	}
 	caller := m.agents[callerID]
 	if caller == nil {
-		m.mu.Unlock()
-		return "", ErrCallerNotFound
+		return 0, "", "", nil, ErrCallerNotFound
 	}
 	if !isOpen(caller) {
-		m.mu.Unlock()
-		return "", ErrCallerUnavailable
+		return 0, "", "", nil, ErrCallerUnavailable
 	}
 	if !caller.AllowSubagents() {
-		m.mu.Unlock()
-		return "", ErrSubagentsNotAllowed
+		return 0, "", "", nil, ErrSubagentsNotAllowed
 	}
 	depth := caller.Depth() + 1
 	if depth > m.maxDepth {
-		m.mu.Unlock()
-		return "", ErrMaxDepth
+		return 0, "", "", nil, ErrMaxDepth
 	}
 	if m.openCountLocked()+m.building >= m.maxAgents {
-		m.mu.Unlock()
-		return "", ErrMaxAgents
+		return 0, "", "", nil, ErrMaxAgents
 	}
 	m.seq++
 	id := fmt.Sprintf("%s-%d", agentType, m.seq)
@@ -320,57 +363,42 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, name, 
 	}
 	m.building++
 	m.wg.Add(1)
-	builder := m.builder
+	return depth, id, name, m.builder, nil
+}
+
+// rollbackSpawn releases the spawn reservation taken by prepareSpawnLocked.
+func (m *Manager) rollbackSpawn() {
+	m.mu.Lock()
+	m.building--
 	m.mu.Unlock()
-	defer m.wg.Done()
-	if builder == nil {
-		m.mu.Lock()
-		m.building--
-		m.mu.Unlock()
-		return "", errors.New("agent: no subagent builder configured")
-	}
+}
 
-	sub, err := builder(ctx, SpawnSpec{
-		ID: id, Name: name, Type: agentType, Depth: depth, CallerID: callerID,
-		InboxCapacity: m.inboxCap, EventCapacity: m.eventCap,
-	})
-	if err != nil {
-		m.mu.Lock()
-		m.building--
-		m.mu.Unlock()
-		return "", fmt.Errorf("agent: spawn %q: %w", agentType, err)
-	}
-	if sub == nil {
-		m.mu.Lock()
-		m.building--
-		m.mu.Unlock()
-		return "", fmt.Errorf("agent: spawn %q: builder returned nil agent", agentType)
-	}
-	if sub.ID() != id || sub.Name() != name || sub.Type() != agentType || sub.Depth() != depth || sub.CallerID() != callerID {
-		m.mu.Lock()
-		m.building--
-		m.mu.Unlock()
-		sub.Close()
-		return "", fmt.Errorf("agent: spawn %q: builder returned an agent that does not match its spawn spec", agentType)
-	}
+// spawnMatchesSpec reports whether a built subagent matches the spec it was
+// built from.
+func spawnMatchesSpec(sub *Agent, id, name, agentType string, depth int, callerID string) bool {
+	return sub.ID() == id && sub.Name() == name && sub.Type() == agentType && sub.Depth() == depth && sub.CallerID() == callerID
+}
 
+// registerSpawn publishes a built subagent into the agent tree and starts its
+// run loop. It closes the subagent if the manager or caller is no longer open.
+func (m *Manager) registerSpawn(ctx context.Context, callerID, agentType, id, name string, sub *Agent) error {
 	m.mu.Lock()
 	m.building--
 	if m.closed {
 		m.mu.Unlock()
 		sub.Close()
-		return "", ErrClosed
+		return ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		m.mu.Unlock()
 		sub.Close()
-		return "", err
+		return err
 	}
-	caller = m.agents[callerID]
+	caller := m.agents[callerID]
 	if caller == nil || !isOpen(caller) {
 		m.mu.Unlock()
 		sub.Close()
-		return "", ErrCallerUnavailable
+		return ErrCallerUnavailable
 	}
 	subCtx, subCancel := context.WithCancel(context.Background())
 	sub.setContext(subCtx, subCancel)
@@ -403,16 +431,7 @@ func (m *Manager) SpawnSubagent(ctx context.Context, callerID, agentType, name, 
 		}
 	}()
 	m.mu.Unlock()
-
-	m.notify()
-	// The initial task prompt is written by the parent model, not a person, and
-	// travels "down" to a descendant.
-	if sub.SendAgent(prompt, &llm.Delivery{
-		From: callerID, To: id, Direction: llm.DirectionDown, Kind: llm.KindTask,
-	}) {
-		sub.emit(Event{Type: EventTaskQueued, Text: prompt})
-	}
-	return id, nil
+	return nil
 }
 
 // SendSubagentMessage implements tools.SubagentBackend. The CALLER supplies the

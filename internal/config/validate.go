@@ -48,53 +48,68 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 		errs = append(errs, "aiharn_home must resolve to an absolute local directory")
 	}
 	validateShortcuts(&errs, cfg.Shortcuts)
+
 	providers := opts.providers()
 	channelTypes := opts.channelTypes()
 
-	// Models.
-	for name, m := range cfg.Models {
+	validateModels(&errs, cfg.Models, providers)
+	seenChannels := validateChannels(&errs, cfg.Channels, channelTypes)
+	validateAgents(&errs, cfg.Agents, cfg.Models, seenChannels, opts.KnownTools)
+	validateLimits(&errs, cfg.Limits)
+	validateApproval(&errs, cfg.Approval.Mode)
+	validateAPI(&errs, cfg.API)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("config: validation failed:\n  - %s", joinErrs(errs))
+	}
+	return nil
+}
+
+func validateModels(errs *[]string, models map[string]ModelConfig, providers map[string]bool) {
+	for name, m := range models {
 		if name == "" {
-			errs = append(errs, "models: name must not be empty")
+			*errs = append(*errs, "models: name must not be empty")
 		}
 		if m.Model == "" {
-			errs = append(errs, fmt.Sprintf("models[%q].model is required", name))
+			*errs = append(*errs, fmt.Sprintf("models[%q].model is required", name))
 		}
 		if !providers[m.Provider] {
-			errs = append(errs, fmt.Sprintf("models[%q].provider %q is unsupported", name, m.Provider))
+			*errs = append(*errs, fmt.Sprintf("models[%q].provider %q is unsupported", name, m.Provider))
 		}
 		if m.APIKey == "" {
-			errs = append(errs, fmt.Sprintf("models[%q].api_key is required", name))
+			*errs = append(*errs, fmt.Sprintf("models[%q].api_key is required", name))
 		}
-		validateModelBaseURL(&errs, name, m)
+		validateModelBaseURL(errs, name, m)
 		if !validReasoningEffort(m.ReasoningEffort) {
-			errs = append(errs, fmt.Sprintf("models[%q].reasoning_effort %q is invalid", name, m.ReasoningEffort))
+			*errs = append(*errs, fmt.Sprintf("models[%q].reasoning_effort %q is invalid", name, m.ReasoningEffort))
 		}
 		if !validReasoningSummary(m.ReasoningSummary) {
-			errs = append(errs, fmt.Sprintf("models[%q].reasoning_summary %q is invalid", name, m.ReasoningSummary))
+			*errs = append(*errs, fmt.Sprintf("models[%q].reasoning_summary %q is invalid", name, m.ReasoningSummary))
 		}
 		if m.ReasoningSummary != "" && m.Provider != ProviderOpenAIResponses {
-			errs = append(errs, fmt.Sprintf("models[%q].reasoning_summary requires provider %q", name, ProviderOpenAIResponses))
+			*errs = append(*errs, fmt.Sprintf("models[%q].reasoning_summary requires provider %q", name, ProviderOpenAIResponses))
 		}
 		if m.ReasoningEffort == "none" && m.ReasoningSummary != "" {
-			errs = append(errs, fmt.Sprintf("models[%q]: reasoning_summary cannot be requested when reasoning_effort is %q", name, "none"))
+			*errs = append(*errs, fmt.Sprintf("models[%q]: reasoning_summary cannot be requested when reasoning_effort is %q", name, "none"))
 		}
 	}
+}
 
-	// Channels: names unique, required fields, type known, auth set.
-	seenChannels := map[string]bool{}
-	for i := range cfg.Channels {
-		c := &cfg.Channels[i]
+func validateChannels(errs *[]string, channels []ChannelConfig, channelTypes map[string]bool) map[string]bool {
+	seen := map[string]bool{}
+	for i := range channels {
+		c := &channels[i]
 		if c.Name == "" {
-			errs = append(errs, fmt.Sprintf("channels[%d].name is required", i))
+			*errs = append(*errs, fmt.Sprintf("channels[%d].name is required", i))
 			continue
 		}
-		if seenChannels[c.Name] {
-			errs = append(errs, fmt.Sprintf("channels: duplicate name %q", c.Name))
+		if seen[c.Name] {
+			*errs = append(*errs, fmt.Sprintf("channels: duplicate name %q", c.Name))
 		}
-		seenChannels[c.Name] = true
+		seen[c.Name] = true
 
 		if !channelTypes[c.Type] {
-			errs = append(errs, fmt.Sprintf("channels[%q].type %q is unsupported", c.Name, c.Type))
+			*errs = append(*errs, fmt.Sprintf("channels[%q].type %q is unsupported", c.Name, c.Type))
 		}
 		switch c.Type {
 		case ChannelTypeLocal:
@@ -102,133 +117,136 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 			// port, user, auth, or host-key verification.
 			continue
 		case ChannelTypeSSH:
-			if c.Host == "" {
-				errs = append(errs, fmt.Sprintf("channels[%q].host is required", c.Name))
-			}
-			if c.Port < 1 || c.Port > 65535 {
-				errs = append(errs, fmt.Sprintf("channels[%q].port must be between 1 and 65535", c.Name))
-			}
-			// An SSH alias (name + host only) resolves user/auth/known_hosts from
-			// ~/.ssh/config at runtime, so those fields are not required here.
-			if c.IsSSHConfigAlias() {
-				continue
-			}
-			if c.User == "" {
-				errs = append(errs, fmt.Sprintf("channels[%q].user is required", c.Name))
-			}
-			if c.Auth.KeyFile == "" && c.Auth.Password == "" {
-				errs = append(errs, fmt.Sprintf("channels[%q].auth: one of key_file or password is required", c.Name))
-			}
-			if c.Auth.KeyFile != "" && c.Auth.Password != "" {
-				errs = append(errs, fmt.Sprintf("channels[%q].auth: key_file and password are mutually exclusive", c.Name))
-			}
-			if c.Auth.KeyFile != "" {
-				validateRegularFile(&errs, fmt.Sprintf("channels[%q].auth.key_file", c.Name), c.Auth.KeyFile)
-			}
-			if !c.Insecure && c.KnownHosts == "" {
-				errs = append(errs, fmt.Sprintf("channels[%q].known_hosts is required unless insecure=true", c.Name))
-			}
-			if c.KnownHosts != "" {
-				validateRegularFile(&errs, fmt.Sprintf("channels[%q].known_hosts", c.Name), c.KnownHosts)
-			}
+			validateSSHChannel(errs, c)
 		}
 	}
-
-	if len(cfg.Channels) == 0 {
-		errs = append(errs, "at least one channel is required")
+	if len(channels) == 0 {
+		*errs = append(*errs, "at least one channel is required")
 	}
+	return seen
+}
 
-	// Agents.
-	for name, a := range cfg.Agents {
+func validateSSHChannel(errs *[]string, c *ChannelConfig) {
+	if c.Host == "" {
+		*errs = append(*errs, fmt.Sprintf("channels[%q].host is required", c.Name))
+	}
+	if c.Port < 1 || c.Port > 65535 {
+		*errs = append(*errs, fmt.Sprintf("channels[%q].port must be between 1 and 65535", c.Name))
+	}
+	// An SSH alias (name + host only) resolves user/auth/known_hosts from
+	// ~/.ssh/config at runtime, so those fields are not required here.
+	if c.IsSSHConfigAlias() {
+		return
+	}
+	if c.User == "" {
+		*errs = append(*errs, fmt.Sprintf("channels[%q].user is required", c.Name))
+	}
+	if c.Auth.KeyFile == "" && c.Auth.Password == "" {
+		*errs = append(*errs, fmt.Sprintf("channels[%q].auth: one of key_file or password is required", c.Name))
+	}
+	if c.Auth.KeyFile != "" && c.Auth.Password != "" {
+		*errs = append(*errs, fmt.Sprintf("channels[%q].auth: key_file and password are mutually exclusive", c.Name))
+	}
+	if c.Auth.KeyFile != "" {
+		validateRegularFile(errs, fmt.Sprintf("channels[%q].auth.key_file", c.Name), c.Auth.KeyFile)
+	}
+	if !c.Insecure && c.KnownHosts == "" {
+		*errs = append(*errs, fmt.Sprintf("channels[%q].known_hosts is required unless insecure=true", c.Name))
+	}
+	if c.KnownHosts != "" {
+		validateRegularFile(errs, fmt.Sprintf("channels[%q].known_hosts", c.Name), c.KnownHosts)
+	}
+}
+
+func validateAgents(errs *[]string, agents map[string]AgentConfig, models map[string]ModelConfig, seenChannels map[string]bool, knownTools map[string]bool) {
+	for name, a := range agents {
 		if name == "" {
-			errs = append(errs, "agents: name must not be empty")
+			*errs = append(*errs, "agents: name must not be empty")
 		}
 		if a.Model == "" {
-			errs = append(errs, fmt.Sprintf("agents[%q].model is required", name))
-		} else if _, ok := cfg.Models[a.Model]; !ok {
-			errs = append(errs, fmt.Sprintf("agents[%q].model %q is not defined", name, a.Model))
+			*errs = append(*errs, fmt.Sprintf("agents[%q].model is required", name))
+		} else if _, ok := models[a.Model]; !ok {
+			*errs = append(*errs, fmt.Sprintf("agents[%q].model %q is not defined", name, a.Model))
 		}
 		if a.Channel != "" && !seenChannels[a.Channel] {
-			errs = append(errs, fmt.Sprintf("agents[%q].channel %q is not defined", name, a.Channel))
+			*errs = append(*errs, fmt.Sprintf("agents[%q].channel %q is not defined", name, a.Channel))
 		}
 		if a.SystemPrompt == "" {
-			errs = append(errs, fmt.Sprintf("agents[%q].system_prompt is required", name))
+			*errs = append(*errs, fmt.Sprintf("agents[%q].system_prompt is required", name))
 		} else {
-			validateRegularFile(&errs, fmt.Sprintf("agents[%q].system_prompt", name), a.SystemPrompt)
+			validateRegularFile(errs, fmt.Sprintf("agents[%q].system_prompt", name), a.SystemPrompt)
 		}
-		switch a.Tools.Mode {
-		case ToolModeNone, ToolModeAll:
-		case ToolModeList:
-			if len(a.Tools.Names) == 0 {
-				errs = append(errs, fmt.Sprintf("agents[%q].tools: list must not be empty", name))
-			}
-			seenTools := make(map[string]bool, len(a.Tools.Names))
-			for _, tn := range a.Tools.Names {
-				if seenTools[tn] {
-					errs = append(errs, fmt.Sprintf("agents[%q].tools: duplicate tool %q", name, tn))
-				}
-				seenTools[tn] = true
-				if opts.KnownTools != nil && !opts.KnownTools[tn] {
-					errs = append(errs, fmt.Sprintf("agents[%q].tools: unknown tool %q", name, tn))
-				}
-			}
-		default:
-			errs = append(errs, fmt.Sprintf("agents[%q].tools: invalid mode %q", name, a.Tools.Mode))
-		}
+		validateAgentTools(errs, name, a.Tools, knownTools)
 	}
+}
 
-	// Limits.
-	lim := cfg.Limits
+func validateAgentTools(errs *[]string, name string, tools ToolSelection, knownTools map[string]bool) {
+	switch tools.Mode {
+	case ToolModeNone, ToolModeAll:
+	case ToolModeList:
+		if len(tools.Names) == 0 {
+			*errs = append(*errs, fmt.Sprintf("agents[%q].tools: list must not be empty", name))
+		}
+		seen := make(map[string]bool, len(tools.Names))
+		for _, tn := range tools.Names {
+			if seen[tn] {
+				*errs = append(*errs, fmt.Sprintf("agents[%q].tools: duplicate tool %q", name, tn))
+			}
+			seen[tn] = true
+			if knownTools != nil && !knownTools[tn] {
+				*errs = append(*errs, fmt.Sprintf("agents[%q].tools: unknown tool %q", name, tn))
+			}
+		}
+	default:
+		*errs = append(*errs, fmt.Sprintf("agents[%q].tools: invalid mode %q", name, tools.Mode))
+	}
+}
+
+func validateLimits(errs *[]string, lim LimitsConfig) {
 	if lim.MaxAgentDepth < 0 {
-		errs = append(errs, "limits.max_agent_depth must be positive")
+		*errs = append(*errs, "limits.max_agent_depth must be positive")
 	}
 	if lim.MaxOpenAgents < 0 {
-		errs = append(errs, "limits.max_open_agents must be positive")
+		*errs = append(*errs, "limits.max_open_agents must be positive")
 	}
 	if lim.CommandTimeout < 0 {
-		errs = append(errs, "limits.command_timeout must be positive")
+		*errs = append(*errs, "limits.command_timeout must be positive")
 	}
 	if lim.CommandOutputBytes < 0 {
-		errs = append(errs, "limits.command_output_bytes must be positive")
+		*errs = append(*errs, "limits.command_output_bytes must be positive")
 	}
 	if lim.ToolResultBytes < 0 {
-		errs = append(errs, "limits.tool_result_bytes must be positive")
+		*errs = append(*errs, "limits.tool_result_bytes must be positive")
 	}
 	if lim.InboxDepth < 0 {
-		errs = append(errs, "limits.inbox_depth must be positive")
+		*errs = append(*errs, "limits.inbox_depth must be positive")
 	}
 	if lim.EventCapacity < 0 {
-		errs = append(errs, "limits.event_capacity must be positive")
+		*errs = append(*errs, "limits.event_capacity must be positive")
 	}
 	if lim.ToolcallsPerTurn < 0 {
-		errs = append(errs, "limits.toolcalls_per_turn must be positive")
+		*errs = append(*errs, "limits.toolcalls_per_turn must be positive")
 	}
 	if lim.ThinkingTimeout < 0 {
-		errs = append(errs, "limits.thinking_timeout must be positive")
+		*errs = append(*errs, "limits.thinking_timeout must be positive")
 	}
 	if lim.RequestTimeout < 0 {
-		errs = append(errs, "limits.request_timeout must be positive")
+		*errs = append(*errs, "limits.request_timeout must be positive")
 	}
 	if lim.TranscriptMaxItems < 0 {
-		errs = append(errs, "limits.transcript_max_items must be positive")
+		*errs = append(*errs, "limits.transcript_max_items must be positive")
 	}
 	if lim.TranscriptMaxBytes < 0 {
-		errs = append(errs, "limits.transcript_max_bytes must be positive")
+		*errs = append(*errs, "limits.transcript_max_bytes must be positive")
 	}
+}
 
-	// Approval.
-	switch cfg.Approval.Mode {
+func validateApproval(errs *[]string, mode string) {
+	switch mode {
 	case ApprovalModeAsk, ApprovalModeAllowAll:
 	default:
-		errs = append(errs, fmt.Sprintf("approval.mode %q is invalid (want %q or %q)", cfg.Approval.Mode, ApprovalModeAsk, ApprovalModeAllowAll))
+		*errs = append(*errs, fmt.Sprintf("approval.mode %q is invalid (want %q or %q)", mode, ApprovalModeAsk, ApprovalModeAllowAll))
 	}
-
-	validateAPI(&errs, cfg.API)
-
-	if len(errs) > 0 {
-		return fmt.Errorf("config: validation failed:\n  - %s", joinErrs(errs))
-	}
-	return nil
 }
 
 func validReasoningEffort(value string) bool {
@@ -265,33 +283,44 @@ func validateAPI(errs *[]string, api APIConfig) {
 		*errs = append(*errs, "api.max_sessions must not be negative")
 	}
 	if api.Listen != "" {
-		if api.AuthFile == "" {
-			*errs = append(*errs, "api.auth_file is required when api.listen is set")
-		}
-		_, port, err := net.SplitHostPort(api.Listen)
-		if err != nil {
-			*errs = append(*errs, fmt.Sprintf("api.listen %q is not a valid host:port address", api.Listen))
-		} else {
-			number, err := strconv.Atoi(port)
-			if err != nil || number < 1 || number > 65535 {
-				*errs = append(*errs, "api.listen port must be between 1 and 65535")
-			}
-		}
+		validateAPIListen(errs, api)
 	}
-	for i, origin := range api.AllowOrigins {
+	validateAPIAllowOrigins(errs, api.AllowOrigins)
+}
+
+func validateAPIListen(errs *[]string, api APIConfig) {
+	if api.AuthFile == "" {
+		*errs = append(*errs, "api.auth_file is required when api.listen is set")
+	}
+	_, port, err := net.SplitHostPort(api.Listen)
+	if err != nil {
+		*errs = append(*errs, fmt.Sprintf("api.listen %q is not a valid host:port address", api.Listen))
+		return
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		*errs = append(*errs, "api.listen port must be between 1 and 65535")
+	}
+}
+
+func validateAPIAllowOrigins(errs *[]string, origins []string) {
+	for i, origin := range origins {
 		if origin == "*" {
 			continue
 		}
-		parsed, err := url.Parse(origin)
-		invalid := err != nil ||
-			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
-			parsed.Host == "" || parsed.User != nil || parsed.Path != "" ||
-			parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != ""
-		if invalid {
+		if invalidAllowOrigin(origin) {
 			*errs = append(*errs, fmt.Sprintf(
 				"api.allow_origins[%d] must be an HTTP(S) origin without credentials, path, query, or fragment", i))
 		}
 	}
+}
+
+func invalidAllowOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	return err != nil ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" || parsed.User != nil || parsed.Path != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != ""
 }
 
 func validateRegularFile(errs *[]string, field, path string) {

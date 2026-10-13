@@ -567,6 +567,21 @@ func truncateDisplay(s string, max int) string {
 	return b.String()
 }
 
+// oscEnd returns the index just past an OSC sequence (introduced by ESC ]),
+// which terminates at BEL or ST (ESC backslash). Unterminated sequences run
+// to the end of the string.
+func oscEnd(s string, start int) int {
+	for j := start; j < len(s); j++ {
+		if s[j] == '\a' {
+			return j + 1
+		}
+		if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+			return j + 2
+		}
+	}
+	return len(s)
+}
+
 // ansiEnd returns the index just past the ANSI escape sequence starting at i,
 // or the end of the string when the sequence is unterminated.
 func ansiEnd(s string, i int) int {
@@ -578,15 +593,7 @@ func ansiEnd(s string, i int) int {
 		// OSC sequences (including markdown-go's OSC 8 hyperlinks) end in
 		// BEL or ST. Treat the whole sequence as zero-width so truncation never
 		// displays or splits its control payload.
-		for j = j + 1; j < len(s); j++ {
-			if s[j] == '\a' {
-				return j + 1
-			}
-			if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
-				return j + 2
-			}
-		}
-		return len(s)
+		return oscEnd(s, j+1)
 	}
 	if s[j] != '[' {
 		return j + 1

@@ -597,16 +597,7 @@ func (m *Model) appendEvent(ev agent.Event) {
 			m.appendText("\n" + ev.Text)
 		}
 	case agent.EventToolLimit:
-		if ev.ToolLimit != nil {
-			if m.toolLimit == nil {
-				copy := *ev.ToolLimit
-				m.toolLimit = &copy
-			} else {
-				m.toolLimitQueue = append(m.toolLimitQueue, *ev.ToolLimit)
-			}
-			m.flushText()
-			m.appendLine(kindPlain, fmt.Sprintf("%d tool calls this turn. [s]top  [c]ontinue without limit  [d]ouble to %d", ev.ToolLimit.Count, ev.ToolLimit.Limit*2))
-		}
+		m.applyToolLimit(ev.ToolLimit)
 	case agent.EventToolLimitResolved:
 		m.removeToolLimit(ev.ToolLimit)
 	case agent.EventToolCall:
@@ -626,6 +617,22 @@ func (m *Model) appendEvent(ev agent.Event) {
 		// traffic is cross-agent and must never be hidden by focus.
 		m.appendAgentMessage(ev)
 	}
+}
+
+// applyToolLimit records a pending tool-call-limit prompt and renders the
+// choices for it. A nil request is ignored (the event can carry no payload).
+func (m *Model) applyToolLimit(tl *agent.ToolLimitRequest) {
+	if tl == nil {
+		return
+	}
+	if m.toolLimit == nil {
+		copy := *tl
+		m.toolLimit = &copy
+	} else {
+		m.toolLimitQueue = append(m.toolLimitQueue, *tl)
+	}
+	m.flushText()
+	m.appendLine(kindPlain, fmt.Sprintf("%d tool calls this turn. [s]top  [c]ontinue without limit  [d]ouble to %d", tl.Count, tl.Limit*2))
 }
 
 // appendAgentMessage renders one agent-to-agent message as its own line. The

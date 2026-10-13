@@ -494,18 +494,7 @@ func (m *Model) shellPane(rows int, topY int) string {
 	}
 	thumbStart, thumbSize := m.shellScrollbar(contentRows)
 	for i := m.shellScroll; i < end; i++ {
-		raw := truncateToColumns(m.shellFlat[i], contentW)
-		line := m.shellLineStyle(i, raw)
-		if showScrollbar && innerW > 1 {
-			line = lipgloss.NewStyle().Width(contentW).Render(line)
-			trackRow := i - m.shellScroll
-			glyph := "│"
-			if trackRow >= thumbStart && trackRow < thumbStart+thumbSize {
-				glyph = "█"
-			}
-			line += styleShellScroll.Render(glyph)
-		}
-		lines = append(lines, line)
+		lines = append(lines, m.shellScrollLine(i, contentW, showScrollbar, innerW, thumbStart, thumbSize))
 	}
 	return styleShellBorder.Render(fill(strings.Join(lines, "\n"), innerH))
 }
@@ -604,4 +593,21 @@ func normalizeCommand(s string) string {
 // rows render one column too wide.
 func truncateToColumns(s string, max int) string {
 	return truncateDisplay(s, max)
+}
+
+// shellScrollLine renders one flat shell line, appending a scrollbar glyph when
+// a scrollbar is visible.
+func (m *Model) shellScrollLine(i, contentW int, showScrollbar bool, innerW, thumbStart, thumbSize int) string {
+	raw := truncateToColumns(m.shellFlat[i], contentW)
+	line := m.shellLineStyle(i, raw)
+	if !showScrollbar || innerW <= 1 {
+		return line
+	}
+	line = lipgloss.NewStyle().Width(contentW).Render(line)
+	trackRow := i - m.shellScroll
+	glyph := "│"
+	if trackRow >= thumbStart && trackRow < thumbStart+thumbSize {
+		glyph = "█"
+	}
+	return line + styleShellScroll.Render(glyph)
 }

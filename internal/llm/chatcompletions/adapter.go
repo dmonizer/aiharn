@@ -129,23 +129,7 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 	for {
 		raw, err := stream.RecvRaw()
 		if err != nil {
-			switch {
-			case ctx.Err() != nil:
-				return
-			case errors.Is(err, io.EOF):
-				if !sawChoice || finish == "" {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("chat completions: stream ended before a finish reason")})
-					return
-				}
-				items, itemErr := completedItems(text.String(), calls)
-				if itemErr != nil {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: itemErr})
-					return
-				}
-				emit(ctx, out, llm.Event{Type: llm.EventCompleted, Items: items, Usage: usage, FinishReason: normalizeFinishReason(finish)})
-			default:
-				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
-			}
+			handleStreamError(ctx, out, err, text.String(), calls, sawChoice, finish, usage)
 			return
 		}
 
@@ -162,74 +146,136 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 			}
 		}
 		for _, choice := range chunk.Choices {
-			if choice.Index != 0 {
-				continue
-			}
-			sawChoice = true
-
-			reasoning, err := streamText(choice.Delta.ReasoningContent)
-			if err != nil {
-				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+			if !processChoice(ctx, out, choice, &text, calls, &finish, &sawChoice) {
 				return
-			}
-			if reasoning != "" {
-				if !emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: reasoning}) {
-					return
-				}
-			}
-
-			content, err := streamText(choice.Delta.Content)
-			if err != nil {
-				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
-				return
-			}
-			refusal, err := streamText(choice.Delta.Refusal)
-			if err != nil {
-				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
-				return
-			}
-			for _, delta := range []string{content, refusal} {
-				if delta != "" {
-					text.WriteString(delta)
-					if !emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: delta}) {
-						return
-					}
-				}
-			}
-
-			for position, call := range choice.Delta.ToolCalls {
-				if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
-					return
-				}
-				index := position
-				if call.Index != nil {
-					index = *call.Index
-				}
-				if index < 0 {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: negative tool-call index %d", index)})
-					return
-				}
-				builder := calls[index]
-				if builder == nil {
-					builder = &callBuilder{}
-					calls[index] = builder
-				}
-				if err := mergeStableField(&builder.id, call.ID, "id", index); err != nil {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
-					return
-				}
-				if err := mergeStableField(&builder.name, call.Function.Name, "name", index); err != nil {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
-					return
-				}
-				builder.args.WriteString(call.Function.Arguments)
-			}
-
-			if reason := streamFinishReason(choice.FinishReason); reason != "" && reason != string(openai.FinishReasonNull) {
-				finish = reason
 			}
 		}
 	}
+}
+
+// handleStreamError emits the terminal event for a stream receive error. It
+// only reads accumulated state; collectStream always returns immediately after
+// calling it.
+func handleStreamError(ctx context.Context, out chan<- llm.Event, err error, text string, calls map[int]*callBuilder, sawChoice bool, finish string, usage llm.Usage) {
+	switch {
+	case ctx.Err() != nil:
+		return
+	case errors.Is(err, io.EOF):
+		if !sawChoice || finish == "" {
+			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("chat completions: stream ended before a finish reason")})
+			return
+		}
+		items, itemErr := completedItems(text, calls)
+		if itemErr != nil {
+			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: itemErr})
+			return
+		}
+		emit(ctx, out, llm.Event{Type: llm.EventCompleted, Items: items, Usage: usage, FinishReason: normalizeFinishReason(finish)})
+	default:
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+	}
+}
+
+// processChoice folds one streamed choice into the accumulated reply state.
+// It reports false when the stream must stop (cancellation or fatal error).
+func processChoice(ctx context.Context, out chan<- llm.Event, choice streamChoice, text *strings.Builder, calls map[int]*callBuilder, finish *string, sawChoice *bool) bool {
+	if choice.Index != 0 {
+		return true
+	}
+	*sawChoice = true
+
+	if !streamReasoningDelta(ctx, out, choice.Delta.ReasoningContent) {
+		return false
+	}
+	content, refusal, err := decodeContentAndRefusal(choice.Delta.Content, choice.Delta.Refusal)
+	if err != nil {
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+		return false
+	}
+	if !emitTextDelta(ctx, out, content, text) {
+		return false
+	}
+	if !emitTextDelta(ctx, out, refusal, text) {
+		return false
+	}
+	if !streamToolCalls(ctx, out, choice.Delta.ToolCalls, calls) {
+		return false
+	}
+
+	if reason := streamFinishReason(choice.FinishReason); reason != "" && reason != string(openai.FinishReasonNull) {
+		*finish = reason
+	}
+	return true
+}
+
+// streamReasoningDelta decodes and emits a reasoning delta (not accumulated).
+func streamReasoningDelta(ctx context.Context, out chan<- llm.Event, raw json.RawMessage) bool {
+	delta, err := streamText(raw)
+	if err != nil {
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+		return false
+	}
+	if delta == "" {
+		return true
+	}
+	return emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: delta})
+}
+
+// decodeContentAndRefusal decodes the content and refusal deltas together,
+// mirroring the original ordering where both are validated before either is
+// emitted.
+func decodeContentAndRefusal(contentRaw, refusalRaw json.RawMessage) (string, string, error) {
+	content, err := streamText(contentRaw)
+	if err != nil {
+		return "", "", err
+	}
+	refusal, err := streamText(refusalRaw)
+	if err != nil {
+		return "", "", err
+	}
+	return content, refusal, nil
+}
+
+// emitTextDelta appends a non-empty text delta to the reply and emits it.
+func emitTextDelta(ctx context.Context, out chan<- llm.Event, delta string, text *strings.Builder) bool {
+	if delta == "" {
+		return true
+	}
+	text.WriteString(delta)
+	return emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: delta})
+}
+
+// streamToolCalls folds a delta's tool-call fragments into stable per-index
+// call builders, emitting a response-started event for each call seen.
+func streamToolCalls(ctx context.Context, out chan<- llm.Event, toolCalls []openai.ToolCall, calls map[int]*callBuilder) bool {
+	for position, call := range toolCalls {
+		if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
+			return false
+		}
+		index := position
+		if call.Index != nil {
+			index = *call.Index
+		}
+		if index < 0 {
+			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: negative tool-call index %d", index)})
+			return false
+		}
+		builder := calls[index]
+		if builder == nil {
+			builder = &callBuilder{}
+			calls[index] = builder
+		}
+		if err := mergeStableField(&builder.id, call.ID, "id", index); err != nil {
+			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
+			return false
+		}
+		if err := mergeStableField(&builder.name, call.Function.Name, "name", index); err != nil {
+			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
+			return false
+		}
+		builder.args.WriteString(call.Function.Arguments)
+	}
+	return true
 }
 
 func mergeStableField(dst *string, next, field string, index int) error {
@@ -284,50 +330,90 @@ func emit(ctx context.Context, out chan<- llm.Event, event llm.Event) bool {
 }
 
 func buildRequest(req llm.Request) (openai.ChatCompletionRequest, error) {
+	messages, err := buildMessages(req)
+	if err != nil {
+		return openai.ChatCompletionRequest{}, err
+	}
+	tools, err := buildTools(req.Tools)
+	if err != nil {
+		return openai.ChatCompletionRequest{}, err
+	}
+	return openai.ChatCompletionRequest{
+		Model: req.Model, Messages: messages, Tools: tools, Stream: true, ReasoningEffort: req.ReasoningEffort,
+	}, nil
+}
+
+// buildMessages converts the normalized input (plus the system prompt) into
+// SDK messages, grouping consecutive function calls into assistant messages.
+func buildMessages(req llm.Request) ([]openai.ChatCompletionMessage, error) {
 	messages := make([]openai.ChatCompletionMessage, 0, len(req.Input)+1)
 	if req.System != "" {
 		messages = append(messages, openai.ChatCompletionMessage{Role: "system", Content: req.System})
 	}
-
 	for i := 0; i < len(req.Input); {
-		item := req.Input[i]
-		switch item.Type {
-		case llm.ItemMessage:
-			if item.Role != llm.RoleUser && item.Role != llm.RoleAssistant {
-				return openai.ChatCompletionRequest{}, fmt.Errorf("input[%d]: invalid message role %q", i, item.Role)
-			}
-			message := openai.ChatCompletionMessage{Role: string(item.Role), Content: item.Content}
-			i++
-			if item.Role == llm.RoleAssistant {
-				var err error
-				message.ToolCalls, i, err = collectInputCalls(req.Input, i)
-				if err != nil {
-					return openai.ChatCompletionRequest{}, err
-				}
-			}
-			messages = append(messages, message)
-		case llm.ItemFunctionCall:
-			calls, next, err := collectInputCalls(req.Input, i)
-			if err != nil {
-				return openai.ChatCompletionRequest{}, err
-			}
-			messages = append(messages, openai.ChatCompletionMessage{Role: "assistant", ToolCalls: calls})
-			i = next
-		case llm.ItemFunctionCallOutput:
-			if item.CallID == "" {
-				return openai.ChatCompletionRequest{}, fmt.Errorf("input[%d]: function call output requires call id", i)
-			}
-			messages = append(messages, openai.ChatCompletionMessage{Role: "tool", ToolCallID: item.CallID, Content: item.Content})
-			i++
-		default:
-			return openai.ChatCompletionRequest{}, fmt.Errorf("input[%d]: unsupported item type %q", i, item.Type)
+		message, next, err := buildInputMessage(req.Input, i)
+		if err != nil {
+			return nil, err
 		}
+		messages = append(messages, message)
+		i = next
 	}
+	return messages, nil
+}
 
-	definitions := make([]openai.Tool, 0, len(req.Tools))
-	for i, tool := range req.Tools {
+// buildInputMessage converts the input item at index i into one SDK message and
+// returns the index of the next unconsumed input item.
+func buildInputMessage(input []llm.Item, i int) (openai.ChatCompletionMessage, int, error) {
+	item := input[i]
+	switch item.Type {
+	case llm.ItemMessage:
+		return buildMessageItem(input, i, item)
+	case llm.ItemFunctionCall:
+		return buildFunctionCallMessage(input, i)
+	case llm.ItemFunctionCallOutput:
+		return buildFunctionCallOutputMessage(i, item)
+	default:
+		return openai.ChatCompletionMessage{}, i, fmt.Errorf("input[%d]: unsupported item type %q", i, item.Type)
+	}
+}
+
+func buildMessageItem(input []llm.Item, i int, item llm.Item) (openai.ChatCompletionMessage, int, error) {
+	if item.Role != llm.RoleUser && item.Role != llm.RoleAssistant {
+		return openai.ChatCompletionMessage{}, i, fmt.Errorf("input[%d]: invalid message role %q", i, item.Role)
+	}
+	message := openai.ChatCompletionMessage{Role: string(item.Role), Content: item.Content}
+	i++
+	if item.Role != llm.RoleAssistant {
+		return message, i, nil
+	}
+	var err error
+	message.ToolCalls, i, err = collectInputCalls(input, i)
+	if err != nil {
+		return openai.ChatCompletionMessage{}, i, err
+	}
+	return message, i, nil
+}
+
+func buildFunctionCallMessage(input []llm.Item, i int) (openai.ChatCompletionMessage, int, error) {
+	calls, next, err := collectInputCalls(input, i)
+	if err != nil {
+		return openai.ChatCompletionMessage{}, i, err
+	}
+	return openai.ChatCompletionMessage{Role: "assistant", ToolCalls: calls}, next, nil
+}
+
+func buildFunctionCallOutputMessage(i int, item llm.Item) (openai.ChatCompletionMessage, int, error) {
+	if item.CallID == "" {
+		return openai.ChatCompletionMessage{}, i, fmt.Errorf("input[%d]: function call output requires call id", i)
+	}
+	return openai.ChatCompletionMessage{Role: "tool", ToolCallID: item.CallID, Content: item.Content}, i + 1, nil
+}
+
+func buildTools(tools []llm.ToolDefinition) ([]openai.Tool, error) {
+	definitions := make([]openai.Tool, 0, len(tools))
+	for i, tool := range tools {
 		if tool.Name == "" {
-			return openai.ChatCompletionRequest{}, fmt.Errorf("tool[%d]: name is required", i)
+			return nil, fmt.Errorf("tool[%d]: name is required", i)
 		}
 		definitions = append(definitions, openai.Tool{
 			Type: openai.ToolTypeFunction,
@@ -336,10 +422,7 @@ func buildRequest(req llm.Request) (openai.ChatCompletionRequest, error) {
 			},
 		})
 	}
-
-	return openai.ChatCompletionRequest{
-		Model: req.Model, Messages: messages, Tools: definitions, Stream: true, ReasoningEffort: req.ReasoningEffort,
-	}, nil
+	return definitions, nil
 }
 
 func collectInputCalls(input []llm.Item, start int) ([]openai.ToolCall, int, error) {

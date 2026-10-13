@@ -51,64 +51,83 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 	go func() {
 		defer close(out)
 		defer stream.Close()
-
-		for {
-			evt, err := stream.Recv()
-			if err != nil {
-				switch {
-				case errors.Is(err, io.EOF):
-					// Stream ended without a terminal event: a protocol error.
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: stream ended without a terminal event")})
-				case ctx.Err() != nil:
-					// Cancellation: close without a terminal event.
-					return
-				default:
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: stream: %w", err)})
-				}
-				return
-			}
-
-			switch evt.Type {
-			case openai.ResponseStreamEventReasoningSummaryTextDelta, openai.ResponseStreamEventReasoningTextDelta:
-				if !emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: evt.Delta}) {
-					return
-				}
-			case openai.ResponseStreamEventOutputTextDelta:
-				if !emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: evt.Delta}) {
-					return
-				}
-			case openai.ResponseStreamEventFunctionArgumentsDelta,
-				openai.ResponseStreamEventCustomToolInputDelta:
-				if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
-					return
-				}
-			case openai.ResponseStreamEventCompleted:
-				if evt.Response == nil {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: completed event has no response")})
-					return
-				}
-				items, err := translateOutputItems(responseOutput(evt))
-				if err != nil {
-					emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: translate output: %w", err)})
-					return
-				}
-				emit(ctx, out, llm.Event{
-					Type:         llm.EventCompleted,
-					Items:        items,
-					Usage:        usage(responseUsage(evt)),
-					FinishReason: finishReason(evt.Response),
-				})
-				return
-			case openai.ResponseStreamEventFailed:
-				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
-				return
-			case openai.ResponseStreamEventError:
-				emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
-				return
-			}
-		}
+		collectStream(ctx, stream, out)
 	}()
 	return out, nil
+}
+
+// collectStream drains the Responses stream, translating each event into the
+// provider-neutral event model until a terminal event or cancellation.
+func collectStream(ctx context.Context, stream *openai.ResponseStream, out chan<- llm.Event) {
+	for {
+		evt, err := stream.Recv()
+		if err != nil {
+			handleStreamError(ctx, out, err)
+			return
+		}
+		if !handleStreamEvent(ctx, out, evt) {
+			return
+		}
+	}
+}
+
+// handleStreamError emits the terminal event for a stream receive error. A
+// context cancellation terminates without emitting a terminal event.
+func handleStreamError(ctx context.Context, out chan<- llm.Event, err error) {
+	switch {
+	case errors.Is(err, io.EOF):
+		// Stream ended without a terminal event: a protocol error.
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: stream ended without a terminal event")})
+	case ctx.Err() != nil:
+		// Cancellation: close without a terminal event.
+		return
+	default:
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: stream: %w", err)})
+	}
+}
+
+// handleStreamEvent translates one stream event, reporting false when the
+// stream must stop (a terminal event or cancellation).
+func handleStreamEvent(ctx context.Context, out chan<- llm.Event, evt openai.ResponseStreamEvent) bool {
+	switch evt.Type {
+	case openai.ResponseStreamEventReasoningSummaryTextDelta, openai.ResponseStreamEventReasoningTextDelta:
+		return emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: evt.Delta})
+	case openai.ResponseStreamEventOutputTextDelta:
+		return emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: evt.Delta})
+	case openai.ResponseStreamEventFunctionArgumentsDelta,
+		openai.ResponseStreamEventCustomToolInputDelta:
+		return emit(ctx, out, llm.Event{Type: llm.EventResponseStarted})
+	case openai.ResponseStreamEventCompleted:
+		return handleCompletedEvent(ctx, out, evt)
+	case openai.ResponseStreamEventFailed:
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
+		return false
+	case openai.ResponseStreamEventError:
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
+		return false
+	}
+	return true
+}
+
+// handleCompletedEvent emits the completed event for a streamed response. It
+// always terminates the stream.
+func handleCompletedEvent(ctx context.Context, out chan<- llm.Event, evt openai.ResponseStreamEvent) bool {
+	if evt.Response == nil {
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: completed event has no response")})
+		return false
+	}
+	items, err := translateOutputItems(responseOutput(evt))
+	if err != nil {
+		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: translate output: %w", err)})
+		return false
+	}
+	emit(ctx, out, llm.Event{
+		Type:         llm.EventCompleted,
+		Items:        items,
+		Usage:        usage(responseUsage(evt)),
+		FinishReason: finishReason(evt.Response),
+	})
+	return false
 }
 
 // responseOutput returns the response output for a completed event (nil-safe).

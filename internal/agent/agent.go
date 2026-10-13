@@ -551,116 +551,186 @@ func (a *Agent) runTurn(ctx context.Context, input string, origin llm.Origin, de
 
 	toolCount, toolLimit := 0, a.toolcallsPerTurn
 	for round := 0; ; round++ {
-		a.setThinkingActive(true)
-		if a.reasoningSummary != "" || (a.reasoningEffort != "" && a.reasoningEffort != "none") {
-			a.emit(Event{Type: EventReasoningStart})
-		}
-		rctx, cancel := context.WithCancel(ctx)
-		budget := newResponseBudget(cancel, a.thinkingTimeout)
-		stream, err := a.client.Stream(rctx, a.buildRequest())
+		done, err := a.runTurnRound(ctx, round, start, &toolCount, &toolLimit)
 		if err != nil {
-			a.finishReasoning()
-			phase, duration := budget.timeout()
-			if phase == "" && errors.Is(err, context.DeadlineExceeded) {
-				current, _ := budget.current()
-				phase = "provider request during " + current
-			}
-			budget.stop()
-			cancel()
-			if phase != "" && ctx.Err() == nil {
-				a.recordTimeout(phase, duration, "")
-				return nil
-			}
-			logging.Debug("agent: client.Stream error",
-				slog.String("component", "agent"),
-				slog.String("agent_id", a.id),
-				slog.Int("round", round),
-				slog.Any("err", err),
-			)
 			return fail(err)
 		}
-
-		output, partial, err := a.collect(rctx, stream, budget)
-		a.finishReasoning()
-		phase, duration := budget.timeout()
-		if phase == "" && errors.Is(err, context.DeadlineExceeded) {
-			current, _ := budget.current()
-			phase = "provider request during " + current
-		}
-		budget.stop()
-		cancel()
-		if err != nil {
-			if phase != "" && ctx.Err() == nil {
-				a.recordTimeout(phase, duration, partial)
-				return nil
-			}
-			logging.Debug("agent: collect error",
-				slog.String("component", "agent"),
-				slog.String("agent_id", a.id),
-				slog.Int("round", round),
-				slog.Any("err", err),
-			)
-			return fail(err)
-		}
-		a.append(output...)
-
-		calls := functionCalls(output)
-		logging.Debug("agent: round collected",
-			slog.String("component", "agent"),
-			slog.String("agent_id", a.id),
-			slog.Int("round", round),
-			slog.Int("output_items", len(output)),
-			slog.Int("tool_calls", len(calls)),
-		)
-		if len(calls) == 0 {
-			a.trimHistory()
-			a.setState(StateIdle)
-			logging.Debug(turnEndMsg,
-				slog.String("component", "agent"),
-				slog.String("agent_id", a.id),
-				slog.String("agent_type", a.typ),
-				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-			)
+		if done {
 			return nil
 		}
+	}
+}
 
-		for i, call := range calls {
-			if toolLimit > 0 && toolCount >= toolLimit {
-				decision, err := a.awaitToolLimit(ctx, toolCount, toolLimit)
-				if err != nil {
-					return fail(err)
-				}
-				switch decision {
-				case "stop":
-					for _, skipped := range calls[i:] {
-						a.append(llm.Item{Type: llm.ItemFunctionCallOutput, CallID: skipped.CallID,
-							Content: "skipped: turn stopped at tool-call limit"})
-					}
-					note := fmt.Sprintf("[Stopped this turn after %d tool calls.]", toolCount)
-					a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: note})
-					a.emit(Event{Type: EventText, Text: note})
-					a.trimHistory()
-					a.setState(StateIdle)
-					return nil
-				case "continue":
-					toolLimit = 0
-				case "double":
-					if toolLimit > int(^uint(0)>>1)/2 {
-						toolLimit = 0
-					} else {
-						toolLimit *= 2
-					}
-				}
-			}
-			a.emit(Event{Type: EventToolCall, Call: call})
-			result := a.runTool(ctx, call)
-			a.append(llm.Item{
-				Type:    llm.ItemFunctionCallOutput,
-				CallID:  call.CallID,
-				Content: result,
-			})
-			toolCount++
+// runTurnRound performs one stream → collect → tools iteration of a turn. It
+// returns done=true when the turn has completed (no more tool calls, a stop
+// decision, or a recorded timeout) without an error.
+func (a *Agent) runTurnRound(ctx context.Context, round int, start time.Time, toolCount, toolLimit *int) (bool, error) {
+	a.setThinkingActive(true)
+	if a.reasoningSummary != "" || (a.reasoningEffort != "" && a.reasoningEffort != "none") {
+		a.emit(Event{Type: EventReasoningStart})
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	budget := newResponseBudget(cancel, a.thinkingTimeout)
+	stream, err := a.client.Stream(rctx, a.buildRequest())
+	if err != nil {
+		return a.handleStreamError(ctx, err, budget, cancel, round)
+	}
+	output, partial, err := a.collect(rctx, stream, budget)
+	done, ferr := a.finishCollect(ctx, err, budget, cancel, round, partial)
+	if ferr != nil || done {
+		return done, ferr
+	}
+	a.append(output...)
+
+	calls := functionCalls(output)
+	logging.Debug("agent: round collected",
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.Int("round", round),
+		slog.Int("output_items", len(output)),
+		slog.Int("tool_calls", len(calls)),
+	)
+	if len(calls) == 0 {
+		a.finishTurn(start)
+		return true, nil
+	}
+	return a.processToolCalls(ctx, calls, toolCount, toolLimit)
+}
+
+// handleStreamError finishes a round whose provider stream could not be opened.
+// It mirrors finishCollect for the Stream() failure path.
+func (a *Agent) handleStreamError(ctx context.Context, err error, budget *responseBudget, cancel context.CancelFunc, round int) (bool, error) {
+	a.finishReasoning()
+	phase, duration := budget.timeout()
+	if phase == "" && errors.Is(err, context.DeadlineExceeded) {
+		current, _ := budget.current()
+		phase = "provider request during " + current
+	}
+	budget.stop()
+	cancel()
+	if phase != "" && ctx.Err() == nil {
+		a.recordTimeout(phase, duration, "")
+		return true, nil
+	}
+	logging.Debug("agent: client.Stream error",
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.Int("round", round),
+		slog.Any("err", err),
+	)
+	return false, a.fail(err)
+}
+
+// finishCollect finalizes a completed collect phase: it stops the response
+// budget, cancels the stream context, and turns a collect error into either a
+// recorded timeout (done=true) or a failed turn.
+func (a *Agent) finishCollect(ctx context.Context, err error, budget *responseBudget, cancel context.CancelFunc, round int, partial string) (bool, error) {
+	a.finishReasoning()
+	phase, duration := budget.timeout()
+	if phase == "" && errors.Is(err, context.DeadlineExceeded) {
+		current, _ := budget.current()
+		phase = "provider request during " + current
+	}
+	budget.stop()
+	cancel()
+	if err == nil {
+		return false, nil
+	}
+	if phase != "" && ctx.Err() == nil {
+		a.recordTimeout(phase, duration, partial)
+		return true, nil
+	}
+	logging.Debug("agent: collect error",
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.Int("round", round),
+		slog.Any("err", err),
+	)
+	return false, a.fail(err)
+}
+
+// finishTurn closes out a turn that ended because the model stopped producing
+// tool calls.
+func (a *Agent) finishTurn(start time.Time) {
+	a.trimHistory()
+	a.setState(StateIdle)
+	logging.Debug(turnEndMsg,
+		slog.String("component", "agent"),
+		slog.String("agent_id", a.id),
+		slog.String("agent_type", a.typ),
+		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+	)
+}
+
+// processToolCalls runs the tool calls collected in one round, applying and
+// updating the per-turn tool-call limit. It returns done=true when the turn was
+// stopped at the limit.
+func (a *Agent) processToolCalls(ctx context.Context, calls []llm.Item, toolCount, toolLimit *int) (bool, error) {
+	for i, call := range calls {
+		stop, err := a.runToolCall(ctx, call, toolCount, toolLimit, calls[i:])
+		if err != nil {
+			return false, err
 		}
+		if stop {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// runToolCall runs one collected tool call, first resolving the tool-call limit
+// when this call would exceed it.
+func (a *Agent) runToolCall(ctx context.Context, call llm.Item, toolCount, toolLimit *int, remaining []llm.Item) (bool, error) {
+	if *toolLimit > 0 && *toolCount >= *toolLimit {
+		limit, stop, err := a.resolveToolLimit(ctx, *toolCount, *toolLimit, remaining)
+		if err != nil {
+			return false, err
+		}
+		if stop {
+			return true, nil
+		}
+		*toolLimit = limit
+	}
+	a.emit(Event{Type: EventToolCall, Call: call})
+	result := a.runTool(ctx, call)
+	a.append(llm.Item{
+		Type:    llm.ItemFunctionCallOutput,
+		CallID:  call.CallID,
+		Content: result,
+	})
+	(*toolCount)++
+	return false, nil
+}
+
+// resolveToolLimit awaits a tool-call-limit decision and applies it. On "stop"
+// it marks the remaining calls as skipped, notes the stop in history, and
+// returns stop=true so the turn ends without running them.
+func (a *Agent) resolveToolLimit(ctx context.Context, toolCount, toolLimit int, remaining []llm.Item) (int, bool, error) {
+	decision, err := a.awaitToolLimit(ctx, toolCount, toolLimit)
+	if err != nil {
+		return 0, false, err
+	}
+	switch decision {
+	case "stop":
+		for _, skipped := range remaining {
+			a.append(llm.Item{Type: llm.ItemFunctionCallOutput, CallID: skipped.CallID,
+				Content: "skipped: turn stopped at tool-call limit"})
+		}
+		note := fmt.Sprintf("[Stopped this turn after %d tool calls.]", toolCount)
+		a.append(llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: note})
+		a.emit(Event{Type: EventText, Text: note})
+		a.trimHistory()
+		a.setState(StateIdle)
+		return 0, true, nil
+	case "continue":
+		return 0, false, nil
+	case "double":
+		if toolLimit > int(^uint(0)>>1)/2 {
+			return 0, false, nil
+		}
+		return toolLimit * 2, false, nil
+	default:
+		return toolLimit, false, nil
 	}
 }
 
