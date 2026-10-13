@@ -14,9 +14,8 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 
 	"aiharn/internal/llm"
+	"aiharn/internal/llm/oaiclient"
 )
-
-const streamBuffer = 16
 
 // Adapter implements llm.Client over an OpenAI-compatible Chat Completions API.
 type Adapter struct {
@@ -26,11 +25,7 @@ type Adapter struct {
 // NewAdapter returns an Adapter whose base URL is the API root. The SDK appends
 // /chat/completions to this URL.
 func NewAdapter(baseURL, apiKey string) *Adapter {
-	cfg := openai.DefaultConfig(apiKey)
-	if baseURL != "" {
-		cfg.BaseURL = strings.TrimRight(baseURL, "/")
-	}
-	return &Adapter{client: openai.NewClientWithConfig(cfg)}
+	return &Adapter{client: oaiclient.NewClient(baseURL, apiKey)}
 }
 
 // Stream implements llm.Client.
@@ -44,13 +39,9 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 		return nil, fmt.Errorf("chat completions: create stream: %w", err)
 	}
 
-	out := make(chan llm.Event, streamBuffer)
-	go func() {
-		defer close(out)
-		defer stream.Close()
+	return llm.StartStream(ctx, func() { _ = stream.Close() }, func(ctx context.Context, out chan<- llm.Event) {
 		collectStream(ctx, stream, out)
-	}()
-	return out, nil
+	}), nil
 }
 
 type callBuilder struct {
@@ -135,7 +126,7 @@ func collectStream(ctx context.Context, stream *openai.ChatCompletionStream, out
 
 		var chunk streamChunk
 		if err := json.Unmarshal(raw, &chunk); err != nil {
-			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+			llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
 			return
 		}
 		if chunk.Usage != nil {
@@ -162,17 +153,17 @@ func handleStreamError(ctx context.Context, out chan<- llm.Event, err error, tex
 		return
 	case errors.Is(err, io.EOF):
 		if !sawChoice || finish == "" {
-			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("chat completions: stream ended before a finish reason")})
+			llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("chat completions: stream ended before a finish reason")})
 			return
 		}
 		items, itemErr := completedItems(text, calls)
 		if itemErr != nil {
-			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: itemErr})
+			llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: itemErr})
 			return
 		}
-		emit(ctx, out, llm.Event{Type: llm.EventCompleted, Items: items, Usage: usage, FinishReason: normalizeFinishReason(finish)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventCompleted, Items: items, Usage: usage, FinishReason: normalizeFinishReason(finish)})
 	default:
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
 	}
 }
 
@@ -189,7 +180,7 @@ func processChoice(ctx context.Context, out chan<- llm.Event, choice streamChoic
 	}
 	content, refusal, err := decodeContentAndRefusal(choice.Delta.Content, choice.Delta.Refusal)
 	if err != nil {
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
 		return false
 	}
 	if !emitTextDelta(ctx, out, content, text) {
@@ -212,13 +203,13 @@ func processChoice(ctx context.Context, out chan<- llm.Event, choice streamChoic
 func streamReasoningDelta(ctx context.Context, out chan<- llm.Event, raw json.RawMessage) bool {
 	delta, err := streamText(raw)
 	if err != nil {
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: stream: %w", err)})
 		return false
 	}
 	if delta == "" {
 		return true
 	}
-	return emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: delta})
+	return llm.Emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: delta})
 }
 
 // decodeContentAndRefusal decodes the content and refusal deltas together,
@@ -242,14 +233,14 @@ func emitTextDelta(ctx context.Context, out chan<- llm.Event, delta string, text
 		return true
 	}
 	text.WriteString(delta)
-	return emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: delta})
+	return llm.Emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: delta})
 }
 
 // streamToolCalls folds a delta's tool-call fragments into stable per-index
 // call builders, emitting a response-started event for each call seen.
 func streamToolCalls(ctx context.Context, out chan<- llm.Event, toolCalls []openai.ToolCall, calls map[int]*callBuilder) bool {
 	for position, call := range toolCalls {
-		if !emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
+		if !llm.Emit(ctx, out, llm.Event{Type: llm.EventResponseStarted}) {
 			return false
 		}
 		index := position
@@ -257,7 +248,7 @@ func streamToolCalls(ctx context.Context, out chan<- llm.Event, toolCalls []open
 			index = *call.Index
 		}
 		if index < 0 {
-			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: negative tool-call index %d", index)})
+			llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("chat completions: negative tool-call index %d", index)})
 			return false
 		}
 		builder := calls[index]
@@ -266,11 +257,11 @@ func streamToolCalls(ctx context.Context, out chan<- llm.Event, toolCalls []open
 			calls[index] = builder
 		}
 		if err := mergeStableField(&builder.id, call.ID, "id", index); err != nil {
-			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
+			llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
 			return false
 		}
 		if err := mergeStableField(&builder.name, call.Function.Name, "name", index); err != nil {
-			emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
+			llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: err})
 			return false
 		}
 		builder.args.WriteString(call.Function.Arguments)
@@ -317,15 +308,6 @@ func normalizeFinishReason(reason string) string {
 		return "stop"
 	default:
 		return reason
-	}
-}
-
-func emit(ctx context.Context, out chan<- llm.Event, event llm.Event) bool {
-	select {
-	case out <- event:
-		return true
-	case <-ctx.Done():
-		return false
 	}
 }
 

@@ -8,16 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
 
 	"aiharn/internal/llm"
+	"aiharn/internal/llm/oaiclient"
 )
-
-// streamBuffer bounds the number of buffered stream events. A full channel
-// blocks the producer, giving the consumer backpressure.
-const streamBuffer = 16
 
 // Adapter implements llm.Client over the OpenAI Responses API.
 type Adapter struct {
@@ -28,11 +24,7 @@ type Adapter struct {
 // Responses endpoint, e.g. https://api.openai.com/v1 or OpenRouter's
 // /api/v1). apiKey is used verbatim.
 func NewAdapter(baseURL, apiKey string) *Adapter {
-	cfg := openai.DefaultConfig(apiKey)
-	if baseURL != "" {
-		cfg.BaseURL = strings.TrimRight(baseURL, "/")
-	}
-	return &Adapter{client: openai.NewClientWithConfig(cfg)}
+	return &Adapter{client: oaiclient.NewClient(baseURL, apiKey)}
 }
 
 // Stream implements llm.Client.
@@ -47,13 +39,9 @@ func (a *Adapter) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event
 		return nil, fmt.Errorf("responses: create stream: %w", err)
 	}
 
-	out := make(chan llm.Event, streamBuffer)
-	go func() {
-		defer close(out)
-		defer stream.Close()
+	return llm.StartStream(ctx, func() { _ = stream.Close() }, func(ctx context.Context, out chan<- llm.Event) {
 		collectStream(ctx, stream, out)
-	}()
-	return out, nil
+	}), nil
 }
 
 // collectStream drains the Responses stream, translating each event into the
@@ -77,12 +65,12 @@ func handleStreamError(ctx context.Context, out chan<- llm.Event, err error) {
 	switch {
 	case errors.Is(err, io.EOF):
 		// Stream ended without a terminal event: a protocol error.
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: stream ended without a terminal event")})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: stream ended without a terminal event")})
 	case ctx.Err() != nil:
 		// Cancellation: close without a terminal event.
 		return
 	default:
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: stream: %w", err)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: stream: %w", err)})
 	}
 }
 
@@ -91,19 +79,19 @@ func handleStreamError(ctx context.Context, out chan<- llm.Event, err error) {
 func handleStreamEvent(ctx context.Context, out chan<- llm.Event, evt openai.ResponseStreamEvent) bool {
 	switch evt.Type {
 	case openai.ResponseStreamEventReasoningSummaryTextDelta, openai.ResponseStreamEventReasoningTextDelta:
-		return emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: evt.Delta})
+		return llm.Emit(ctx, out, llm.Event{Type: llm.EventReasoningDelta, Text: evt.Delta})
 	case openai.ResponseStreamEventOutputTextDelta:
-		return emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: evt.Delta})
+		return llm.Emit(ctx, out, llm.Event{Type: llm.EventTextDelta, Text: evt.Delta})
 	case openai.ResponseStreamEventFunctionArgumentsDelta,
 		openai.ResponseStreamEventCustomToolInputDelta:
-		return emit(ctx, out, llm.Event{Type: llm.EventResponseStarted})
+		return llm.Emit(ctx, out, llm.Event{Type: llm.EventResponseStarted})
 	case openai.ResponseStreamEventCompleted:
 		return handleCompletedEvent(ctx, out, evt)
 	case openai.ResponseStreamEventFailed:
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
 		return false
 	case openai.ResponseStreamEventError:
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
 		return false
 	}
 	return true
@@ -113,15 +101,15 @@ func handleStreamEvent(ctx context.Context, out chan<- llm.Event, evt openai.Res
 // always terminates the stream.
 func handleCompletedEvent(ctx context.Context, out chan<- llm.Event, evt openai.ResponseStreamEvent) bool {
 	if evt.Response == nil {
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: completed event has no response")})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: errors.New("responses: completed event has no response")})
 		return false
 	}
 	items, err := translateOutputItems(responseOutput(evt))
 	if err != nil {
-		emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: translate output: %w", err)})
+		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: fmt.Errorf("responses: translate output: %w", err)})
 		return false
 	}
-	emit(ctx, out, llm.Event{
+	llm.Emit(ctx, out, llm.Event{
 		Type:         llm.EventCompleted,
 		Items:        items,
 		Usage:        usage(responseUsage(evt)),
@@ -159,14 +147,4 @@ func responseError(evt openai.ResponseStreamEvent) error {
 		return fmt.Errorf("responses: %s", evt.Message)
 	}
 	return errors.New("responses: unknown failure")
-}
-
-// emit sends e on out, or reports false if ctx was cancelled first.
-func emit(ctx context.Context, out chan<- llm.Event, e llm.Event) bool {
-	select {
-	case out <- e:
-		return true
-	case <-ctx.Done():
-		return false
-	}
 }

@@ -3,7 +3,6 @@ package local
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,9 +19,6 @@ import (
 // killGrace is how long Exec waits for a terminated command to unwind before
 // escalating from SIGTERM to SIGKILL.
 const killGrace = 3 * time.Second
-
-// execFailMsg is the shared debug message for failed Exec calls.
-const execFailMsg = "local: Exec fail"
 
 // Session implements execution.Session over one persistent local shell.
 type Session struct {
@@ -120,123 +116,24 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	start := time.Now()
-	logging.Debug("local: Exec start",
-		slog.String("component", "local"),
-		slog.String("cmd", cmd),
-		slog.String("cwd", opts.Cwd),
-		slog.Int64("max_output", opts.MaxOutputBytes),
-	)
-
-	if s.isDead() {
-		err := fmt.Errorf("%w: session is no longer usable", execution.ErrSessionReset)
-		logging.Debug(execFailMsg, slog.String("component", "local"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
-		return execution.Result{}, err
-	}
-
-	m, err := shell.NewMarkers()
-	if err != nil {
-		logging.Debug(execFailMsg, slog.String("component", "local"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
-		return execution.Result{}, err
-	}
-	script := shell.BuildWrapperScript(m, opts.Cwd, cmd)
-
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := io.WriteString(s.stdin, script)
-		writeDone <- err
-	}()
-	select {
-	case err := <-writeDone:
-		if err == nil {
-			break
-		}
-		s.closeDead()
-		werr := fmt.Errorf("%w: write: %v", execution.ErrSessionReset, err)
-		logging.Debug(execFailMsg, slog.String("component", "local"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", werr))
-		return execution.Result{}, werr
-	case <-ctx.Done():
-		s.Close()
-		cerr := fmt.Errorf("%w: cancelled while writing command: %v", execution.ErrSessionReset, ctx.Err())
-		logging.Debug(execFailMsg, slog.String("component", "local"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
-		return execution.Result{}, cerr
-	}
-
-	type beginResult struct {
-		pid int
-		err error
-	}
-	beginDone := make(chan beginResult, 1)
-	go func() {
-		pid, err := shell.ReadBegin(s.reader, m)
-		beginDone <- beginResult{pid: pid, err: err}
-	}()
-	var pid int
-	select {
-	case r := <-beginDone:
-		pid, err = r.pid, r.err
-	case <-ctx.Done():
-		s.Close()
-		cerr := fmt.Errorf("%w: cancelled before command started: %v", execution.ErrSessionReset, ctx.Err())
-		logging.Debug(execFailMsg, slog.String("component", "local"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
-		return execution.Result{}, cerr
-	}
-	if err != nil {
-		if errors.Is(err, execution.ErrSessionReset) {
-			s.closeDead()
-		} else {
-			s.Close()
-		}
-		berr := fmt.Errorf("local: persistent shell failed before producing output (is %q a valid local shell?): %w", shellName(s.opts), err)
-		logging.Debug(execFailMsg, slog.String("component", "local"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", berr))
-		return execution.Result{}, berr
-	}
-
-	type bodyResult struct {
-		f   shell.Frame
-		err error
-	}
-	ch := make(chan bodyResult, 1)
-	go func() {
-		f, err := shell.ReadBody(s.reader, m, opts.MaxOutputBytes, opts.Stream)
-		ch <- bodyResult{f, err}
-	}()
-
-	for {
-		select {
-		case r := <-ch:
-			res, err := s.finishBody(r.f, r.err)
-			s.logExecFinish(start, pid, res, err)
-			return res, err
-		case <-ctx.Done():
-			for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
-				logging.Debug("local: Exec cancellation signal",
-					slog.String("component", "local"),
-					slog.Int64("signal", int64(sig)),
-					slog.Int("pid", pid),
-				)
-				s.signal(pid, sig)
-				select {
-				case r := <-ch:
-					res, err := s.finishBody(r.f, r.err)
-					s.logExecFinish(start, pid, res, err)
-					return res, err
-				case <-time.After(killGrace):
-				}
-			}
-			s.Close()
-			serr := fmt.Errorf("%w: command survived TERM and KILL", execution.ErrSessionReset)
-			logging.Debug("local: Exec finish",
-				slog.String("component", "local"),
-				slog.Int("pid", pid),
-				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-				slog.Any("err", serr),
-			)
-			return execution.Result{}, serr
-		}
-	}
+	return shell.Exec(ctx, cmd, opts, shell.ExecHooks{
+		Component: "local",
+		Stdin:     s.stdin,
+		Reader:    s.reader,
+		IsDead:    s.isDead,
+		OnReset:   s.closeDead,
+		OnCancel:  func() { _ = s.Close() },
+		Signal:    s.signal,
+		ShellName: func() string { return shellName(s.opts) },
+		BeforeOutputErr: func(name string, err error) error {
+			return fmt.Errorf("local: persistent shell failed before producing output (is %q a valid local shell?): %w", name, err)
+		},
+		LogFinish: s.logExecFinish,
+	})
 }
 
+// logExecFinish records the outcome of a completed Exec: the process group id,
+// exit code, retained byte counts, truncation, duration, and any error.
 func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, err error) {
 	attrs := []slog.Attr{
 		slog.String("component", "local"),
@@ -256,34 +153,15 @@ func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, 
 	logging.Debug("local: Exec finish", attrs...)
 }
 
-func (s *Session) finishBody(f shell.Frame, err error) (execution.Result, error) {
-	if errors.Is(err, execution.ErrSessionReset) {
-		s.closeDead()
-	} else if err != nil {
-		var streamErr *shell.StreamWriteError
-		if !errors.As(err, &streamErr) {
-			s.Close()
-		}
-	}
-	return s.toResult(f, err)
-}
-
-func (s *Session) toResult(f shell.Frame, err error) (execution.Result, error) {
-	if err != nil {
-		return execution.Result{}, err
-	}
-	return execution.Result{
-		Stdout:    string(f.Stdout),
-		Stderr:    string(f.Stderr),
-		ExitCode:  f.ExitCode,
-		Truncated: f.Truncated,
-	}, nil
-}
-
-// signal sends sig to the command's local process group. It is best-effort.
-func (s *Session) signal(pid int, sig syscall.Signal) {
+// signal sends the named signal ("TERM" or "KILL") to the command's local
+// process group. It is best-effort.
+func (s *Session) signal(pid int, name string) {
 	if pid <= 0 {
 		return
+	}
+	sig := syscall.SIGTERM
+	if name == "KILL" {
+		sig = syscall.SIGKILL
 	}
 	_ = syscall.Kill(-pid, sig)
 }
