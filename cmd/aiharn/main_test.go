@@ -9,6 +9,7 @@ import (
 	"aiharn/internal/agent"
 	"aiharn/internal/app"
 	"aiharn/internal/approval"
+	"aiharn/internal/authfile"
 	"aiharn/internal/config"
 	"aiharn/internal/sessions"
 	testllm "aiharn/internal/testutil/llm"
@@ -250,4 +251,21 @@ func TestClearedRuntime(t *testing.T) {
 	if res.Agent == nil || res.Manager == nil || res.Gate == nil {
 		t.Fatalf("clearedRuntime returned incomplete result: %+v", res)
 	}
+}
+
+func TestStartAPISuccess(t *testing.T) {
+	mgr := newTestSessionManager(t)
+	authPath := filepath.Join(t.TempDir(), "users")
+	if err := authfile.Set(authPath, "alice", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{API: config.APIConfig{Listen: "127.0.0.1:0", AuthFile: authPath}}
+	api, err := startAPI(cfg, mgr)
+	if err != nil {
+		t.Fatalf("startAPI: %v", err)
+	}
+	if api == nil {
+		t.Fatal("api is nil")
+	}
+	_ = api.Close()
 }
