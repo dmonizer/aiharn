@@ -31,6 +31,9 @@ const archiveFilenameLayout = "2006-01-02T15-04-05.000000000Z"
 
 var errHeaderTooLong = errors.New("recorder: transcript header line too long")
 
+// archiveExt is the file extension of archived transcript files.
+const archiveExt = ".jsonl"
+
 // ArchivedSession is the archive-listing summary of one finished transcript.
 type ArchivedSession struct {
 	Key       string    `json:"key"`
@@ -110,24 +113,9 @@ func ArchivedSessions(aiharnHome string) ([]ArchivedSession, error) {
 		if entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
-		if filepath.Ext(name) != ".jsonl" {
-			continue
+		if session, ok := listArchivedSession(dir, entry.Name()); ok {
+			sessions = append(sessions, session)
 		}
-		f, err := os.Open(filepath.Join(dir, name))
-		if err != nil {
-			return nil, err
-		}
-		line, headerErr := readFirstLine(bufio.NewReader(f))
-		_ = f.Close()
-		if headerErr != nil {
-			continue
-		}
-		h, err := parseArchiveHeader(line)
-		if err != nil || h.Type != "session" || h.SessionID == "" {
-			continue
-		}
-		sessions = append(sessions, archivedSession(name, h))
 	}
 
 	sort.Slice(sessions, func(i, j int) bool {
@@ -136,34 +124,74 @@ func ArchivedSessions(aiharnHome string) ([]ArchivedSession, error) {
 	return sessions, nil
 }
 
+// listArchivedSession reads one transcript's header and returns its summary.
+// ok is false when the file should be skipped (not a transcript, missing, or
+// malformed).
+func listArchivedSession(dir, name string) (ArchivedSession, bool) {
+	if filepath.Ext(name) != archiveExt {
+		return ArchivedSession{}, false
+	}
+	f, err := os.Open(filepath.Join(dir, name))
+	if err != nil {
+		return ArchivedSession{}, false
+	}
+	defer f.Close()
+
+	line, err := readFirstLine(bufio.NewReader(f))
+	if err != nil {
+		return ArchivedSession{}, false
+	}
+	h, err := parseArchiveHeader(line)
+	if err != nil || h.Type != "session" || h.SessionID == "" {
+		return ArchivedSession{}, false
+	}
+	return archivedSession(name, h), true
+}
+
+// isArchivedKey reports whether key is a bare .jsonl file name. Anything else
+// is rejected before it reaches the filesystem.
+func isArchivedKey(key string) bool {
+	return key != "" && filepath.Base(key) == key && filepath.Ext(key) == archiveExt
+}
+
+// openArchived opens the transcript named by key and returns its parsed header.
+// The file is positioned just after the header line; callers scan from br to
+// read the remaining entries.
+func openArchived(aiharnHome, key string) (*os.File, *bufio.Reader, archiveHeader, error) {
+	f, err := os.Open(filepath.Join(aiharnHome, "transcripts", key))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, archiveHeader{}, ErrArchivedNotFound
+		}
+		return nil, nil, archiveHeader{}, err
+	}
+	br := bufio.NewReader(f)
+	line, err := readFirstLine(br)
+	if err != nil {
+		f.Close()
+		return nil, nil, archiveHeader{}, fmt.Errorf("recorder: read archived header: %w", err)
+	}
+	h, err := parseArchiveHeader(line)
+	if err != nil || h.Type != "session" {
+		f.Close()
+		return nil, nil, archiveHeader{}, fmt.Errorf("recorder: parse archived header: %w", err)
+	}
+	return f, br, h, nil
+}
+
 // ArchivedSessionDetail returns up to limit completed top-level conversation
 // messages from the archived transcript named by key. limit <= 0 means no
 // bound. key must be a bare .jsonl file name; anything else is
 // ErrArchivedNotFound.
 func ArchivedSessionDetail(aiharnHome, key string, limit int) (ArchivedDetail, error) {
-	if key == "" || filepath.Base(key) != key || filepath.Ext(key) != ".jsonl" {
+	if !isArchivedKey(key) {
 		return ArchivedDetail{}, ErrArchivedNotFound
 	}
-
-	path := filepath.Join(aiharnHome, "transcripts", key)
-	f, err := os.Open(path)
+	f, br, h, err := openArchived(aiharnHome, key)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ArchivedDetail{}, ErrArchivedNotFound
-		}
 		return ArchivedDetail{}, err
 	}
 	defer f.Close()
-
-	br := bufio.NewReader(f)
-	line, err := readFirstLine(br)
-	if err != nil {
-		return ArchivedDetail{}, fmt.Errorf("recorder: read archived header: %w", err)
-	}
-	h, err := parseArchiveHeader(line)
-	if err != nil || h.Type != "session" {
-		return ArchivedDetail{}, fmt.Errorf("recorder: parse archived header: %w", err)
-	}
 
 	detail := ArchivedDetail{
 		ArchivedSession: archivedSession(key, h),
@@ -172,30 +200,32 @@ func ArchivedSessionDetail(aiharnHome, key string, limit int) (ArchivedDetail, e
 
 	scanner := bufio.NewScanner(br)
 	scanner.Buffer(make([]byte, 0, 64*1024), archiveHeaderMaxBytes)
-	for {
-		if limit > 0 && len(detail.Messages) >= limit {
-			break
-		}
-		if !scanner.Scan() {
-			break
-		}
+	for scanner.Scan() && (limit <= 0 || len(detail.Messages) < limit) {
 		var entry archiveEntry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
 		}
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !topLevelMessage(entry.Type, entry.AgentID, h.Agent) {
 			continue
 		}
-		if h.Agent != "" && entry.AgentID != "" && entry.AgentID != h.Agent {
-			continue
-		}
-		detail.Messages = append(detail.Messages, ArchivedMessage{
-			Type:    "message",
-			Role:    entry.Type,
-			Content: entry.Content,
-		})
+		detail.Messages = append(detail.Messages, archivedMessage(entry))
 	}
 	return detail, nil
+}
+
+// topLevelMessage reports whether a transcript entry is a completed user or
+// assistant message belonging to the top-level agent.
+func topLevelMessage(entryType, agentID, agent string) bool {
+	if entryType != "user" && entryType != "assistant" {
+		return false
+	}
+	return agent == "" || agentID == "" || agentID == agent
+}
+
+// archivedMessage maps one user/assistant transcript entry onto a preview
+// message.
+func archivedMessage(entry archiveEntry) ArchivedMessage {
+	return ArchivedMessage{Type: "message", Role: entry.Type, Content: entry.Content}
 }
 
 // ArchivedHistory returns the reconstructed top-level conversation history of an
@@ -203,33 +233,18 @@ func ArchivedSessionDetail(aiharnHome, key string, limit int) (ArchivedDetail, e
 // completed items are included, in transcript order. Streaming/delta and
 // lifecycle entries are ignored.
 func ArchivedHistory(aiharnHome, key string) ([]llm.Item, sessions.TranscriptMeta, error) {
-	if key == "" || filepath.Base(key) != key || filepath.Ext(key) != ".jsonl" {
+	if !isArchivedKey(key) {
 		return nil, sessions.TranscriptMeta{}, ErrArchivedNotFound
 	}
-
-	path := filepath.Join(aiharnHome, "transcripts", key)
-	f, err := os.Open(path)
+	f, br, h, err := openArchived(aiharnHome, key)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, sessions.TranscriptMeta{}, ErrArchivedNotFound
-		}
 		return nil, sessions.TranscriptMeta{}, err
 	}
 	defer f.Close()
 
-	br := bufio.NewReader(f)
-	line, err := readFirstLine(br)
-	if err != nil {
-		return nil, sessions.TranscriptMeta{}, fmt.Errorf("recorder: read archived header: %w", err)
-	}
-	h, err := parseArchiveHeader(line)
-	if err != nil || h.Type != "session" {
-		return nil, sessions.TranscriptMeta{}, fmt.Errorf("recorder: parse archived header: %w", err)
-	}
 	if h.Agent == "" {
 		h.Agent = "main"
 	}
-
 	meta := sessions.TranscriptMeta{
 		ID:        h.SessionID,
 		Name:      h.SessionName,
@@ -250,25 +265,31 @@ func ArchivedHistory(aiharnHome, key string) ([]llm.Item, sessions.TranscriptMet
 		if entry.AgentID != "" && entry.AgentID != h.Agent {
 			continue
 		}
-		switch entry.Type {
-		case "user":
-			history = append(history, llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: entry.Content})
-		case "assistant":
-			history = append(history, llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: entry.Content})
-		case "tool_call":
-			history = append(history, llm.Item{Type: llm.ItemFunctionCall, CallID: entry.CallID, Name: entry.Name, Args: string(entry.Arguments)})
-		case "tool_result":
-			history = append(history, llm.Item{Type: llm.ItemFunctionCallOutput, CallID: entry.CallID, Content: entry.Content})
-		case "reasoning":
-			// Display-only; never part of completed history.
-		default:
-			// Streaming/delta and lifecycle entries are not completed history.
+		if item, ok := archiveHistoryItem(entry); ok {
+			history = append(history, item)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, sessions.TranscriptMeta{}, err
 	}
 	return history, meta, nil
+}
+
+// archiveHistoryItem maps one completed transcript entry onto an llm.Item.
+// Display-only and lifecycle entries return ok == false.
+func archiveHistoryItem(entry archiveHistoryEntry) (llm.Item, bool) {
+	switch entry.Type {
+	case "user":
+		return llm.Item{Type: llm.ItemMessage, Role: llm.RoleUser, Content: entry.Content}, true
+	case "assistant":
+		return llm.Item{Type: llm.ItemMessage, Role: llm.RoleAssistant, Content: entry.Content}, true
+	case "tool_call":
+		return llm.Item{Type: llm.ItemFunctionCall, CallID: entry.CallID, Name: entry.Name, Args: string(entry.Arguments)}, true
+	case "tool_result":
+		return llm.Item{Type: llm.ItemFunctionCallOutput, CallID: entry.CallID, Content: entry.Content}, true
+	default:
+		return llm.Item{}, false
+	}
 }
 
 // readFirstLine reads at most archiveHeaderMaxBytes of the first line of r,
@@ -325,7 +346,7 @@ func archiveStartedAt(key string, raw json.RawMessage) time.Time {
 		_ = json.Unmarshal(raw, &started)
 	}
 	if started.IsZero() {
-		if parsed, err := time.Parse(archiveFilenameLayout, strings.TrimSuffix(key, ".jsonl")); err == nil {
+		if parsed, err := time.Parse(archiveFilenameLayout, strings.TrimSuffix(key, archiveExt)); err == nil {
 			started = parsed
 		}
 	}

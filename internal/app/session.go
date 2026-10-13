@@ -511,15 +511,27 @@ func (m *SessionManager) Create(ctx context.Context, name string) (sessions.Hand
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	auto := name == ""
-	if !auto {
-		trimmed, err := sessions.ValidateName(name)
-		if err != nil {
-			return nil, err
-		}
-		name = trimmed
+	name, err := normalizeName(name)
+	if err != nil {
+		return nil, err
 	}
+	return m.start(ctx, name, m.buildSession)
+}
 
+// normalizeName returns an empty name unchanged so the caller can assign an
+// auto-generated one, and otherwise validates and trims name.
+func normalizeName(name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	return sessions.ValidateName(name)
+}
+
+// start registers and builds one session, then returns its handle. It must be
+// called without m.mu held, because building opens a transport session and can
+// block. An empty name selects an auto-generated one. The slot is reserved
+// under the lock so concurrent starts cannot exceed MaxSessions.
+func (m *SessionManager) start(ctx context.Context, name string, build func(context.Context, string, string) (*Runtime, sessions.Transcript, error)) (sessions.Handle, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -534,16 +546,16 @@ func (m *SessionManager) Create(ctx context.Context, name string) (sessions.Hand
 		m.mu.Unlock()
 		return nil, fmt.Errorf("app: session id %q is already in use", id)
 	}
-	if auto {
+	if name == "" {
 		// The number is assigned under the lock and is not rolled back on a
-		// failed build, so concurrent Creates can never reuse one.
+		// failed build, so concurrent starts can never reuse one.
 		m.nextNumber++
 		name = fmt.Sprintf("Session %d", m.nextNumber)
 	}
 	m.building++
 	m.mu.Unlock()
 
-	rt, transcript, err := m.buildSession(ctx, id, name)
+	rt, transcript, err := build(ctx, id, name)
 
 	m.mu.Lock()
 	m.building--
@@ -724,13 +736,9 @@ func (m *SessionManager) Import(ctx context.Context, name string, history []llm.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	auto := name == ""
-	if !auto {
-		trimmed, err := sessions.ValidateName(name)
-		if err != nil {
-			return nil, err
-		}
-		name = trimmed
+	name, err := normalizeName(name)
+	if err != nil {
+		return nil, err
 	}
 
 	opts := m.build
@@ -757,50 +765,9 @@ func (m *SessionManager) Import(ctx context.Context, name string, history []llm.
 	}
 	opts.SeedHistory = history
 
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, sessions.ErrClosed
-	}
-	if len(m.sessions)+m.building >= m.max {
-		m.mu.Unlock()
-		return nil, sessions.ErrLimitReached
-	}
-	id := m.newID()
-	if id == m.defaultID || m.sessions[id] != nil {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("app: session id %q is already in use", id)
-	}
-	if auto {
-		// The number is assigned under the lock and is not rolled back on a
-		// failed build, so concurrent imports can never reuse one.
-		m.nextNumber++
-		name = fmt.Sprintf("Session %d", m.nextNumber)
-	}
-	m.building++
-	m.mu.Unlock()
-
-	rt, transcript, err := m.buildSessionOpts(ctx, id, name, opts)
-
-	m.mu.Lock()
-	m.building--
-	if err != nil {
-		m.mu.Unlock()
-		return nil, err
-	}
-	if m.closed {
-		m.mu.Unlock()
-		cerr := rt.Close()
-		if transcript != nil {
-			cerr = errors.Join(cerr, transcript.Close())
-		}
-		return nil, errors.Join(sessions.ErrClosed, cerr)
-	}
-	s := newSession(id, name, rt, transcript)
-	m.sessions[id] = s
-	m.order = append(m.order, id)
-	m.mu.Unlock()
-	return s, nil
+	return m.start(ctx, name, func(ctx context.Context, id, name string) (*Runtime, sessions.Transcript, error) {
+		return m.buildSessionOpts(ctx, id, name, opts)
+	})
 }
 
 // buildSession builds one session's runtime and transcript using the manager's

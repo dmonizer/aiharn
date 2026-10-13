@@ -43,6 +43,10 @@ const (
 	archiveSessionsPath = "/api/v1/sessions/archived"
 	// archiveSessionsItemPrefix is the subtree pattern for one archived session.
 	archiveSessionsItemPrefix = "/api/v1/sessions/archived/"
+	// errArchivedNotFound is the shared not-found message for archive routes.
+	errArchivedNotFound = "archived session not found"
+	// archiveExt is the file extension of archived transcript files.
+	archiveExt = ".jsonl"
 )
 
 // Config configures one API server. Sessions is required and owns every
@@ -1293,7 +1297,7 @@ func (s *Server) handleArchivedSessionItem(w http.ResponseWriter, r *http.Reques
 // getArchivedSessionItem returns a bounded preview of one archived transcript.
 func (s *Server) getArchivedSessionItem(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AiharnHome == "" {
-		writeError(w, http.StatusNotFound, "archived session not found")
+		writeError(w, http.StatusNotFound, errArchivedNotFound)
 		return
 	}
 
@@ -1301,7 +1305,7 @@ func (s *Server) getArchivedSessionItem(w http.ResponseWriter, r *http.Request) 
 	detail, err := recorder.ArchivedSessionDetail(s.cfg.AiharnHome, key, 200)
 	if err != nil {
 		if errors.Is(err, recorder.ErrArchivedNotFound) {
-			writeError(w, http.StatusNotFound, "archived session not found")
+			writeError(w, http.StatusNotFound, errArchivedNotFound)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "cannot read archived session")
@@ -1322,13 +1326,13 @@ func (s *Server) getArchivedSessionItem(w http.ResponseWriter, r *http.Request) 
 // session whose top-level history is seeded from the archived conversation.
 func (s *Server) importArchivedSessionItem(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AiharnHome == "" {
-		writeError(w, http.StatusNotFound, "archived session not found")
+		writeError(w, http.StatusNotFound, errArchivedNotFound)
 		return
 	}
 
 	key := strings.TrimPrefix(r.URL.Path, archiveSessionsItemPrefix)
-	if key == "" || filepath.Base(key) != key || filepath.Ext(key) != ".jsonl" {
-		writeError(w, http.StatusNotFound, "archived session not found")
+	if key == "" || filepath.Base(key) != key || filepath.Ext(key) != archiveExt {
+		writeError(w, http.StatusNotFound, errArchivedNotFound)
 		return
 	}
 
@@ -1342,7 +1346,7 @@ func (s *Server) importArchivedSessionItem(w http.ResponseWriter, r *http.Reques
 	history, meta, err := recorder.ArchivedHistory(s.cfg.AiharnHome, key)
 	if err != nil {
 		if errors.Is(err, recorder.ErrArchivedNotFound) {
-			writeError(w, http.StatusNotFound, "archived session not found")
+			writeError(w, http.StatusNotFound, errArchivedNotFound)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "cannot read archived session")

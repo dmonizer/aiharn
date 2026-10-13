@@ -2208,7 +2208,7 @@
     refreshAfterEndpointChange();
     renderWaiting();
     pollSessions();
-    poll();
+    void poll();
   });
   document.querySelector("#open-login").addEventListener("click", () => {
     elements.settingsDialog.close();
@@ -2327,12 +2327,12 @@
     if (!state.endpoint) return;
     const hasCredentials = await loadCredentials();
     if (hasCredentials) {
-      pollSessions();
-      poll();
+      void pollSessions();
+      void poll();
     } else {
       openLoginDialog();
     }
   }
 
-  bootstrap();
+  void bootstrap();
 })();
