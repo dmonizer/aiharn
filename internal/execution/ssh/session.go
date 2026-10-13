@@ -3,7 +3,6 @@ package ssh
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,13 +16,6 @@ import (
 	"aiharn/internal/execution/shell"
 	"aiharn/internal/logging"
 )
-
-// killGrace is how long Exec waits for a terminated command to unwind before
-// escalating from SIGTERM to SIGKILL.
-const killGrace = 3 * time.Second
-
-// execFailMsg is the shared debug message for failed Exec calls.
-const execFailMsg = "ssh: Exec fail"
 
 // Session implements execution.Session over one persistent non-PTY shell.
 // It is not safe for concurrent use; the agent serializes access.
@@ -145,7 +137,14 @@ func newSSHSession(ctx context.Context, client *ssh.Client) (*ssh.Session, error
 	}
 }
 
+// Stdin returns the persistent shell's stdin stream.
+func (s *Session) Stdin() io.Writer { return s.stdin }
+
+// Reader returns the persistent shell's framed stdout stream.
+func (s *Session) Reader() *bufio.Reader { return s.reader }
+
 func (s *Session) markDead() {
+
 	s.deadMu.Lock()
 	already := s.dead
 	s.dead = true
@@ -162,7 +161,7 @@ func (s *Session) markClosed() {
 	s.deadMu.Unlock()
 }
 
-func (s *Session) isDead() bool {
+func (s *Session) IsDead() bool {
 	s.deadMu.Lock()
 	defer s.deadMu.Unlock()
 	return s.dead
@@ -173,123 +172,14 @@ func (s *Session) Exec(ctx context.Context, cmd string, opts execution.ExecOptio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	start := time.Now()
-	logging.Debug("ssh: Exec start",
-		slog.String("component", "ssh"),
-		slog.String("cmd", cmd),
-		slog.String("cwd", opts.Cwd),
-		slog.Int64("max_output", opts.MaxOutputBytes),
-	)
-
-	if s.isDead() {
-		err := fmt.Errorf("%w: session is no longer usable", execution.ErrSessionReset)
-		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
-		return execution.Result{}, err
-	}
-
-	m, err := shell.NewMarkers()
-	if err != nil {
-		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", err))
-		return execution.Result{}, err
-	}
-	script := shell.BuildWrapperScript(m, opts.Cwd, cmd)
-
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := io.WriteString(s.stdin, script)
-		writeDone <- err
-	}()
-	select {
-	case err := <-writeDone:
-		if err == nil {
-			break
-		}
-		s.closeDead()
-		werr := fmt.Errorf("%w: write: %v", execution.ErrSessionReset, err)
-		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", werr))
-		return execution.Result{}, werr
-	case <-ctx.Done():
-		s.Close()
-		cerr := fmt.Errorf("%w: cancelled while writing command: %v", execution.ErrSessionReset, ctx.Err())
-		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
-		return execution.Result{}, cerr
-	}
-
-	type beginResult struct {
-		pid int
-		err error
-	}
-	beginDone := make(chan beginResult, 1)
-	go func() {
-		pid, err := shell.ReadBegin(s.reader, m)
-		beginDone <- beginResult{pid: pid, err: err}
-	}()
-	var pid int
-	select {
-	case r := <-beginDone:
-		pid, err = r.pid, r.err
-	case <-ctx.Done():
-		s.Close()
-		cerr := fmt.Errorf("%w: cancelled before command started: %v", execution.ErrSessionReset, ctx.Err())
-		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", cerr))
-		return execution.Result{}, cerr
-	}
-	if err != nil {
-		if errors.Is(err, execution.ErrSessionReset) {
-			s.closeDead()
-		} else {
-			s.Close()
-		}
-		berr := fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", interpreterCommand(s.opts), err)
-		logging.Debug(execFailMsg, slog.String("component", "ssh"), slog.Int64("duration_ms", time.Since(start).Milliseconds()), slog.Any("err", berr))
-		return execution.Result{}, berr
-	}
-
-	type bodyResult struct {
-		f   shell.Frame
-		err error
-	}
-	ch := make(chan bodyResult, 1)
-	go func() {
-		f, err := shell.ReadBody(s.reader, m, opts.MaxOutputBytes, opts.Stream)
-		ch <- bodyResult{f, err}
-	}()
-
-	for {
-		select {
-		case r := <-ch:
-			res, err := s.finishBody(r.f, r.err)
-			s.logExecFinish(start, pid, res, err)
-			return res, err
-		case <-ctx.Done():
-			for _, sig := range []string{"TERM", "KILL"} {
-				logging.Debug("ssh: Exec cancellation signal",
-					slog.String("component", "ssh"),
-					slog.String("signal", sig),
-					slog.Int("pid", pid),
-					slog.Int("pgid", pid),
-				)
-				s.signal(pid, sig)
-				select {
-				case r := <-ch:
-					res, err := s.finishBody(r.f, r.err)
-					s.logExecFinish(start, pid, res, err)
-					return res, err
-				case <-time.After(killGrace):
-				}
-			}
-			s.Close()
-			serr := fmt.Errorf("%w: command survived TERM and KILL", execution.ErrSessionReset)
-			logging.Debug("ssh: Exec finish",
-				slog.String("component", "ssh"),
-				slog.Int("pid", pid),
-				slog.Int("pgid", pid),
-				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-				slog.Any("err", serr),
-			)
-			return execution.Result{}, serr
-		}
-	}
+	return shell.Exec(ctx, cmd, opts, s, shell.ExecConfig{
+		Component: "ssh",
+		ShellName: func() string { return interpreterCommand(s.opts) },
+		BeforeOutputErr: func(name string, err error) error {
+			return fmt.Errorf("ssh: persistent shell failed before producing output (is %q the right shell on the remote host?): %w", name, err)
+		},
+		LogFinish: s.logExecFinish,
+	})
 }
 
 // logExecFinish records the outcome of a completed Exec: the remote process
@@ -315,33 +205,9 @@ func (s *Session) logExecFinish(start time.Time, pid int, res execution.Result, 
 	logging.Debug("ssh: Exec finish", attrs...)
 }
 
-func (s *Session) finishBody(f shell.Frame, err error) (execution.Result, error) {
-	if errors.Is(err, execution.ErrSessionReset) {
-		s.closeDead()
-	} else if err != nil {
-		var streamErr *shell.StreamWriteError
-		if !errors.As(err, &streamErr) {
-			s.Close()
-		}
-	}
-	return s.toResult(f, err)
-}
-
-func (s *Session) toResult(f shell.Frame, err error) (execution.Result, error) {
-	if err != nil {
-		return execution.Result{}, err
-	}
-	return execution.Result{
-		Stdout:    string(f.Stdout),
-		Stderr:    string(f.Stderr),
-		ExitCode:  f.ExitCode,
-		Truncated: f.Truncated,
-	}, nil
-}
-
 // signal sends sig to the command's remote process group via a throwaway
 // channel on the same client connection. It is best-effort and bounded.
-func (s *Session) signal(pid int, sig string) {
+func (s *Session) Signal(pid int, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	sess, err := newSSHSession(ctx, s.client)
@@ -352,7 +218,7 @@ func (s *Session) signal(pid int, sig string) {
 	go func() {
 		defer close(done)
 		defer sess.Close()
-		_ = sess.Run(fmt.Sprintf("kill -%s -- -%d 2>/dev/null || true", sig, pid))
+		_ = sess.Run(fmt.Sprintf("kill -%s -- -%d 2>/dev/null || true", name, pid))
 	}()
 	select {
 	case <-done:
@@ -378,7 +244,7 @@ func (s *Session) Close() error {
 	return nil
 }
 
-func (s *Session) closeDead() {
+func (s *Session) Reset() {
 	logging.Debug("ssh: closeDead", slog.String("component", "ssh"))
 	s.markDead()
 	_ = s.Close()

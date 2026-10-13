@@ -381,6 +381,17 @@ func (s *Server) resolve(id string) (sessions.Handle, bool) {
 	return handle, true
 }
 
+// resolveOrNotFound resolves the session addressed by id, writing a 404 and
+// returning false when it does not exist.
+func (s *Server) resolveOrNotFound(w http.ResponseWriter, id string) (sessions.Handle, bool) {
+	handle, ok := s.resolve(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, errSessionNotFound)
+		return nil, false
+	}
+	return handle, true
+}
+
 // defaultSessionID returns the store's default session id, or "".
 func (s *Server) defaultSessionID() string {
 	if handle := s.cfg.Sessions.Default(); handle != nil {
@@ -540,9 +551,8 @@ func (s *Server) handleToolLimit(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &body); err != nil {
 		return
 	}
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	var a interface{ DecideToolLimit(string, string) error }
@@ -682,9 +692,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "content exceeds 65536 bytes")
 		return
 	}
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	// A subagent message goes to that agent's inbox, so it never occupies the
@@ -730,9 +739,8 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	// Approval ids are sequential per gate, so the same id exists in every
 	// session; the decision must be applied to the addressed session's gate.
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	gate := handle.Gate()
@@ -783,9 +791,8 @@ func (s *Server) handleSessionApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Like handleMessages, an empty session_id addresses the default session.
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	gate := handle.Gate()
@@ -806,9 +813,8 @@ func (s *Server) handleSessionLoop(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &body); err != nil {
 		return
 	}
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	if err := handle.Agent().SetMainLoopActive(body.Active); err != nil {
@@ -839,9 +845,8 @@ func (s *Server) handleSessionChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel must not be empty")
 		return
 	}
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	if err := handle.SetChannel(r.Context(), body.Channel); err != nil {
@@ -902,9 +907,8 @@ func (s *Server) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &body); err != nil {
 		return
 	}
-	handle, ok := s.resolve(body.SessionID)
+	handle, ok := s.resolveOrNotFound(w, body.SessionID)
 	if !ok {
-		writeError(w, http.StatusNotFound, errSessionNotFound)
 		return
 	}
 	affected, err := handle.Cancel(r.Context())
