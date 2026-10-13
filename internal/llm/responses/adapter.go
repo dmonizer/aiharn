@@ -87,10 +87,7 @@ func handleStreamEvent(ctx context.Context, out chan<- llm.Event, evt openai.Res
 		return llm.Emit(ctx, out, llm.Event{Type: llm.EventResponseStarted})
 	case openai.ResponseStreamEventCompleted:
 		return handleCompletedEvent(ctx, out, evt)
-	case openai.ResponseStreamEventFailed:
-		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
-		return false
-	case openai.ResponseStreamEventError:
+	case openai.ResponseStreamEventFailed, openai.ResponseStreamEventError:
 		llm.Emit(ctx, out, llm.Event{Type: llm.EventFailed, Err: responseError(evt)})
 		return false
 	}
