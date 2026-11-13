@@ -66,3 +66,48 @@ func TestDirectorySettingLocal(t *testing.T) {
 		t.Fatalf("execution cwd: %+v %v", r, err)
 	}
 }
+
+func TestDirectoriesStayWithChannel(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	for _, dir := range []string{a, b} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.Config{Channels: []config.ChannelConfig{
+		{Name: "one", Type: "local", Root: root, DefaultShell: "/bin/bash"},
+		{Name: "two", Type: "local", Root: root, DefaultShell: "/bin/bash"},
+	}}
+	tc := &transportCache{transports: map[string]execution.Transport{}}
+	defer tc.closeAll()
+	c, err := newChannelController(ctx, cfg, tc, config.AgentConfig{}, "main", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	s := &Session{rt: &Runtime{channel: c}}
+	if err := s.SetWorkingDirectory(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := s.ChannelWorkingDirectory(ctx, "two", &b); err != nil || value != b {
+		t.Fatalf("directory two: %q %v", value, err)
+	}
+	if c.Name() != "one" || c.Cwd() != a {
+		t.Fatal("inactive edit changed active channel")
+	}
+	if err := c.Set(ctx, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if c.Cwd() != b {
+		t.Fatal("second directory lost")
+	}
+	if err := c.Set(ctx, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if c.Cwd() != a {
+		t.Fatal("first directory lost")
+	}
+}

@@ -387,8 +387,7 @@ within that root, including after symlink resolution. Without `root`, directory
 changes are unrestricted.
 
 Use `/cd <path>` in the TUI (`/cd` shows the current setting), or enter a path in
-the web console's channel chip menu. Relative paths resolve against the current
+the modal opened by each channel's `dir` link in the web console's channel chip menu. Relative paths resolve against the current
 working directory; the target must exist. Paths are literal text; percent escapes
-and backslashes are rejected. Changing channels restores that channel's configured
-default. This bounds the directory setting only: commands and explicit tool `cwd`
+and backslashes are rejected. Directory changes are retained separately for each channel in the conversation session. This bounds the directory setting only: commands and explicit tool `cwd`
 arguments are not sandboxed.

@@ -47,6 +47,10 @@ func (s *Session) SetWorkingDirectory(ctx context.Context, dir string) error {
 	c := s.rt.channel
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.setDirectoryLocked(ctx, dir)
+}
+
+func (c *channelController) setDirectoryLocked(ctx context.Context, dir string) error {
 	if c.session == nil {
 		return sessions.ErrClosed
 	}
@@ -84,6 +88,49 @@ func (s *Session) SetWorkingDirectory(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
+	if c.directories == nil {
+		c.directories = make(map[string]string)
+	}
+	c.directories[c.name] = candidate
 	c.cwd = candidate
 	return nil
+}
+
+// ChannelWorkingDirectory reads or updates one channel without changing the active channel.
+// A nil directory reads the current setting.
+func (s *Session) ChannelWorkingDirectory(ctx context.Context, name string, dir *string) (string, error) {
+	if s.isClosed() {
+		return "", sessions.ErrClosed
+	}
+	c := s.rt.channel
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil {
+		return "", sessions.ErrClosed
+	}
+	if name == "" || name == c.name {
+		if dir != nil {
+			if err := c.setDirectoryLocked(ctx, *dir); err != nil {
+				return "", err
+			}
+		}
+		return c.cwd, nil
+	}
+	ch, err := selectChannel(c.cfg, "", name)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", sessions.ErrChannelNotFound, err)
+	}
+	// Open a separate shell for validation on the selected execution host.
+	target := &channelController{cfg: c.cfg, tc: c.tc, agentCfg: c.agentCfg, agentType: c.agentType, directories: c.directories}
+	if err := target.openLocked(ctx, ch); err != nil {
+		return "", err
+	}
+	defer target.Close()
+	if dir != nil {
+		if err := target.setDirectoryLocked(ctx, *dir); err != nil {
+			return "", err
+		}
+		c.directories = target.directories
+	}
+	return target.cwd, nil
 }

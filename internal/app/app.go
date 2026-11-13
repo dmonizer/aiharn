@@ -182,10 +182,11 @@ type channelController struct {
 	agentCfg  config.AgentConfig // top-level agent config, for working_dir resolution
 	agentType string             // top-level agent type; top-level IDs equal the type
 
-	mu      sync.RWMutex
-	name    string
-	session execution.Session
-	cwd     string
+	mu          sync.RWMutex
+	name        string
+	session     execution.Session
+	cwd         string
+	directories map[string]string
 }
 
 func newChannelController(ctx context.Context, cfg *config.Config, tc *transportCache, agentCfg config.AgentConfig, agentType, name string) (*channelController, error) {
@@ -254,6 +255,9 @@ func (c *channelController) openLocked(ctx context.Context, channel config.Chann
 	if err != nil {
 		session.Close()
 		return err
+	}
+	if saved, ok := c.directories[channel.Name]; ok {
+		cwd = saved
 	}
 	old := c.session
 	c.name = channel.Name

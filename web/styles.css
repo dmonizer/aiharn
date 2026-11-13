@@ -851,5 +851,9 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
 .resume-bubble .role { display: block; margin-bottom: 3px; color: var(--faint); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 .resume-bubble.assistant { background: rgba(185, 244, 95, .04); }
 
-.channel-directory-form { display: grid; gap: 8px; padding: 10px; border-top: 1px solid var(--line-bright); }
-.channel-directory-form input { width: 100%; min-width: 0; box-sizing: border-box; }
+.channel-row { display: flex; align-items: center; gap: 12px; }
+.channel-row .channel-option { flex: 1; min-width: 0; }
+.channel-dir-link { margin-left: auto; padding: 7px 9px; border: 0; background: transparent; color: var(--muted); text-decoration: underline; cursor: pointer; }
+.channel-dir-link:hover { color: var(--text); }
+
+#directory-dialog .form-error { color: var(--danger); }

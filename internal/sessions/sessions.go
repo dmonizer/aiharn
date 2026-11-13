@@ -145,3 +145,8 @@ type WorkingDirectoryHandle interface {
 	WorkingDirectory() string
 	SetWorkingDirectory(context.Context, string) error
 }
+
+// ChannelDirectoryHandle controls a named channel without switching active execution.
+type ChannelDirectoryHandle interface {
+	ChannelWorkingDirectory(context.Context, string, *string) (string, error)
+}

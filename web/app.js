@@ -916,7 +916,7 @@
     button.className = "meta-chip channel-toggle";
     setChipContent(button, "channel", session.channel);
     button.title = "Switch execution channel";
-    button.setAttribute("aria-haspopup", "listbox");
+    button.setAttribute("aria-haspopup", "dialog");
     button.setAttribute("aria-expanded", "false");
     button.addEventListener("click", () => toggleChannelMenu(button, channels));
     wrapper.append(button);
@@ -944,7 +944,7 @@
     wrapper.className = "channel-menu-anchor channel-menu-open";
     const menu = document.createElement("div");
     menu.className = "channel-menu";
-    menu.setAttribute("role", "listbox");
+    menu.setAttribute("role", "group");
     menu.setAttribute("aria-label", "Execution channel");
 
     const current = button.dataset.value || "";
@@ -952,8 +952,7 @@
       const option = document.createElement("button");
       option.type = "button";
       option.className = "channel-option" + (channel.name === current ? " active" : "");
-      option.setAttribute("role", "option");
-      option.setAttribute("aria-selected", channel.name === current ? "true" : "false");
+      option.setAttribute("aria-pressed", channel.name === current ? "true" : "false");
 
       const label = document.createElement("span");
       label.textContent = channel.name;
@@ -966,31 +965,68 @@
         closeChannelMenu();
         void selectChannel(channel.name);
       });
-      menu.append(option);
+      const row = document.createElement("div");
+      row.className = "channel-row";
+      const dir = document.createElement("button");
+      dir.type = "button";
+      dir.className = "channel-dir-link";
+      dir.textContent = "dir";
+      dir.setAttribute("aria-label", "Change directory for " + channel.name);
+      dir.addEventListener("click", () => {
+        closeChannelMenu();
+        void openDirectoryDialog(channel.name);
+      });
+      row.append(option, dir);
+      menu.append(row);
     }
 
-    const form = document.createElement("form");
-    const input = document.createElement("input");
-    input.type = "text";
-    input.setAttribute("aria-label", "Working directory");
-    input.placeholder = "Working directory";
-    input.value = state.snapshots.get(state.sessionId)?.session?.working_directory || "";
-    const apply = document.createElement("button");
-    apply.type = "submit";
-    apply.textContent = "Set directory";
-    form.className = "channel-directory-form";
-    form.append(input, apply);
-    form.addEventListener("submit", async event => {
-      event.preventDefault();
-      try {
-        await apiCall("/session/directory", { method: "POST", body: JSON.stringify({ directory: input.value, session_id: state.sessionId || "" }) });
-        closeChannelMenu();
-      } catch (error) { showConnection(error.message || "Could not change directory."); }
-    });
-    menu.append(form);
     wrapper.append(menu);
     button.parentElement.appendChild(wrapper);
     openChannelMenu = wrapper;
+  }
+
+  let directoryDialogController = null;
+  async function openDirectoryDialog(channel) {
+    if (directoryDialogController) directoryDialogController.abort();
+    const controller = new AbortController();
+    directoryDialogController = controller;
+    const sessionId = state.sessionId || "";
+    const dialog = document.querySelector("#directory-dialog");
+    const form = dialog.querySelector("form");
+    const input = dialog.querySelector("input");
+    const error = dialog.querySelector(".form-error");
+    const save = dialog.querySelector("[type=submit]");
+    dialog.querySelector("h2").textContent = "Directory · " + channel;
+    input.value = "";
+    input.disabled = true;
+    error.textContent = "";
+    save.disabled = true;
+    dialog.showModal();
+    dialog.querySelectorAll(".close-directory").forEach(button => {
+      button.addEventListener("click", () => dialog.close(), { signal: controller.signal });
+    });
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      save.disabled = true;
+      error.textContent = "";
+      try {
+        await apiCall("/session/directory", { method: "POST", body: JSON.stringify({
+          channel, directory: input.value, session_id: sessionId
+        }) });
+        if (controller.signal.aborted) return;
+        dialog.close();
+        await poll(true);
+      } catch (failure) { if (!controller.signal.aborted) error.textContent = failure.message || "Could not change directory."; }
+      finally { if (!controller.signal.aborted) save.disabled = false; }
+    }, { signal: controller.signal });
+    try {
+      const result = await apiCall("/session/directory?" + new URLSearchParams({ channel, session_id: sessionId }));
+      if (!dialog.open || controller.signal.aborted) return;
+      input.value = result.working_directory || "";
+      input.disabled = false;
+      save.disabled = false;
+      input.focus();
+    } catch (failure) { if (!controller.signal.aborted) error.textContent = failure.message || "Could not load directory."; }
   }
 
   async function selectChannel(name) {

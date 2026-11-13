@@ -63,6 +63,15 @@
     </section>
   </div>
 
+  <dialog id="directory-dialog" aria-labelledby="directory-title">
+    <form class="dialog-card compact">
+      <div class="dialog-head"><h2 id="directory-title">Directory</h2><button type="button" class="icon-button close-directory" aria-label="Close">×</button></div>
+      <label>Working directory<input type="text" name="directory" required autocomplete="off" spellcheck="false"></label>
+      <p class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button type="button" class="quiet-button close-directory">Cancel</button><button type="submit" class="primary-button">Save</button></div>
+    </form>
+  </dialog>
+
   <dialog id="settings-dialog">
     <form id="settings-form" method="dialog" class="dialog-card">
       <div class="dialog-head"><div><span class="eyebrow">Connection</span><h2>Aiharn API</h2></div><button type="button" class="icon-button close-settings" aria-label="Close">×</button></div>
