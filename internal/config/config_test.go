@@ -1012,3 +1012,44 @@ func TestValidateFSHelperRejectsLineBreaks(t *testing.T) {
 		})
 	}
 }
+
+// TestInterpolateFSHelper proves the channel fs_helper command line goes through
+// the same environment interpolation as the other channel strings, so a helper
+// path can be parameterized.
+func TestInterpolateFSHelper(t *testing.T) {
+	t.Setenv("AIHARN_TEST_FS_HELPER", "/opt/aiharn/bin/aiharn fs-helper")
+	path := setup(t, `[[channels]]
+name = "devbox"
+type = "ssh"
+host = "h"
+user = "u"
+keep_alive = true
+fs_helper = "${AIHARN_TEST_FS_HELPER} --verbose"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Channels) != 1 {
+		t.Fatalf("channels = %d, want 1", len(cfg.Channels))
+	}
+	if got, want := cfg.Channels[0].FSHelper, "/opt/aiharn/bin/aiharn fs-helper --verbose"; got != want {
+		t.Fatalf("fs_helper = %q, want %q", got, want)
+	}
+}
+
+// TestInterpolateFSHelperMissingVariableFails proves an unset variable in
+// fs_helper is reported instead of silently becoming an empty helper.
+func TestInterpolateFSHelperMissingVariableFails(t *testing.T) {
+	path := setup(t, `[[channels]]
+name = "devbox"
+type = "ssh"
+host = "h"
+user = "u"
+keep_alive = true
+fs_helper = "${AIHARN_TEST_FS_HELPER_DEFINITELY_UNSET}"
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "AIHARN_TEST_FS_HELPER_DEFINITELY_UNSET") {
+		t.Fatalf("Load error = %v, want a mention of the missing variable", err)
+	}
+}

@@ -427,3 +427,13 @@ func TestChannelFileTargetsShareOneBackend(t *testing.T) {
 		t.Fatalf("write through the shared backend: %v", err)
 	}
 }
+
+// TestFileToolLimitsMatchDomainDefaults guards against drift between the
+// configuration defaults and the filetools defaults: a config built without a
+// [file_tools] section must yield exactly the domain defaults.
+func TestFileToolLimitsMatchDomainDefaults(t *testing.T) {
+	cfg := &config.Config{FileTools: config.DefaultFileTools()}
+	if got, want := fileToolLimits(cfg), filetools.DefaultLimits(); got != want {
+		t.Fatalf("fileToolLimits(DefaultFileTools()) = %+v, want %+v", got, want)
+	}
+}
