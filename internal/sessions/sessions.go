@@ -139,3 +139,9 @@ func ValidateName(name string) (string, error) {
 	}
 	return trimmed, nil
 }
+
+// WorkingDirectoryHandle exposes optional execution directory controls.
+type WorkingDirectoryHandle interface {
+	WorkingDirectory() string
+	SetWorkingDirectory(context.Context, string) error
+}

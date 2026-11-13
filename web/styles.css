@@ -850,3 +850,6 @@ dialog::backdrop { background: rgba(0, 0, 0, .68); backdrop-filter: blur(5px); }
 .resume-bubble { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #0c0f11; color: var(--text); font-size: 11px; line-height: 1.5; }
 .resume-bubble .role { display: block; margin-bottom: 3px; color: var(--faint); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 .resume-bubble.assistant { background: rgba(185, 244, 95, .04); }
+
+.channel-directory-form { display: grid; gap: 8px; padding: 10px; border-top: 1px solid var(--line-bright); }
+.channel-directory-form input { width: 100%; min-width: 0; box-sizing: border-box; }

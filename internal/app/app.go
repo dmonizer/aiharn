@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -215,6 +216,9 @@ func (c *channelController) Exec(ctx context.Context, cmd string, opts execution
 	defer c.mu.RUnlock()
 	if c.session == nil {
 		return execution.Result{}, fmt.Errorf("app: no active execution channel")
+	}
+	if opts.Cwd == "" {
+		opts.Cwd = c.cwd
 	}
 	return c.session.Exec(ctx, cmd, opts)
 }
@@ -473,7 +477,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 	)
 	if channel != nil {
 		executor = channel
-		defaultCwd = channel.Cwd()
+		defaultCwd = "" // controller supplies the current directory at execution time
 		cleanup = func() {
 			// No-op: the shared channel owns its own lifecycle; nothing to release.
 		}
@@ -561,6 +565,9 @@ func buildModelClient(model config.ModelConfig) (llm.Client, error) {
 // working_dir is configured.
 func resolveDefaultCwd(ctx context.Context, session execution.Session, agentCfg config.AgentConfig, channelCfg config.ChannelConfig, agentType, agentID string) (string, error) {
 	tmpl := channelCfg.WorkingDir
+	if tmpl.Raw == "" && channelCfg.Root != "" {
+		tmpl.Raw = channelCfg.Root
+	}
 	if agentCfg.WorkingDir != nil {
 		tmpl = *agentCfg.WorkingDir
 	}
@@ -590,8 +597,29 @@ func resolveDefaultCwd(ctx context.Context, session execution.Session, agentCfg 
 	if err != nil {
 		return "", err
 	}
+	if channelCfg.Root != "" {
+		_, err := physicalDir(ctx, session, channelCfg.Root)
+		if err != nil {
+			return "", err
+		}
+		dir, err = boundedDirectory(path.Clean(channelCfg.Root), path.Clean(channelCfg.Root), dir)
+		if err != nil {
+			return "", err
+		}
+	}
 	if err := ensureRemoteDir(ctx, session, channelCfg.Name, dir); err != nil {
 		return "", err
+	}
+	if channelCfg.Root != "" {
+		root, err := physicalDir(ctx, session, channelCfg.Root)
+		if err != nil {
+			return "", err
+		}
+		dir, err = physicalDir(ctx, session, dir)
+		if err != nil {
+			return "", err
+		}
+		return boundedDirectory(root, root, dir)
 	}
 	return dir, nil
 }

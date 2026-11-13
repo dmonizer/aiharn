@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -22,13 +23,21 @@ func (m *Model) handleCommand(line string) tea.Cmd {
 	case "/quit", "/exit":
 		m.cancel()
 		return tea.Quit
+	case "/cd":
+		if m.status.Directory == nil {
+			m.appendLine(kindError, "directory control unavailable")
+			return nil
+		}
+		dir := strings.TrimSpace(strings.TrimPrefix(line, "/cd"))
+		change := m.status.Directory
+		return func() tea.Msg { value, err := change(context.Background(), dir); return directoryDoneMsg{value, err} }
 	case "/clear":
 		return m.requestClear()
 	case "/skill", "/skills":
 		return m.handleSkill(fields)
 	case "/help", "/":
 		m.appendLine(kindPlain, "available commands:")
-		m.appendLine(kindPlain, "  /help - show this help")
+		m.appendLine(kindPlain, "  /help - show this help; /cd [path] - show/change channel working directory")
 		m.appendLine(kindPlain, "  /quit - quit")
 		m.appendLine(kindPlain, "  /clear - start a new conversation session")
 		m.appendLine(kindPlain, "  /skill (or /skills) - list installed skills; /skill install <url> to install one")
@@ -104,4 +113,9 @@ func (m *Model) installSkill(url string) tea.Cmd {
 	}
 	m.appendLine(kindPlain, "installing skill from "+url)
 	return m.sendToCurrentAgent(prompt)
+}
+
+type directoryDoneMsg struct {
+	dir string
+	err error
 }

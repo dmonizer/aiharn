@@ -24,6 +24,7 @@ import (
 
 // Status is the immutable startup-banner content shown in the status bar.
 type Status struct {
+	Directory  func(context.Context, string) (string, error)
 	Model      string // model config name
 	AgentType  string
 	Channel    string

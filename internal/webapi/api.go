@@ -110,6 +110,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc("/api/v1/session/approval", s.handleSessionApproval)
 	mux.HandleFunc("/api/v1/session/channel", s.handleSessionChannel)
+	mux.HandleFunc("/api/v1/session/directory", s.handleSessionDirectory)
 	mux.HandleFunc("/api/v1/session/clear", s.handleSessionClear)
 	mux.HandleFunc("/api/v1/session/cancel", s.handleSessionCancel)
 	mux.HandleFunc("/api/v1/session/loop", s.handleSessionLoop)
@@ -233,17 +234,18 @@ type agentSummary struct {
 }
 
 type session struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Title        string    `json:"title,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	AgentID      string    `json:"agent_id"`
-	AgentType    string    `json:"agent_type"`
-	Model        string    `json:"model"`
-	Channel      string    `json:"channel"`
-	State        string    `json:"state"`
-	ApprovalMode string    `json:"approval_mode"`
-	LoopActive   bool      `json:"loop_active"`
+	WorkingDirectory string    `json:"working_directory"`
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	Title            string    `json:"title,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	AgentID          string    `json:"agent_id"`
+	AgentType        string    `json:"agent_type"`
+	Model            string    `json:"model"`
+	Channel          string    `json:"channel"`
+	State            string    `json:"state"`
+	ApprovalMode     string    `json:"approval_mode"`
+	LoopActive       bool      `json:"loop_active"`
 }
 
 // sessionListResponse is the payload of GET /api/v1/sessions.
@@ -487,7 +489,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			ID: handle.ID(), Name: handle.Name(), CreatedAt: handle.CreatedAt(),
 			Title:   handle.Title(),
 			AgentID: selected.ID(), AgentType: selected.Type(),
-			Model: model, Channel: channel,
+			Model: model, Channel: channel, WorkingDirectory: workingDirectory(handle),
 			State:        selected.State().String(),
 			ApprovalMode: handle.Gate().Mode().String(),
 			LoopActive:   handle.Agent().MainLoopActive(),

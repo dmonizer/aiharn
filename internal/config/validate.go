@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -99,6 +100,9 @@ func validateChannels(errs *[]string, channels []ChannelConfig, channelTypes map
 	seen := map[string]bool{}
 	for i := range channels {
 		c := &channels[i]
+		if c.Root != "" && (!path.IsAbs(c.Root) || strings.ContainsAny(c.Root, "%\\\x00\r\n")) {
+			*errs = append(*errs, fmt.Sprintf("channels[%d].root must be an absolute literal path", i))
+		}
 		if c.Name == "" {
 			*errs = append(*errs, fmt.Sprintf("channels[%d].name is required", i))
 			continue

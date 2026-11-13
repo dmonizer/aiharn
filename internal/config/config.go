@@ -73,6 +73,7 @@ type AuthConfig struct {
 // ChannelConfig is an execution channel (transport). The first channel in the
 // list is the default unless an agent overrides it.
 type ChannelConfig struct {
+	Root          string             `toml:"root"` // absolute directory on the execution host; bounds working-directory settings
 	Name          string             `toml:"name"`
 	Type          string             `toml:"type"`
 	Host          string             `toml:"host"`

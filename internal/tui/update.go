@@ -19,6 +19,13 @@ import (
 // commands to keep the bridges and turn loop alive.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case directoryDoneMsg:
+		if msg.err != nil {
+			m.appendLine(kindError, msg.err.Error())
+		} else {
+			m.appendLine(kindPlain, "working directory: "+msg.dir)
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height

@@ -969,6 +969,25 @@
       menu.append(option);
     }
 
+    const form = document.createElement("form");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.setAttribute("aria-label", "Working directory");
+    input.placeholder = "Working directory";
+    input.value = state.snapshots.get(state.sessionId)?.session?.working_directory || "";
+    const apply = document.createElement("button");
+    apply.type = "submit";
+    apply.textContent = "Set directory";
+    form.className = "channel-directory-form";
+    form.append(input, apply);
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      try {
+        await apiCall("/session/directory", { method: "POST", body: JSON.stringify({ directory: input.value, session_id: state.sessionId || "" }) });
+        closeChannelMenu();
+      } catch (error) { showConnection(error.message || "Could not change directory."); }
+    });
+    menu.append(form);
     wrapper.append(menu);
     button.parentElement.appendChild(wrapper);
     openChannelMenu = wrapper;

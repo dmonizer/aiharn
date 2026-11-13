@@ -159,6 +159,15 @@ func run(args []string) int {
 		Approval:   rt.Summary.Approval,
 		Shortcuts:  cfg.Shortcuts,
 		AiharnHome: cfg.AiharnHome,
+		Directory: func(ctx context.Context, dir string) (string, error) {
+			h := sessionsMgr.Default().(sessions.WorkingDirectoryHandle)
+			if dir != "" {
+				if err := h.SetWorkingDirectory(ctx, dir); err != nil {
+					return "", err
+				}
+			}
+			return h.WorkingDirectory(), nil
+		},
 	})
 	m.SetClearFunc(func(ctx context.Context) (tui.ClearResult, error) {
 		return clearedRuntime(ctx, sessionsMgr)

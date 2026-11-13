@@ -379,3 +379,16 @@ SonarCloud analysis runs on the same triggers
 (`.github/workflows/sonarcloud.yml`). It requires a `SONAR_TOKEN` repository
 secret and a `sonar-project.properties` whose `sonar.organization` and
 `sonar.projectKey` match the project created on SonarCloud.
+
+Execution channels may set `root = "/srv/work"` alongside `working_dir`. The root
+is an absolute path on the execution host and must already exist. When no working
+directory is configured, it defaults to the root. Directory settings must stay
+within that root, including after symlink resolution. Without `root`, directory
+changes are unrestricted.
+
+Use `/cd <path>` in the TUI (`/cd` shows the current setting), or enter a path in
+the web console's channel chip menu. Relative paths resolve against the current
+working directory; the target must exist. Paths are literal text; percent escapes
+and backslashes are rejected. Changing channels restores that channel's configured
+default. This bounds the directory setting only: commands and explicit tool `cwd`
+arguments are not sandboxed.
