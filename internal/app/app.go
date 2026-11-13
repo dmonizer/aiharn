@@ -22,6 +22,7 @@ import (
 	"aiharn/internal/execution"
 	execlocal "aiharn/internal/execution/local"
 	execssh "aiharn/internal/execution/ssh"
+	"aiharn/internal/filetools"
 	"aiharn/internal/llm"
 	"aiharn/internal/llm/chatcompletions"
 	"aiharn/internal/llm/responses"
@@ -53,6 +54,11 @@ type Options struct {
 	// runtime is built. It supersedes Observer, which remains the single shared
 	// transcript used when no factory is set.
 	NewTranscript func(sessionID, sessionName string) (sessions.Transcript, error)
+
+	// FileRegistry, when set, overrides the process-wide file-tool coordination
+	// registry. Tests inject a fresh registry; production shares one per process
+	// so receipts and mutation history span conversations.
+	FileRegistry *filetools.Registry
 
 	// Memory, when set, is the process-wide memory manager shared by every
 	// session launched from one working directory. Build binds a store to it and
@@ -187,6 +193,10 @@ type channelController struct {
 	session     execution.Session
 	cwd         string
 	directories map[string]string
+	// gen increases on every successful channel switch; file mutation approvals
+	// captured under an older generation are rejected.
+	gen        uint64
+	filesystem execution.Filesystem
 }
 
 func newChannelController(ctx context.Context, cfg *config.Config, tc *transportCache, agentCfg config.AgentConfig, agentType, name string) (*channelController, error) {
@@ -263,6 +273,8 @@ func (c *channelController) openLocked(ctx context.Context, channel config.Chann
 	c.name = channel.Name
 	c.session = session
 	c.cwd = cwd
+	c.gen++
+	c.filesystem = nil
 	if old != nil {
 		_ = old.Close()
 	}
@@ -369,6 +381,15 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		}
 	}()
 	title := &titleBackend{}
+	fileRegistry := opts.FileRegistry
+	if fileRegistry == nil {
+		fileRegistry = defaultFileRegistry
+	}
+	runtimeID, err := newRuntimeID()
+	if err != nil {
+		return nil, err
+	}
+	files := fileToolDeps{registry: fileRegistry, runtimeID: runtimeID, limits: fileToolLimits(cfg)}
 	var controller *channelController
 	// mainChannel reports the main agent's current channel. It is read when a
 	// subagent is actually spawned (not at Build time), so a later channel
@@ -391,7 +412,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 			return configuredSubagentTypes(cfg, mainChannel())
 		},
 		Builder: func(ctx context.Context, spec agent.SpawnSpec) (*agent.Agent, error) {
-			return buildAgent(ctx, cfg, tc, mgr, gate, memStore, spec,
+			return buildAgent(ctx, cfg, tc, mgr, gate, memStore, files, spec,
 				agentOverrides{Channel: mainChannel()}, observer, nil, title)
 		},
 	})
@@ -408,7 +429,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (rt *Runtime, 
 		}
 	}()
 
-	top, err := buildAgent(ctx, cfg, tc, mgr, gate, memStore, agent.SpawnSpec{
+	top, err := buildAgent(ctx, cfg, tc, mgr, gate, memStore, files, agent.SpawnSpec{
 		ID:            agentType,
 		Type:          agentType,
 		Depth:         0,
@@ -455,7 +476,7 @@ type agentOverrides struct {
 // buildAgent resolves an agent type, model, and channel; opens a dedicated
 // session; reads the system prompt; and constructs a fully-wired Agent whose
 // cleanup closes its session.
-func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, mem memory.Backend, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController, title tools.SessionTitleBackend) (*agent.Agent, error) {
+func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr *agent.Manager, gate *approval.Gate, mem memory.Backend, files fileToolDeps, spec agent.SpawnSpec, o agentOverrides, observer agent.HistoryObserver, channel *channelController, title tools.SessionTitleBackend) (*agent.Agent, error) {
 	agentCfg, ok := cfg.Agents[spec.Type]
 	if !ok {
 		return nil, fmt.Errorf("app: agent type %q is not defined", spec.Type)
@@ -478,10 +499,12 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		executor   tools.Executor
 		defaultCwd string
 		cleanup    func()
+		fileTarget filetools.TargetFunc
 	)
 	if channel != nil {
 		executor = channel
 		defaultCwd = "" // controller supplies the current directory at execution time
+		fileTarget = channel.Filesystem
 		cleanup = func() {
 			// No-op: the shared channel owns its own lifecycle; nothing to release.
 		}
@@ -504,6 +527,9 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 			session.Close()
 			return nil, err
 		}
+		// The filesystem backend is cached and owned by the transport cache, so
+		// closing this agent must not release it.
+		fileTarget = (&channelFileTarget{tc: tc, channel: channelCfg}).target
 		cleanup = func() { session.Close() }
 	}
 
@@ -515,12 +541,17 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		return nil, err
 	}
 
-	reg, err := buildRegistry(executor, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
-		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, mgr, mem, title, spec.ID, spec.Type)
-	if err != nil {
+	fileBackend := files.newBackend(spec.ID, fileTarget, cfg.Limits.ToolResultBytes)
+	release := func() {
+		fileBackend.Close()
 		if cleanup != nil {
 			cleanup()
 		}
+	}
+	reg, err := buildRegistry(executor, gate, cfg.Limits.CommandOutputBytes, defaultCwd,
+		cfg.Limits.CommandTimeout.Std(), agentCfg.Tools, fileBackend, mgr, mem, title, spec.ID, spec.Type)
+	if err != nil {
+		release()
 		return nil, err
 	}
 
@@ -547,7 +578,7 @@ func buildAgent(ctx context.Context, cfg *config.Config, tc *transportCache, mgr
 		TranscriptBytes:  cfg.Limits.TranscriptMaxBytes,
 		Observer:         observer,
 		SeedHistory:      o.SeedHistory,
-		Cleanup:          cleanup,
+		Cleanup:          release,
 	})
 	return a, nil
 }
@@ -659,8 +690,9 @@ func needsRemoteHome(template string) bool {
 // transportCache returns one Transport per channel name, created lazily and
 // shared by every agent on that channel.
 type transportCache struct {
-	mu         sync.Mutex
-	transports map[string]execution.Transport
+	mu          sync.Mutex
+	transports  map[string]execution.Transport
+	filesystems map[string]execution.Filesystem
 }
 
 func (tc *transportCache) get(c config.ChannelConfig) (execution.Transport, error) {
@@ -678,6 +710,7 @@ func (tc *transportCache) get(c config.ChannelConfig) (execution.Transport, erro
 }
 
 func (tc *transportCache) closeAll() error {
+	err := tc.closeFilesystems()
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	var errs []error
@@ -686,6 +719,7 @@ func (tc *transportCache) closeAll() error {
 			errs = append(errs, err)
 		}
 	}
+	errs = append(errs, err)
 	return errors.Join(errs...)
 }
 
@@ -733,6 +767,7 @@ func buildTransport(c config.ChannelConfig) (execution.Transport, error) {
 			KeepAlive:      c.KeepAliveEnabled(),
 			DefaultShell:   c.DefaultShell,
 			RemoteCommand:  c.RemoteCommand,
+			FSHelper:       c.FSHelper,
 			SSHConfigAlias: true,
 		})
 	case config.ChannelTypeLocal:
@@ -760,7 +795,7 @@ func buildGate(mode string) (*approval.Gate, error) {
 // The session and gate are shared by all built-ins; backend (the Manager) and
 // callerID wire the subagent tools to the runtime. defaultCwd is the directory
 // execute_command falls back to when the model omits one.
-func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, backend tools.SubagentBackend, mem memory.Backend, title tools.SessionTitleBackend, callerID, callerType string) (*tools.Registry, error) {
+func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defaultCwd string, commandTimeout time.Duration, sel config.ToolSelection, files tools.FileBackend, backend tools.SubagentBackend, mem memory.Backend, title tools.SessionTitleBackend, callerID, callerType string) (*tools.Registry, error) {
 	reg := tools.New()
 	if mem == nil {
 		mgr, err := memory.NewManager("", "")
@@ -784,6 +819,11 @@ func buildRegistry(ex tools.Executor, gate *approval.Gate, maxOutput int64, defa
 		tools.NameListSubagents:       tools.ListSubagents(backend, callerID),
 		tools.NameCloseSubagent:       tools.CloseSubagent(backend, callerID),
 		tools.NameSetApproval:         tools.SetApproval(gate),
+	}
+	if files != nil {
+		all[tools.NameRead] = tools.ReadFile(files, callerID)
+		all[tools.NameWrite] = tools.WriteFile(files, gate, callerID, callerType)
+		all[tools.NameEdit] = tools.EditFile(files, gate, callerID, callerType)
 	}
 	switch sel.Mode {
 	case config.ToolModeNone:

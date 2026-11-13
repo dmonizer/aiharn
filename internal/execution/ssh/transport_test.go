@@ -130,4 +130,17 @@ func TestNewTransportInsecureDefaults(t *testing.T) {
 	if tr.opts.DefaultShell != "/bin/bash" {
 		t.Fatalf("default shell = %q, want /bin/bash", tr.opts.DefaultShell)
 	}
+	if tr.opts.FSHelper != "aiharn fs-helper" {
+		t.Fatalf("default fs helper = %q, want aiharn fs-helper", tr.opts.FSHelper)
+	}
+}
+
+func TestNewTransportKeepsExplicitFSHelper(t *testing.T) {
+	tr, err := NewTransport(Options{Host: "h", User: "u", Insecure: true, FSHelper: "/opt/bin/aiharn fs-helper --version 1"})
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+	if tr.opts.FSHelper != "/opt/bin/aiharn fs-helper --version 1" {
+		t.Fatalf("fs helper = %q, want the explicit command", tr.opts.FSHelper)
+	}
 }

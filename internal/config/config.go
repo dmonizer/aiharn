@@ -48,6 +48,7 @@ type Config struct {
 	Channels   []ChannelConfig
 	Agents     map[string]AgentConfig
 	Limits     LimitsConfig
+	FileTools  FileToolsConfig `toml:"file_tools"`
 	Approval   ApprovalConfig
 	API        APIConfig
 	Shortcuts  ShortcutsConfig
@@ -85,6 +86,7 @@ type ChannelConfig struct {
 	KeepAlive     *bool              `toml:"keep_alive"` // non-nil after Load; true = shared client
 	DefaultShell  string             `toml:"default_shell"`
 	RemoteCommand string             `toml:"remote_command"` // optional command run in place of the default shell
+	FSHelper      string             `toml:"fs_helper"`      // optional filesystem-helper command line; empty = "aiharn fs-helper"
 	WorkingDir    WorkingDirTemplate `toml:"working_dir"`
 }
 
@@ -128,6 +130,16 @@ type LimitsConfig struct {
 	RequestTimeout     Duration `toml:"request_timeout"`
 	TranscriptMaxItems int      `toml:"transcript_max_items"`
 	TranscriptMaxBytes int64    `toml:"transcript_max_bytes"`
+}
+
+// FileToolsConfig holds the limits for the read/write/edit text file tools.
+// Zero means "use the default"; negative values are rejected by Validate.
+type FileToolsConfig struct {
+	MaxReadLines       int   `toml:"max_read_lines"`        // lines returned by one read
+	MaxReadBytes       int64 `toml:"max_read_bytes"`        // returned content bytes per read
+	MaxWriteBytes      int64 `toml:"max_write_bytes"`       // bytes accepted by one write
+	MaxFileBytes       int64 `toml:"max_file_bytes"`        // largest existing file the tools open
+	MaxEditResultBytes int64 `toml:"max_edit_result_bytes"` // largest result one edit may produce
 }
 
 // ApprovalConfig holds the command-approval settings.
@@ -183,6 +195,12 @@ const (
 	defaultRequestTimeout     = 60 * time.Second
 	defaultTranscriptMaxItems = 200
 	defaultTranscriptMaxBytes = 1048576 // 1 MiB
+
+	defaultMaxReadLines       = 500
+	defaultMaxReadBytes       = 262144   // 256 KiB
+	defaultMaxWriteBytes      = 1048576  // 1 MiB
+	defaultMaxFileBytes       = 10485760 // 10 MiB
+	defaultMaxEditResultBytes = 10485760 // 10 MiB
 )
 
 // DefaultLimits returns the limit defaults.
@@ -200,5 +218,16 @@ func DefaultLimits() LimitsConfig {
 		RequestTimeout:     Duration(defaultRequestTimeout),
 		TranscriptMaxItems: defaultTranscriptMaxItems,
 		TranscriptMaxBytes: defaultTranscriptMaxBytes,
+	}
+}
+
+// DefaultFileTools returns the text file tool limit defaults.
+func DefaultFileTools() FileToolsConfig {
+	return FileToolsConfig{
+		MaxReadLines:       defaultMaxReadLines,
+		MaxReadBytes:       defaultMaxReadBytes,
+		MaxWriteBytes:      defaultMaxWriteBytes,
+		MaxFileBytes:       defaultMaxFileBytes,
+		MaxEditResultBytes: defaultMaxEditResultBytes,
 	}
 }

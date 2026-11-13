@@ -46,6 +46,11 @@ type Options struct {
 	DefaultShell  string // e.g. "/bin/bash"
 	RemoteCommand string // optional command run verbatim in place of DefaultShell
 
+	// FSHelper is the remote shell command that starts the filesystem helper on
+	// the host (see Transport.NewFilesystem). It must be a command line, not a
+	// quoted argument list; the default is "aiharn fs-helper".
+	FSHelper string
+
 	// Env holds "NAME=value" pairs sent to the remote before the shell starts,
 	// mirroring OpenSSH's SetEnv directive (read from ~/.ssh/config during alias
 	// resolution). A rejected or malformed entry is ignored, matching OpenSSH.
@@ -86,6 +91,9 @@ func NewTransport(opts Options) (*Transport, error) {
 	}
 	if opts.DefaultShell == "" {
 		opts.DefaultShell = "/bin/bash"
+	}
+	if opts.FSHelper == "" {
+		opts.FSHelper = defaultFSHelper
 	}
 	return &Transport{opts: opts}, nil
 }

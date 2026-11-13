@@ -36,6 +36,11 @@ Packages depend only in this direction; preserve the acyclic boundary:
 config → llm → execution → approval → tools → agent → app → tui / webapi
 ```
 
+## Feature documents
+
+- [Text file tools: development specification](docs/text-file-tools-development.md)
+- [Text file tools: implementation notes](docs/text-file-tools-implementation.md)
+
 ## Subsystem index
 
 - [Configuration](internal/config/AGENTS.md)
@@ -54,3 +59,11 @@ config → llm → execution → approval → tools → agent → app → tui / 
 For cross-subsystem changes, read all affected guides before editing. Keep
 provider SDK types inside LLM adapters, transport details behind execution
 interfaces, and agent implementation details out of `tools`.
+
+## Development
+
+Write Clean Code - no God-files, small tested methods, descriptively named, KISS, YAGNI.
+
+Keep AGENTS.md files up to date - for every significant subsystem there should be separate AGENTS.md file in their main directory, linked from this file.
+
+Every feature ends with a fully green test suite and a commit.

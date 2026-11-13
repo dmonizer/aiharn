@@ -116,10 +116,10 @@ tools = "all"              # all | none | "tool1,tool2" | TOML array
 allow_subagents = true
 ```
 
-Available tools: `execute_command`, `write_memory`, `list_memories`,
-`get_memory`, `set_approval`, `list_subagent_types`, `spawn_subagent`,
-`send_subagent_message`, `send_agent_message`, `check_subagent`,
-`list_subagents`, `close_subagent`.
+Available tools: `execute_command`, `read`, `write`, `edit`, `write_memory`,
+`list_memories`, `get_memory`, `set_approval`, `list_subagent_types`,
+`spawn_subagent`, `send_subagent_message`, `send_agent_message`,
+`check_subagent`, `list_subagents`, `close_subagent`.
 
 ### limits
 
@@ -138,6 +138,49 @@ request_timeout = "60s"
 transcript_max_items = 200
 transcript_max_bytes = 1048576
 ```
+
+### text file tools
+
+`read`, `write`, and `edit` operate on text files through the agent's execution
+channel. Enable them per agent with `tools = "all"` or by listing them:
+
+```toml
+[agents.main]
+tools = ["read", "write", "edit", "execute_command"]
+```
+
+- Paths resolve against the channel's `root`, and absolute paths are accepted
+  only inside it. A channel without `root` cannot use the file tools. Symlinks,
+  directories, and other non-regular files are rejected.
+- `read` runs without approval. `write` (create a new file) and `edit` (replace
+  whole lines) are approval-gated: in `ask` mode they prompt, in `allow-all`
+  mode they proceed without prompting.
+- `edit` requires a successful `read` of the affected lines by the same agent
+  earlier in the conversation. Reading the file through `execute_command` does
+  not qualify.
+- Limits (all defaults, positive integers):
+
+```toml
+[file_tools]
+max_read_lines = 500              # lines returned by one read
+max_read_bytes = 262144           # returned content bytes per read (256 KiB)
+max_write_bytes = 1048576         # bytes accepted by one write (1 MiB)
+max_file_bytes = 10485760         # largest existing file the tools open (10 MiB)
+max_edit_result_bytes = 10485760  # largest result one edit may produce (10 MiB)
+```
+
+  Over-limit requests fail with an explicit error; results are never silently
+  truncated. `max_read_bytes` must not exceed `max_file_bytes`, and
+  `max_write_bytes` must not exceed `max_edit_result_bytes`.
+- SSH channels need the Aiharn filesystem helper installed on the execution host:
+  the same Aiharn version that runs the session must be on the remote `PATH` (it
+  provides `aiharn fs-helper`, and `aiharn fs-helper --version` reports the
+  protocol). The client and helper negotiate a protocol version and refuse to run
+  with a mismatch. The default `fs_helper` is `aiharn fs-helper`; set the
+  channel's `fs_helper` to override the command line. File content exchanged with
+  the helper is capped at 10 MiB per request.
+- These tools constrain only their own file access. `execute_command` is not
+  sandboxed and can still reach paths outside the channel root.
 
 ### approval
 
@@ -250,6 +293,9 @@ agent. The repo ships `prompts/skill-install.md`; copy it into
 | Tool | Purpose |
 |---|---|
 | `execute_command` | run a shell command (fresh shell each call; approval-gated unless allow-all) |
+| `read` | read a line/byte range of a text file under the channel `root` |
+| `write` | create a new text file under the channel `root` (approval-gated) |
+| `edit` | replace lines of a file this agent already read (approval-gated) |
 | `write_memory` | store a memory in `local` or `global` scope |
 | `list_memories` | list memory indexes and summaries |
 | `get_memory` | read one memory by index |

@@ -57,6 +57,7 @@ func Validate(cfg *Config, opts ValidateOptions) error {
 	seenChannels := validateChannels(&errs, cfg.Channels, channelTypes)
 	validateAgents(&errs, cfg.Agents, cfg.Models, seenChannels, opts.KnownTools)
 	validateLimits(&errs, cfg.Limits)
+	validateFileTools(&errs, cfg.FileTools)
 	validateApproval(&errs, cfg.Approval.Mode)
 	validateAPI(&errs, cfg.API)
 
@@ -111,6 +112,7 @@ func validateChannels(errs *[]string, channels []ChannelConfig, channelTypes map
 			*errs = append(*errs, fmt.Sprintf("channels: duplicate name %q", c.Name))
 		}
 		seen[c.Name] = true
+		validateFSHelper(errs, c)
 
 		if !channelTypes[c.Type] {
 			*errs = append(*errs, fmt.Sprintf("channels[%q].type %q is unsupported", c.Name, c.Type))
@@ -242,6 +244,57 @@ func validateLimits(errs *[]string, lim LimitsConfig) {
 	}
 	if lim.TranscriptMaxBytes < 0 {
 		*errs = append(*errs, "limits.transcript_max_bytes must be positive")
+	}
+}
+
+// validatePositiveInt reports field when a limit is negative. Load replaces
+// zero limits with their defaults, so only negatives can make a tool unusable.
+func validatePositiveInt(errs *[]string, field string, value int) {
+	validatePositive(errs, field, value)
+}
+
+// validatePositiveInt64 is validatePositiveInt for byte limits.
+func validatePositiveInt64(errs *[]string, field string, value int64) {
+	validatePositive(errs, field, value)
+}
+
+func validatePositive[T int | int64](errs *[]string, field string, value T) {
+	if value < 0 {
+		*errs = append(*errs, fmt.Sprintf("%s must be a positive integer (got %d)", field, value))
+	}
+}
+
+func validateFileTools(errs *[]string, ft FileToolsConfig) {
+	validatePositiveInt(errs, "file_tools.max_read_lines", ft.MaxReadLines)
+	validatePositiveInt64(errs, "file_tools.max_read_bytes", ft.MaxReadBytes)
+	validatePositiveInt64(errs, "file_tools.max_write_bytes", ft.MaxWriteBytes)
+	validatePositiveInt64(errs, "file_tools.max_file_bytes", ft.MaxFileBytes)
+	validatePositiveInt64(errs, "file_tools.max_edit_result_bytes", ft.MaxEditResultBytes)
+	validateFileToolsRelations(errs, ft)
+}
+
+// validateFileToolsRelations rejects combinations that would make a tool
+// unusable: a read cap larger than the file cap can never be returned, and a
+// write whose result exceeds the edit result cap can never be published.
+func validateFileToolsRelations(errs *[]string, ft FileToolsConfig) {
+	if ft.MaxReadBytes > ft.MaxFileBytes {
+		*errs = append(*errs, fmt.Sprintf(
+			"file_tools.max_read_bytes (%d) must not exceed file_tools.max_file_bytes (%d)",
+			ft.MaxReadBytes, ft.MaxFileBytes))
+	}
+	if ft.MaxWriteBytes > ft.MaxEditResultBytes {
+		*errs = append(*errs, fmt.Sprintf(
+			"file_tools.max_write_bytes (%d) must not exceed file_tools.max_edit_result_bytes (%d)",
+			ft.MaxWriteBytes, ft.MaxEditResultBytes))
+	}
+}
+
+// validateFSHelper rejects a helper command line that cannot be sent as one
+// command to the execution host.
+func validateFSHelper(errs *[]string, c *ChannelConfig) {
+	if strings.ContainsAny(c.FSHelper, "\x00\r\n") {
+		*errs = append(*errs, fmt.Sprintf(
+			"channels[%q].fs_helper must be a single command line without NUL, CR, or LF", c.Name))
 	}
 }
 

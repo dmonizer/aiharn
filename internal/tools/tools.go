@@ -38,6 +38,9 @@ func Names() []string {
 		NameListSubagents,
 		NameCloseSubagent,
 		NameSetApproval,
+		NameRead,
+		NameWrite,
+		NameEdit,
 	}
 }
 

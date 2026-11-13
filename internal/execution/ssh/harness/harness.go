@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -281,14 +282,31 @@ func (st *channelState) kill() {
 // server's process table.
 func (st *channelState) start(s *Server, ch ssh.Channel, name string, args ...string) *exec.Cmd {
 	c := exec.Command(name, args...)
-	c.Stdin = ch
+	// Feed the child through a real pipe with our own copy goroutine. Handing the
+	// channel to exec would make cmd.Wait wait for that copy, so a command that
+	// exits while the client still holds the channel open would never be reaped
+	// (and no exit-status would be sent). A real sshd closes the channel when the
+	// command exits; this keeps the harness faithful.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		s.publishErr(fmt.Errorf("stdin pipe for %s: %w", name, err))
+		return nil
+	}
+	c.Stdin = stdinR
 	c.Stdout = ch
 	c.Stderr = ch.Stderr()
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := c.Start(); err != nil {
+		stdinR.Close()
+		stdinW.Close()
 		s.publishErr(fmt.Errorf("start %s: %w", name, err))
 		return nil
 	}
+	stdinR.Close()
+	go func() {
+		defer stdinW.Close()
+		_, _ = io.Copy(stdinW, ch)
+	}()
 	s.mu.Lock()
 	s.procs[c] = struct{}{}
 	s.mu.Unlock()

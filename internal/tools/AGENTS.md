@@ -15,3 +15,19 @@ calls. Approval is required unless the gate is in `allow-all` mode.
 
 Prefer the fakes under `internal/testutil` for unit tests rather than real model,
 transport, or approval services.
+
+## Text file tools
+
+`read`, `write`, and `edit` (files.go) are thin adapters over `filetools`:
+schemas, model-facing descriptions, approval, and JSON results live here, while
+line handling, receipts, and publication live in `internal/filetools`. They reach
+the runtime through `FileBackend`, which the app implements over one agent's
+`filetools.Session`; the app also owns channel selection, so the tools never see
+channel names, roots, or generations.
+
+`read` runs without approval. `write` and `edit` call the gate explicitly:
+`Propose*` validates and returns the exact unpublished result (with a bounded
+preview), the gate decides, and `Commit` revalidates and publishes. A denial or
+cancellation returns a `filetools` error with a stable code
+(`approval_denied`, `cancelled`) and publishes nothing. Preview text goes into
+`approval.Request.Command`; `Args` stays compact and never contains file content.

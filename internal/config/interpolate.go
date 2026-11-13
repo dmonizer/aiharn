@@ -112,6 +112,7 @@ func interpolateChannels(cfg *Config, lookup func(string) (string, bool)) error 
 			{"auth.key_file", &c.Auth.KeyFile},
 			{"auth.password", &c.Auth.Password},
 			{"known_hosts", &c.KnownHosts},
+			{"fs_helper", &c.FSHelper},
 		}
 		for _, f := range fields {
 			v, err := interpolateEnv(*f.value, lookup)

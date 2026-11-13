@@ -38,6 +38,9 @@ func run(args []string) int {
 	if len(args) > 0 && args[0] == "add-user" {
 		return runAddUser(args[1:])
 	}
+	if len(args) > 0 && args[0] == "fs-helper" {
+		return runFSHelper(args[1:])
+	}
 	fs := flag.NewFlagSet("aiharn", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 

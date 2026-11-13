@@ -835,3 +835,180 @@ func TestValidateErrorBranches(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadFileToolsDefaults(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(setup(t, validConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := DefaultFileTools()
+	if want != (FileToolsConfig{
+		MaxReadLines:       500,
+		MaxReadBytes:       262144,
+		MaxWriteBytes:      1048576,
+		MaxFileBytes:       10485760,
+		MaxEditResultBytes: 10485760,
+	}) {
+		t.Fatalf("DefaultFileTools() = %+v, want the documented defaults", want)
+	}
+	if cfg.FileTools != want {
+		t.Fatalf("FileTools = %+v, want defaults %+v", cfg.FileTools, want)
+	}
+	if err := Validate(cfg, ValidateOptions{}); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestLoadFileToolsExplicitValues(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	body := validConfig + `
+[file_tools]
+max_read_lines = 20
+max_read_bytes = 1024
+max_write_bytes = 2048
+max_file_bytes = 4096
+max_edit_result_bytes = 8192
+`
+	cfg, err := Load(setup(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := FileToolsConfig{
+		MaxReadLines:       20,
+		MaxReadBytes:       1024,
+		MaxWriteBytes:      2048,
+		MaxFileBytes:       4096,
+		MaxEditResultBytes: 8192,
+	}
+	if cfg.FileTools != want {
+		t.Fatalf("FileTools = %+v, want %+v", cfg.FileTools, want)
+	}
+	if err := Validate(cfg, ValidateOptions{}); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestValidateFileToolsNegativeValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*FileToolsConfig)
+		wantErr string
+	}{
+		{"max_read_lines", func(f *FileToolsConfig) { f.MaxReadLines = -1 }, "file_tools.max_read_lines"},
+		{"max_read_bytes", func(f *FileToolsConfig) { f.MaxReadBytes = -1 }, "file_tools.max_read_bytes"},
+		{"max_write_bytes", func(f *FileToolsConfig) { f.MaxWriteBytes = -1 }, "file_tools.max_write_bytes"},
+		{"max_file_bytes", func(f *FileToolsConfig) { f.MaxFileBytes = -1 }, "file_tools.max_file_bytes"},
+		{"max_edit_result_bytes", func(f *FileToolsConfig) { f.MaxEditResultBytes = -1 }, "file_tools.max_edit_result_bytes"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_API_KEY", "x")
+			cfg, err := Load(setup(t, validConfig))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			tc.mutate(&cfg.FileTools)
+			err = Validate(cfg, ValidateOptions{})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) ||
+				!strings.Contains(err.Error(), "positive integer") {
+				t.Fatalf("Validate error = %v, want %q to be rejected", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateFileToolsRelationships(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr []string
+	}{
+		{
+			name:    "read bytes exceed file bytes",
+			body:    validConfig + "\n[file_tools]\nmax_read_bytes = 2048\nmax_file_bytes = 1024\n",
+			wantErr: []string{"file_tools.max_read_bytes", "file_tools.max_file_bytes"},
+		},
+		{
+			name:    "write bytes exceed edit result bytes",
+			body:    validConfig + "\n[file_tools]\nmax_write_bytes = 2048\nmax_edit_result_bytes = 1024\n",
+			wantErr: []string{"file_tools.max_write_bytes", "file_tools.max_edit_result_bytes"},
+		},
+		{
+			name: "equal caps allowed",
+			body: validConfig + "\n[file_tools]\nmax_read_bytes = 1024\nmax_file_bytes = 1024\n" +
+				"max_write_bytes = 4096\nmax_edit_result_bytes = 4096\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_API_KEY", "x")
+			cfg, err := Load(setup(t, tc.body))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			err = Validate(cfg, ValidateOptions{})
+			if len(tc.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate: want error naming %v", tc.wantErr)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("Validate error = %v, want it to name %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadFSHelper(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	body := strings.Replace(validConfig, "\nkeep_alive = true\n",
+		"\nkeep_alive = true\nfs_helper = \"/opt/aiharn/bin/aiharn fs-helper --verbose\"\n", 1)
+	cfg, err := Load(setup(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := "/opt/aiharn/bin/aiharn fs-helper --verbose"; cfg.Channels[0].FSHelper != want {
+		t.Fatalf("FSHelper = %q, want %q", cfg.Channels[0].FSHelper, want)
+	}
+	if err := Validate(cfg, ValidateOptions{}); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestLoadFSHelperDefaultsToEmpty(t *testing.T) {
+	t.Setenv("TEST_API_KEY", "x")
+	cfg, err := Load(setup(t, validConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Channels[0].FSHelper != "" {
+		t.Fatalf("FSHelper = %q, want empty default", cfg.Channels[0].FSHelper)
+	}
+}
+
+func TestValidateFSHelperRejectsLineBreaks(t *testing.T) {
+	// TOML escape sequences keep the config file itself single-line.
+	values := []string{`"aiharn\nfs-helper"`, `"aiharn\rfs-helper"`, `"aiharn\u0000fs-helper"`}
+	for _, value := range values {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("TEST_API_KEY", "x")
+			body := strings.Replace(validConfig, "\nkeep_alive = true\n",
+				"\nkeep_alive = true\nfs_helper = "+value+"\n", 1)
+			cfg, err := Load(setup(t, body))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			err = Validate(cfg, ValidateOptions{})
+			if err == nil || !strings.Contains(err.Error(), "fs_helper") {
+				t.Fatalf("Validate error = %v, want fs_helper rejection", err)
+			}
+		})
+	}
+}

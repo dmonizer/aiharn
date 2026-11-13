@@ -12,10 +12,13 @@ import (
 	"aiharn/internal/approval"
 	"aiharn/internal/config"
 	"aiharn/internal/execution"
+	"aiharn/internal/execution/ssh/harness"
+	"aiharn/internal/filetools"
 	"aiharn/internal/memory"
 	"aiharn/internal/sessions"
 	testexec "aiharn/internal/testutil/execution"
 	testllm "aiharn/internal/testutil/llm"
+	"aiharn/internal/testutil/memfs"
 	"aiharn/internal/tools"
 )
 
@@ -83,8 +86,9 @@ func TestBuildGate(t *testing.T) {
 func TestBuildRegistrySelection(t *testing.T) {
 	sess := testexec.NewSession(nil)
 	gate := approval.NewGate(approval.ModeAllowAll)
+	files := testFileBackend(t)
 
-	none, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeNone}, nil, newMemoryStore(t), nil, "a1", "main")
+	none, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeNone}, nil, nil, newMemoryStore(t), nil, "a1", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +96,7 @@ func TestBuildRegistrySelection(t *testing.T) {
 		t.Fatalf("none: got %v", none.Names())
 	}
 
-	all, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeAll}, nil, newMemoryStore(t), nil, "a1", "main")
+	all, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeAll}, files, nil, newMemoryStore(t), nil, "a1", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,11 +106,14 @@ func TestBuildRegistrySelection(t *testing.T) {
 	if !all.Has(tools.NameListSubagentTypes) {
 		t.Fatal("all must include subagent type discovery")
 	}
+	if !all.Has(tools.NameRead) || !all.Has(tools.NameWrite) || !all.Has(tools.NameEdit) {
+		t.Fatalf("all must include the text file tools: %v", all.Names())
+	}
 
 	list, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
 		Mode:  config.ToolModeList,
 		Names: []string{"execute_command"},
-	}, nil, newMemoryStore(t), nil, "a1", "main")
+	}, nil, nil, newMemoryStore(t), nil, "a1", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,11 +122,11 @@ func TestBuildRegistrySelection(t *testing.T) {
 	}
 	discovery, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{
 		Mode: config.ToolModeList, Names: []string{tools.NameListSubagentTypes},
-	}, nil, newMemoryStore(t), nil, "a1", "main")
+	}, nil, nil, newMemoryStore(t), nil, "a1", "main")
 	if err != nil || !discovery.Has(tools.NameListSubagentTypes) || discovery.Has(tools.NameSpawnSubagent) {
 		t.Fatalf("discovery-only registry: names=%v err=%v", discovery.Names(), err)
 	}
-	if _, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeList, Names: []string{"not_a_tool"}}, nil, newMemoryStore(t), nil, "a1", "main"); err == nil {
+	if _, err := buildRegistry(sess, gate, 0, "", 0, config.ToolSelection{Mode: config.ToolModeList, Names: []string{"not_a_tool"}}, nil, nil, newMemoryStore(t), nil, "a1", "main"); err == nil {
 		t.Fatal("expected unknown tool error")
 	}
 }
@@ -313,5 +320,110 @@ func TestRuntimeCloseNilSafe(t *testing.T) {
 	var rt Runtime
 	if err := rt.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// testFileBackend returns a file-tool backend over an in-memory filesystem, for
+// registry construction tests.
+func testFileBackend(t *testing.T) *fileBackend {
+	t.Helper()
+	fs := memfs.New()
+	session := filetools.NewRegistry().NewSession("test-runtime", filetools.DefaultLimits(),
+		func(context.Context) (filetools.Target, error) {
+			return filetools.Target{Channel: "local", Root: "/root", FS: fs}, nil
+		})
+	t.Cleanup(func() { session.Close() })
+	return &fileBackend{session: session}
+}
+
+// TestFileBackendCloseClearsOnlyThatAgentsReceipts proves that closing one
+// agent (for example a finished subagent) does not disarm another agent's
+// read-before-edit context in the same conversation.
+func TestFileBackendCloseClearsOnlyThatAgentsReceipts(t *testing.T) {
+	fs := memfs.New()
+	fs.Set("a.txt", "a\nb\n")
+	deps := fileToolDeps{
+		registry:  filetools.NewRegistry(),
+		runtimeID: "conv-1",
+		limits:    filetools.DefaultLimits(),
+	}
+	resolve := func(context.Context) (filetools.Target, error) {
+		return filetools.Target{Channel: "local", Root: "/root", FS: fs}, nil
+	}
+	first := deps.newBackend("agent-1", resolve, 0)
+	second := deps.newBackend("agent-2", resolve, 0)
+
+	read, err := first.ReadFile(context.Background(), filetools.ReadRequest{AgentID: "agent-1", Filename: "a.txt"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	second.Close()
+	proposal, err := first.ProposeFileEdit(context.Background(), filetools.EditRequest{
+		AgentID: "agent-1", Filename: "a.txt", ReadID: read.ReadID, StartLine: 0, EndLine: 1, Content: "A\n",
+	})
+	if err != nil {
+		t.Fatalf("edit after another agent closed: %v", err)
+	}
+	if _, err := proposal.Commit(context.Background()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+// TestChannelFilesystemPropagatesFSHelper proves the channel's fs_helper option
+// reaches the ssh transport: the error names the configured helper instead of
+// the default. It also proves an unavailable helper is reported as
+// unsupported_filesystem rather than a generic failure.
+func TestChannelFilesystemPropagatesFSHelper(t *testing.T) {
+	sshSrv, err := harness.New("/bin/bash")
+	if err != nil {
+		t.Fatalf("harness.New: %v", err)
+	}
+	t.Cleanup(func() { _ = sshSrv.Close() })
+
+	tc := &transportCache{transports: map[string]execution.Transport{}}
+	t.Cleanup(func() { _ = tc.closeAll() })
+	channel := config.ChannelConfig{
+		Name: "devbox", Type: config.ChannelTypeSSH, Host: "127.0.0.1", Port: sshSrv.Port(),
+		User: "test", Insecure: true, Root: t.TempDir(), FSHelper: "/nonexistent/aiharn-helper",
+	}
+	_, err = tc.filesystem(context.Background(), channel)
+	if err == nil {
+		t.Fatal("expected an unsupported-helper error")
+	}
+	if got := filetools.Code(err); got != filetools.CodeUnsupported {
+		t.Fatalf("code = %q, want %q (%v)", got, filetools.CodeUnsupported, err)
+	}
+	if !strings.Contains(err.Error(), "/nonexistent/aiharn-helper") {
+		t.Fatalf("error does not name the configured helper: %v", err)
+	}
+}
+
+// TestChannelFileTargetsShareOneBackend proves the transport cache owns the
+// filesystem backend: agents on the same channel share it, so one agent closing
+// cannot pull the backend out from under another.
+func TestChannelFileTargetsShareOneBackend(t *testing.T) {
+	root := t.TempDir()
+	tc := &transportCache{transports: map[string]execution.Transport{}}
+	t.Cleanup(func() { _ = tc.closeAll() })
+	channel := config.ChannelConfig{Name: "local", Type: config.ChannelTypeLocal, Root: root}
+	first := &channelFileTarget{tc: tc, channel: channel}
+	second := &channelFileTarget{tc: tc, channel: channel}
+
+	firstTarget, err := first.target(context.Background())
+	if err != nil {
+		t.Fatalf("first target: %v", err)
+	}
+	secondTarget, err := second.target(context.Background())
+	if err != nil {
+		t.Fatalf("second target: %v", err)
+	}
+	if firstTarget.FS == nil || firstTarget.FS != secondTarget.FS {
+		t.Fatal("agents on one channel must share one filesystem backend")
+	}
+	session := filetools.NewRegistry().NewSession("rt-1", filetools.DefaultLimits(), second.target)
+	if _, err := session.ProposeWrite(context.Background(), filetools.WriteRequest{
+		AgentID: "agent-2", Filename: "shared.txt", Content: "x\n",
+	}); err != nil {
+		t.Fatalf("write through the shared backend: %v", err)
 	}
 }

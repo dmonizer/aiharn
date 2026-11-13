@@ -64,6 +64,7 @@ insecure = false           # default; true explicitly skips host-key verificatio
 keep_alive = true          # default; false creates one connection per session
 default_shell = "/bin/bash" # default
 remote_command = ""        # default: use default_shell; e.g. "/bin/bash" overrides it
+# fs_helper = ""           # default: "aiharn fs-helper" on the host (read/write/edit)
 # working_dir is unset by default (no directory override).
 # working_dir = "/sec/root/ai-work/${agent.type}-${agent.id}" # optional remote template
 # To configure SSH without an alias, set user, one auth value, and known_hosts.
@@ -127,6 +128,17 @@ thinking_timeout = "180s"      # request setup and thinking, until answer text o
 request_timeout = "60s"        # answer text or tool call through response completion
 transcript_max_items = 200     # retained conversation items (0 = default)
 transcript_max_bytes = 1048576 # retained conversation content bytes (0 = default)
+
+# Text file tools (read/write/edit). All values below are defaults, so
+# uncomment the section only to change them. Every limit must be a positive
+# integer; max_read_bytes must not exceed max_file_bytes, and max_write_bytes
+# must not exceed max_edit_result_bytes.
+# [file_tools]
+# max_read_lines = 500            # lines returned by one read
+# max_read_bytes = 262144         # returned content bytes per read (256 KiB)
+# max_write_bytes = 1048576       # bytes accepted by one write (1 MiB)
+# max_file_bytes = 10485760       # largest existing file the tools open (10 MiB)
+# max_edit_result_bytes = 10485760 # largest result one edit may produce (10 MiB)
 
 [approval]
 mode = "ask"                   # default; alternative: "allow-all"

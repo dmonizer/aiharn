@@ -100,6 +100,7 @@ func applyDefaults(cfg *Config) {
 	applyChannelDefaults(cfg)
 	applyAgentDefaults(cfg)
 	applyLimitsDefaults(cfg)
+	applyFileToolsDefaults(cfg)
 
 	if cfg.Approval.Mode == "" {
 		cfg.Approval.Mode = defaultApprovalMode
@@ -172,6 +173,25 @@ func applyLimitsDefaults(cfg *Config) {
 	}
 	if cfg.Limits.TranscriptMaxBytes == 0 {
 		cfg.Limits.TranscriptMaxBytes = d.TranscriptMaxBytes
+	}
+}
+
+func applyFileToolsDefaults(cfg *Config) {
+	d := DefaultFileTools()
+	if cfg.FileTools.MaxReadLines == 0 {
+		cfg.FileTools.MaxReadLines = d.MaxReadLines
+	}
+	if cfg.FileTools.MaxReadBytes == 0 {
+		cfg.FileTools.MaxReadBytes = d.MaxReadBytes
+	}
+	if cfg.FileTools.MaxWriteBytes == 0 {
+		cfg.FileTools.MaxWriteBytes = d.MaxWriteBytes
+	}
+	if cfg.FileTools.MaxFileBytes == 0 {
+		cfg.FileTools.MaxFileBytes = d.MaxFileBytes
+	}
+	if cfg.FileTools.MaxEditResultBytes == 0 {
+		cfg.FileTools.MaxEditResultBytes = d.MaxEditResultBytes
 	}
 }
 
